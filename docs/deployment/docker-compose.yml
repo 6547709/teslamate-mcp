@@ -19,6 +19,8 @@ services:
       - MCP_TRANSPORT=streamable-http
       - HTTP_HOST=0.0.0.0
       - HTTP_PORT=8080
+      # Timezone (default Asia/Shanghai)
+      - TIMEZONE=Asia/Shanghai
       # Units and currency
       - USE_METRIC_UNITS=true      # true = km/°C/¥, false = mi/°F/$
       - TESLA_ELECTRICITY_RATE_RMB=0.6

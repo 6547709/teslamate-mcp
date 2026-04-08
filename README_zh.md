@@ -163,6 +163,12 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 | `HTTP_HOST` | `0.0.0.0` | 绑定地址 |
 | `HTTP_PORT` | `8080` | 容器内部端口 |
 
+### 时区与显示
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `TIMEZONE` | `Asia/Shanghai` | 所有输出日期的时区（IANA 时区名，如 `Asia/Shanghai`、`America/Los_Angeles`） |
+
 ### 单位与货币
 
 | 变量名 | 默认值 | 说明 |

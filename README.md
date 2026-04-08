@@ -166,6 +166,12 @@ All configuration is via environment variables.
 | `HTTP_HOST` | `0.0.0.0` | Bind address |
 | `HTTP_PORT` | `8080` | HTTP port inside container |
 
+### Timezone & Display
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TIMEZONE` | `Asia/Shanghai` | Timezone for all output dates (IANA timezone name, e.g. `Asia/Shanghai`, `America/Los_Angeles`) |
+
 ### Units & Currency
 
 | Variable | Default | Description |
