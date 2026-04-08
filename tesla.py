@@ -501,6 +501,115 @@ async def tesla_drives(days: int = 30) -> str:
 
 
 @mcp.tool()
+async def tesla_driving_score(
+    period: str = "recent_n",
+    n: int = 10,
+    year: int | None = None,
+    month: int | None = None,
+) -> str:
+    """Driving score based on acceleration, braking, and speed habits.
+
+    Args:
+        period: "recent_n" (default), "monthly", or "yearly"
+        n: Number of recent drives to score (default: 10, used when period="recent_n")
+        year: Year for monthly/yearly period
+        month: Month (1-12) for monthly period
+    """
+    # Build date filter
+    if period == "recent_n":
+        rows = _query(
+            f"""
+            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+                   d.speed_max, d.start_date
+            FROM drives d
+            WHERE d.car_id = %s AND d.distance > 0
+            ORDER BY d.start_date DESC LIMIT %s
+            """,
+            (CAR_ID, n),
+        )
+        label = f"last {len(rows)} drives"
+    elif period == "monthly":
+        if not year or not month:
+            return "year and month are required for monthly period"
+        start = datetime(year, month, 1)
+        if month == 12:
+            end = datetime(year + 1, 1, 1)
+        else:
+            end = datetime(year, month + 1, 1)
+        rows = _query(
+            f"""
+            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+                   d.speed_max, d.start_date
+            FROM drives d
+            WHERE d.car_id = %s AND d.distance > 0
+              AND d.start_date >= %s AND d.start_date < %s
+            ORDER BY d.start_date DESC
+            """,
+            (CAR_ID, start.isoformat(), end.isoformat()),
+        )
+        label = f"{year}-{month:02d}"
+    elif period == "yearly":
+        if not year:
+            return "year is required for yearly period"
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        rows = _query(
+            f"""
+            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+                   d.speed_max, d.start_date
+            FROM drives d
+            WHERE d.car_id = %s AND d.distance > 0
+              AND d.start_date >= %s AND d.start_date < %s
+            ORDER BY d.start_date DESC
+            """,
+            (CAR_ID, start.isoformat(), end.isoformat()),
+        )
+        label = str(year)
+    else:
+        return f"Unknown period: {period}. Use recent_n, monthly, or yearly."
+
+    if not rows:
+        return f"No drives found for {label}."
+
+    # Score calculation
+    POWER_ACCEL_THRESHOLD = 50   # kW — above this = aggressive acceleration
+    POWER_BRAKE_THRESHOLD = -30  # kW — below this = harsh braking
+    SPEED_THRESHOLD_KMH = 130     # km/h — above this = speeding
+
+    score = 100
+    details = []
+
+    for r in rows:
+        power_max = r.get("power_max") or 0
+        power_min = r.get("power_min") or 0
+        speed_max = r.get("speed_max") or 0
+
+        if power_max > POWER_ACCEL_THRESHOLD:
+            deduct = min(5, round((power_max - POWER_ACCEL_THRESHOLD) / 10))
+            score -= deduct
+            details.append(f"hard accel ({power_max:.0f} kW)")
+
+        if power_min < POWER_BRAKE_THRESHOLD:
+            deduct = min(5, round((abs(power_min) - abs(POWER_BRAKE_THRESHOLD)) / 10))
+            score -= deduct
+            details.append(f"hard brake ({power_min:.0f} kW)")
+
+        if speed_max > SPEED_THRESHOLD_KMH:
+            deduct = min(3, round((speed_max - SPEED_THRESHOLD_KMH) / 20))
+            score -= deduct
+            details.append(f"high speed ({speed_max:.0f} km/h)")
+
+    score = max(0, min(100, score))
+
+    lines = [f"**Driving Score — {label}**\n"]
+    lines.append(f"Score: {score}/100")
+    if details:
+        lines.append(f"Events: {', '.join(details[:5])}")
+    lines.append(f"Drives analyzed: {len(rows)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def tesla_battery_health() -> str:
     """Battery degradation trend — range at 100% charge over time.
 
