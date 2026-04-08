@@ -1,61 +1,61 @@
-"""Tesla MCP Server — TeslaMate analytics + Owner API real-time data.
+"""Tesla MCP Server -- TeslaMate analytics + Owner API real-time data.
 
-See README.md (English) or README_zh.md (中文) for full documentation."""
+See README.md (English) or README_zh.md for full documentation."""
 
 Single-file FastMCP server. Stdio transport. Works with TeslaMate, Owner API,
-or both — tools are available based on which backends you configure.
+or both -- tools are available based on which backends you configure.
 
 Two data paths:
-  1. TeslaMate Postgres (read-only) — historical telemetry and analytics
+  1. TeslaMate Postgres (read-only) -- historical telemetry and analytics
   2. Tesla Owner API (read-only live data from TeslaMate DB)
 
 Read tools (TeslaMate):
-  tesla_status            — Current vehicle state (battery, range, location, climate)
-  tesla_charging_history  — Charging sessions over N days
-  tesla_drives            — Recent drives with distance, duration, efficiency
-  tesla_battery_health    — Battery degradation trend
-  tesla_efficiency        — Wh/mi consumption trends
-  tesla_location_history  — Where the car has been, time at each location
-  tesla_state_history     — Vehicle state transitions (online/asleep/offline)
-  tesla_software_updates  — Firmware version history
+  tesla_status            -- Current vehicle state (battery, range, location, climate)
+  tesla_charging_history  -- Charging sessions over N days
+  tesla_drives            -- Recent drives with distance, duration, efficiency
+  tesla_battery_health    -- Battery degradation trend
+  tesla_efficiency        -- Wh/mi consumption trends
+  tesla_location_history  -- Where the car has been, time at each location
+  tesla_state_history     -- Vehicle state transitions (online/asleep/offline)
+  tesla_software_updates  -- Firmware version history
 
 Analytics tools (TeslaMate):
-  tesla_savings           — Gas savings scorecard
-  tesla_trip_cost         — Estimate trip cost to a destination
-  tesla_efficiency_by_temp — Efficiency curve by temperature
-  tesla_charging_by_location — Charging patterns by location
-  tesla_top_destinations  — Most visited locations
-  tesla_longest_trips     — Top drives ranked by distance
-  tesla_monthly_summary   — Monthly driving summary
-  tesla_vampire_drain     — Battery loss while parked
+  tesla_savings           -- Gas savings scorecard
+  tesla_trip_cost         -- Estimate trip cost to a destination
+  tesla_efficiency_by_temp -- Efficiency curve by temperature
+  tesla_charging_by_location -- Charging patterns by location
+  tesla_top_destinations  -- Most visited locations
+  tesla_longest_trips     -- Top drives ranked by distance
+  tesla_monthly_summary   -- Monthly driving summary
+  tesla_vampire_drain     -- Battery loss while parked
 
 Live data tool (Owner API):
-  tesla_live              — Real-time vehicle data from Owner API
+  tesla_live              -- Real-time vehicle data from Owner API
 
 Environment variables:
   # TeslaMate Postgres
-  TESLAMATE_DB_HOST     — Postgres host (e.g. localhost, 192.168.1.50)
-  TESLAMATE_DB_PORT     — Postgres port (default: 5432)
-  TESLAMATE_DB_USER     — Postgres user (default: teslamate)
-  TESLAMATE_DB_PASS     — Postgres password
-  TESLAMATE_DB_NAME     — Postgres database (default: teslamate)
+  TESLAMATE_DB_HOST     -- Postgres host (e.g. localhost, 192.168.1.50)
+  TESLAMATE_DB_PORT     -- Postgres port (default: 5432)
+  TESLAMATE_DB_USER     -- Postgres user (default: teslamate)
+  TESLAMATE_DB_PASS     -- Postgres password
+  TESLAMATE_DB_NAME     -- Postgres database (default: teslamate)
 
-  # Encryption key (TeslaMate's ENCRYPTION_KEY — required for Owner API)
-  ENCRYPTION_KEY        — AES-256 key used to decrypt tokens from DB
+  # Encryption key (TeslaMate's ENCRYPTION_KEY -- required for Owner API)
+  ENCRYPTION_KEY        -- AES-256 key used to decrypt tokens from DB
 
   # Vehicle config
-  TESLA_CAR_ID          — TeslaMate car ID (default: 1)
-  TESLA_BATTERY_KWH     — Usable battery capacity in kWh (default: 75)
-  TESLA_BATTERY_RANGE_KM — EPA range at 100% in km (default: 525)
+  TESLA_CAR_ID          -- TeslaMate car ID (default: 1)
+  TESLA_BATTERY_KWH     -- Usable battery capacity in kWh (default: 75)
+  TESLA_BATTERY_RANGE_KM -- EPA range at 100% in km (default: 525)
 
   # Cost defaults (overridable per-tool-call)
-  TESLA_ELECTRICITY_RATE_USD — $/kWh (default: 0.12)
-  TESLA_ELECTRICITY_RATE_RMB — Electricity cost in RMB/kWh (default: 0.6)
-  TESLA_GAS_PRICE        — $/gallon for comparison (default: 3.50)
-  TESLA_GAS_MPG          — Comparable gas vehicle MPG (default: 28)
+  TESLA_ELECTRICITY_RATE_USD -- USD/kWh (default: 0.12)
+  TESLA_ELECTRICITY_RATE_RMB -- Electricity cost in RMB/kWh (default: 0.6)
+  TESLA_GAS_PRICE        -- USD/gallon for comparison (default: 3.50)
+  TESLA_GAS_MPG          -- Comparable gas vehicle MPG (default: 28)
 
   # Units (metric)
-  USE_METRIC_UNITS       — Set "true" for km, °C, kWh/100km, ¥ (default: false/imperial)
+  USE_METRIC_UNITS       -- Set "true" for km, degC, kWh/100km, JPY (default: false/imperial)
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
 if not ENCRYPTION_KEY:
     raise RuntimeError("ENCRYPTION_KEY environment variable is required")
 
-# Owner API (read from TeslaMate DB — no file, no manual refresh)
+# Owner API (read from TeslaMate DB -- no file, no manual refresh)
 OWNER_API_URL = "https://owner-api.tesla.com"
 HAS_OWNER_API = bool(DB_HOST and DB_PASS and ENCRYPTION_KEY)
 
@@ -103,13 +103,13 @@ ELECTRICITY_RATE = float(os.environ.get("TESLA_ELECTRICITY_RATE_USD", "0.12"))  
 GAS_PRICE = float(os.environ.get("TESLA_GAS_PRICE", "3.50"))
 GAS_MPG = int(os.environ.get("TESLA_GAS_MPG", "28"))
 
-# Units: true = metric (km, °C, kWh/100km), false = imperial (mi, °F, Wh/mi)
+# Units: true = metric (km, degC, kWh/100km), false = imperial (mi, degF, Wh/mi)
 USE_METRIC_UNITS = os.environ.get("USE_METRIC_UNITS", "false").lower() in ("true", "1", "yes")
 
 # TPMS thresholds (bar)
 TPMS_MIN = float(os.environ.get("TESLA_TPMS_MIN_THRESHOLD", "2.0"))
 TPMS_MAX = float(os.environ.get("TESLA_TPMS_MAX_THRESHOLD", "2.5"))
-TPMS_WARN_DELTA = 0.15  # bar — warn if any tire differs from average by this much
+TPMS_WARN_DELTA = 0.15  # bar -- warn if any tire differs from average by this much
 
 # Backend availability
 HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
@@ -284,8 +284,8 @@ def _format_temp(c: float | None) -> str:
     if c is None:
         return "N/A"
     if USE_METRIC_UNITS:
-        return f"{round(c)}°C"
-    return f"{_c_to_f(c)}°F"
+        return f"{round(c)}degC"
+    return f"{_c_to_f(c)}degF"
 
 
 def _format_efficiency(kwh: float, km: float) -> str:
@@ -303,7 +303,7 @@ def _format_efficiency(kwh: float, km: float) -> str:
 def _format_cost(kwh: float) -> str:
     """Format electricity cost based on USE_METRIC_UNITS."""
     if USE_METRIC_UNITS:
-        return f"¥{round(kwh * ELECTRICITY_RATE_RMB, 2)}"
+        return f"JPY{round(kwh * ELECTRICITY_RATE_RMB, 2)}"
     return f"${round(kwh * ELECTRICITY_RATE, 2)}"
 
 
@@ -312,7 +312,7 @@ def _format_cost(kwh: float) -> str:
 
 @mcp.tool()
 async def tesla_status() -> str:
-    """Current vehicle state — battery, range, location, climate, odometer.
+    """Current vehicle state -- battery, range, location, climate, odometer.
 
     Returns the latest position snapshot and vehicle info from TeslaMate.
     """
@@ -453,7 +453,7 @@ async def tesla_status() -> str:
         start_bat = charge.get("start_battery_level") or "?"
         end_bat = charge.get("end_battery_level") or "?"
         lines.append(
-            f"Last charge: {kwh:.1f} kWh in {dur} min ({start_bat}% → {end_bat}%)"
+            f"Last charge: {kwh:.1f} kWh in {dur} min ({start_bat}% -> {end_bat}%)"
         )
 
     return "\n".join(lines) if lines else "No vehicle data found. Is TeslaMate running?"
@@ -502,7 +502,7 @@ async def tesla_charging_history(days: int = 30) -> str:
         loc = r.get("location") or "Unknown"
         date_str = str(r.get("start_date", ""))[:16]
         lines.append(
-            f"- {date_str}: {kwh:.1f} kWh, {dur} min, {start_pct}% → {end_pct}%, {loc}"
+            f"- {date_str}: {kwh:.1f} kWh, {dur} min, {start_pct}% -> {end_pct}%, {loc}"
         )
 
     lines.append(f"\n**Total:** {total_kwh:.1f} kWh across {len(rows)} sessions")
@@ -511,7 +511,7 @@ async def tesla_charging_history(days: int = 30) -> str:
 
 @mcp.tool()
 async def tesla_drives(days: int = 30) -> str:
-    """Recent drives — distance, duration, efficiency, start/end locations.
+    """Recent drives -- distance, duration, efficiency, start/end locations.
 
     Shows the last N days of driving activity with energy consumption.
     """
@@ -556,7 +556,7 @@ async def tesla_drives(days: int = 30) -> str:
 
         eff_str = _format_efficiency(kwh, dist_km) if dist_km > 0 and kwh > 0 else ""
 
-        lines.append(f"- {date_str}: {_format_distance(dist_km)}, {dur} min, {start} → {end}{eff_str}")
+        lines.append(f"- {date_str}: {_format_distance(dist_km)}, {dur} min, {start} -> {end}{eff_str}")
 
     avg_eff = ""
     if total_km > 0 and total_kwh > 0:
@@ -640,9 +640,9 @@ async def tesla_driving_score(
         return f"No drives found for {label}."
 
     # Score calculation
-    POWER_ACCEL_THRESHOLD = 50   # kW — above this = aggressive acceleration
-    POWER_BRAKE_THRESHOLD = -30  # kW — below this = harsh braking
-    SPEED_THRESHOLD_KMH = 130     # km/h — above this = speeding
+    POWER_ACCEL_THRESHOLD = 50   # kW -- above this = aggressive acceleration
+    POWER_BRAKE_THRESHOLD = -30  # kW -- below this = harsh braking
+    SPEED_THRESHOLD_KMH = 130     # km/h -- above this = speeding
 
     score = 100
     details = []
@@ -669,7 +669,7 @@ async def tesla_driving_score(
 
     score = max(0, min(100, score))
 
-    lines = [f"**Driving Score — {label}**\n"]
+    lines = [f"**Driving Score -- {label}**\n"]
     lines.append(f"Score: {score}/100")
     if details:
         lines.append(f"Events: {', '.join(details[:5])}")
@@ -758,7 +758,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20) ->
         dur = r.get("duration_min") or 0
         start = r.get("start_location") or "?"
         end = r.get("end_location") or "?"
-        lines.append(f"- {date}: {_format_distance(dist_km)}, {dur} min, {start} → {end}")
+        lines.append(f"- {date}: {_format_distance(dist_km)}, {dur} min, {start} -> {end}")
     return "\n".join(lines)
 
 
@@ -800,7 +800,7 @@ async def tesla_trip_categories() -> str:
 
 @mcp.tool()
 async def tesla_battery_health() -> str:
-    """Battery degradation trend — range at 100% charge over time.
+    """Battery degradation trend -- range at 100% charge over time.
 
     Shows monthly snapshots of ideal range when battery is at 100%.
     """
@@ -856,7 +856,7 @@ async def tesla_battery_health() -> str:
 
 @mcp.tool()
 async def tesla_efficiency(days: int = 90) -> str:
-    """Energy consumption trends — Wh/mi over time.
+    """Energy consumption trends -- Wh/mi over time.
 
     Shows weekly average efficiency from driving data.
     """
@@ -901,7 +901,7 @@ async def tesla_efficiency(days: int = 90) -> str:
 
 @mcp.tool()
 async def tesla_location_history(days: int = 7) -> str:
-    """Where the car has been — top locations by time spent.
+    """Where the car has been -- top locations by time spent.
 
     Groups positions by proximity and shows time at each cluster.
     """
@@ -950,7 +950,7 @@ async def tesla_location_history(days: int = 7) -> str:
 
 @mcp.tool()
 async def tesla_state_history(days: int = 7) -> str:
-    """Vehicle state transitions — online, asleep, offline.
+    """Vehicle state transitions -- online, asleep, offline.
 
     Shows when the car was awake vs sleeping, useful for vampire drain analysis.
     """
@@ -999,7 +999,7 @@ async def tesla_state_history(days: int = 7) -> str:
 
 @mcp.tool()
 async def tesla_software_updates() -> str:
-    """Firmware version history — all recorded software versions and install dates."""
+    """Firmware version history -- all recorded software versions and install dates."""
     rows = _query(f"""
         SELECT version, start_date, end_date
         FROM updates
@@ -1030,7 +1030,7 @@ async def tesla_software_updates() -> str:
 
 @mcp.tool()
 async def tesla_live() -> str:
-    """Live vehicle data from Tesla Owner API — real-time battery, charging, climate.
+    """Live vehicle data from Tesla Owner API -- real-time battery, charging, climate.
 
     Uses tokens shared with TeslaMate (decrypted from DB). More current than
     TeslaMate which polls on intervals.
@@ -1147,7 +1147,7 @@ async def tesla_live() -> str:
     for pos, label in [("fl", "FL"), ("fr", "FR"), ("rl", "RL"), ("rr", "RR")]:
         bar = vs.get(f"tpms_pressure_{pos}")
         if bar:
-            warn = " ⚠" if vs.get(f"tpms_soft_warning_{pos}") else ""
+            warn = " !" if vs.get(f"tpms_soft_warning_{pos}") else ""
             if USE_METRIC_UNITS:
                 tires.append(f"{label}:{bar:.2f} bar{warn}")
             else:
@@ -1162,7 +1162,7 @@ async def tesla_live() -> str:
     if title:
         playing = title
         if artist:
-            playing = f"{artist} — {title}"
+            playing = f"{artist} -- {title}"
         lines.append(f"Playing: {playing} ({media.get('now_playing_source', '?')})")
 
     update = vs.get("software_update", {})
@@ -1183,7 +1183,7 @@ async def tesla_savings(
     gas_price: float = None,
     mpg_equivalent: int = None,
 ) -> str:
-    """Gas savings scorecard — how much you've saved vs a gas car.
+    """Gas savings scorecard -- how much you've saved vs a gas car.
 
     Args:
         gas_price: Gas price per gallon (default from TESLA_GAS_PRICE env, or $3.50)
@@ -1220,7 +1220,7 @@ async def tesla_savings(
         if USE_METRIC_UNITS:
             elec_cost = round(kwh * ELECTRICITY_RATE_RMB, 2)
             lines.append(f"**{label}:** {km:,.1f} km")
-            lines.append(f"  Electricity: {kwh:,.1f} kWh × ¥{ELECTRICITY_RATE_RMB} = ¥{elec_cost:,.2f}")
+            lines.append(f"  Electricity: {kwh:,.1f} kWh x JPY{ELECTRICITY_RATE_RMB} = JPY{elec_cost:,.2f}")
             lines.append("")
         else:
             mi = round(km * 0.621371, 1)
@@ -1231,15 +1231,15 @@ async def tesla_savings(
 
             lines.append(f"**{label}:** {mi:,.1f} mi")
             lines.append(
-                f"  Electricity: {kwh:,.1f} kWh × ${ELECTRICITY_RATE} = ${elec_cost:,.2f}"
+                f"  Electricity: {kwh:,.1f} kWh x ${ELECTRICITY_RATE} = ${elec_cost:,.2f}"
             )
             lines.append(
-                f"  Gas equivalent: {mi:,.1f} mi ÷ {_mpg} MPG × "
+                f"  Gas equivalent: {mi:,.1f} mi / {_mpg} MPG x "
                 f"${_gas}/gal = ${gas_cost:,.2f}"
             )
             lines.append(
-                f"  **Saved: ${saved:,.2f}** ({cost_per_mi}¢/mi electric vs "
-                f"{round(_gas / _mpg * 100, 1)}¢/mi gas)"
+                f"  **Saved: ${saved:,.2f}** ({cost_per_mi}c/mi electric vs "
+                f"{round(_gas / _mpg * 100, 1)}c/mi gas)"
             )
             lines.append("")
 
@@ -1252,7 +1252,7 @@ async def tesla_trip_cost(
     gas_price: float = None,
     mpg_equivalent: int = None,
 ) -> str:
-    """Estimate trip cost to a destination — kWh, cost, range check.
+    """Estimate trip cost to a destination -- kWh, cost, range check.
 
     Uses your personal 30-day average efficiency and current battery level.
 
@@ -1321,7 +1321,7 @@ async def tesla_trip_cost(
             f"**Trip to {dest_name}** ({road_km} km each way, {round_trip_km} km round trip)\n"
         ]
         lines.append(f"Estimated: {kwh_round} kWh @ {wh_per_km} Wh/km (your 30-day avg)")
-        lines.append(f"Cost: ¥{cost_round}")
+        lines.append(f"Cost: JPY{cost_round}")
         lines.append(f"Current battery: {bat}% ({_format_distance(range_km)})")
 
         if range_km >= round_trip_km:
@@ -1331,7 +1331,7 @@ async def tesla_trip_cost(
         else:
             pct_needed = min(95, round(round_trip_km / range_km * bat)) if range_km > 0 else 95
             lines.append(
-                f"Range: NOT sufficient — charge to {pct_needed}%+ before departure"
+                f"Range: NOT sufficient -- charge to {pct_needed}%+ before departure"
             )
     else:
         wh_per_mi = 300  # default
@@ -1359,7 +1359,7 @@ async def tesla_trip_cost(
         else:
             pct_needed = min(95, round(round_trip / range_mi * bat)) if range_mi > 0 else 95
             lines.append(
-                f"Range: NOT sufficient — charge to {pct_needed}%+ before departure"
+                f"Range: NOT sufficient -- charge to {pct_needed}%+ before departure"
             )
 
     return "\n".join(lines)
@@ -1367,21 +1367,21 @@ async def tesla_trip_cost(
 
 @mcp.tool()
 async def tesla_efficiency_by_temp() -> str:
-    """Efficiency curve by temperature — Wh/mi at different temps.
+    """Efficiency curve by temperature -- Wh/mi at different temps.
 
     Shows how outside temperature affects energy consumption.
     """
     rows = _query(f"""
         SELECT
             CASE
-                WHEN outside_temp_avg < 0 THEN 'Below 32°F'
-                WHEN outside_temp_avg < 4.4 THEN '32-40°F'
-                WHEN outside_temp_avg < 10 THEN '40-50°F'
-                WHEN outside_temp_avg < 15.6 THEN '50-60°F'
-                WHEN outside_temp_avg < 21.1 THEN '60-70°F'
-                WHEN outside_temp_avg < 26.7 THEN '70-80°F'
-                WHEN outside_temp_avg < 32.2 THEN '80-90°F'
-                ELSE 'Above 90°F'
+                WHEN outside_temp_avg < 0 THEN 'Below 32degF'
+                WHEN outside_temp_avg < 4.4 THEN '32-40degF'
+                WHEN outside_temp_avg < 10 THEN '40-50degF'
+                WHEN outside_temp_avg < 15.6 THEN '50-60degF'
+                WHEN outside_temp_avg < 21.1 THEN '60-70degF'
+                WHEN outside_temp_avg < 26.7 THEN '70-80degF'
+                WHEN outside_temp_avg < 32.2 THEN '80-90degF'
+                ELSE 'Above 90degF'
             END AS temp_range,
             COUNT(*) AS trips,
             SUM(distance) AS total_km,
@@ -1401,14 +1401,14 @@ async def tesla_efficiency_by_temp() -> str:
     if USE_METRIC_UNITS:
         # Temperature bins in Celsius
         temp_bins = {
-            'Below 32°F': 'Below 0°C',
-            '32-40°F': '0-4°C',
-            '40-50°F': '4-10°C',
-            '50-60°F': '10-16°C',
-            '60-70°F': '16-21°C',
-            '70-80°F': '21-27°C',
-            '80-90°F': '27-32°C',
-            'Above 90°F': 'Above 32°C',
+            'Below 32degF': 'Below 0degC',
+            '32-40degF': '0-4degC',
+            '40-50degF': '4-10degC',
+            '50-60degF': '10-16degC',
+            '60-70degF': '16-21degC',
+            '70-80degF': '21-27degC',
+            '80-90degF': '27-32degC',
+            'Above 90degF': 'Above 32degC',
         }
         lines = ["**Efficiency by Temperature**\n"]
         lines.append(f"{'Temp Range':<15} {'Trips':>6} {'Wh/km':>8} {'km':>10}")
@@ -1439,7 +1439,7 @@ async def tesla_efficiency_by_temp() -> str:
 
 @mcp.tool()
 async def tesla_charging_by_location() -> str:
-    """Charging patterns by location — where you charge and how much."""
+    """Charging patterns by location -- where you charge and how much."""
     rows = _query(f"""
         SELECT a.display_name AS location,
                COUNT(*) AS sessions,
@@ -1504,14 +1504,14 @@ async def tesla_top_destinations(limit: int = 15) -> str:
         dest = r.get("destination") or "Unknown"
         visits = r.get("visits", 0)
         km = r.get("total_km") or 0
-        lines.append(f"{i}. {dest} — {visits} visits ({_format_distance(km)} total)")
+        lines.append(f"{i}. {dest} -- {visits} visits ({_format_distance(km)} total)")
 
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def tesla_longest_trips(limit: int = 10) -> str:
-    """Top drives ranked by distance — your epic road trips.
+    """Top drives ranked by distance -- your epic road trips.
 
     Args:
         limit: Number of trips to show (default: 10)
@@ -1544,7 +1544,7 @@ async def tesla_longest_trips(limit: int = 10) -> str:
         end = r.get("end_loc") or "?"
         date = str(r.get("start_date", ""))[:10]
         kwh = r.get("consumption_kwh") or 0
-        lines.append(f"{i}. {_format_distance(dist_km)} — {start} → {end} ({date}, {dur}min, {kwh:.1f}kWh)")
+        lines.append(f"{i}. {_format_distance(dist_km)} -- {start} -> {end} ({date}, {dur}min, {kwh:.1f}kWh)")
 
     return "\n".join(lines)
 
@@ -1605,7 +1605,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
     prev_kwh = prev_r.get("total_kwh") or 0
 
     if USE_METRIC_UNITS:
-        lines = [f"**Monthly Report — {year}-{month:02d}**\n"]
+        lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]
         lines.append(f"Trips: {trips}")
         lines.append(f"Distance: {km:.1f} km")
         lines.append(f"Energy: {kwh:.1f} kWh")
@@ -1616,7 +1616,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
         mi = round(km * 0.621371)
         wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
         cost = round(kwh * ELECTRICITY_RATE, 2)
-        lines = [f"**Monthly Report — {year}-{month:02d}**\n"]
+        lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]
         lines.append(f"Trips: {trips}")
         lines.append(f"Distance: {mi} mi ({km:.1f} km)")
         lines.append(f"Energy: {kwh:.1f} kWh")
@@ -1677,7 +1677,7 @@ async def tesla_tpms_status() -> str:
         if soft:
             status = status + " + SOFT WARNING"
         pressures[pos] = bar
-        lines.append(f"{label}: {display} — {status}")
+        lines.append(f"{label}: {display} -- {status}")
 
     # Check consistency
     if len(pressures) >= 3:
@@ -1687,9 +1687,9 @@ async def tesla_tpms_status() -> str:
             if abs(bar - avg) > TPMS_WARN_DELTA:
                 label = dict(positions).get(pos, pos)
                 if USE_METRIC_UNITS:
-                    lines.append(f"  ⚠ {label} deviates {abs(bar-avg):.2f} bar from average")
+                    lines.append(f"  ! {label} deviates {abs(bar-avg):.2f} bar from average")
                 else:
-                    lines.append(f"  ⚠ {label} deviates {abs(bar-avg)*14.5038:.1f} psi from average")
+                    lines.append(f"  ! {label} deviates {abs(bar-avg)*14.5038:.1f} psi from average")
         if USE_METRIC_UNITS:
             lines.append(f"Average: {round(avg,2)} bar")
         else:
@@ -1735,22 +1735,22 @@ async def tesla_tpms_history(days: int = 30) -> str:
         rl = r.get("tpms_pressure_rl")
         rr = r.get("tpms_pressure_rr")
         if USE_METRIC_UNITS:
-            fl_s = f"{fl:.2f}" if fl else "—"
-            fr_s = f"{fr:.2f}" if fr else "—"
-            rl_s = f"{rl:.2f}" if rl else "—"
-            rr_s = f"{rr:.2f}" if rr else "—"
+            fl_s = f"{fl:.2f}" if fl else "--"
+            fr_s = f"{fr:.2f}" if fr else "--"
+            rl_s = f"{rl:.2f}" if rl else "--"
+            rr_s = f"{rr:.2f}" if rr else "--"
         else:
-            fl_s = f"{round(fl*14.5038,1)}" if fl else "—"
-            fr_s = f"{round(fr*14.5038,1)}" if fr else "—"
-            rl_s = f"{round(rl*14.5038,1)}" if rl else "—"
-            rr_s = f"{round(rr*14.5038,1)}" if rr else "—"
+            fl_s = f"{round(fl*14.5038,1)}" if fl else "--"
+            fr_s = f"{round(fr*14.5038,1)}" if fr else "--"
+            rl_s = f"{round(rl*14.5038,1)}" if rl else "--"
+            rr_s = f"{round(rr*14.5038,1)}" if rr else "--"
         lines.append(f"{date}: FL={fl_s} FR={fr_s} RL={rl_s} RR={rr_s} {unit_label}")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def tesla_monthly_summary(months: int = 6) -> str:
-    """Monthly driving summary — miles, kWh, cost, efficiency.
+    """Monthly driving summary -- miles, kWh, cost, efficiency.
 
     Args:
         months: Number of months to show (default: 6)
@@ -1816,7 +1816,7 @@ async def tesla_monthly_summary(months: int = 6) -> str:
 
 @mcp.tool()
 async def tesla_vampire_drain(days: int = 14) -> str:
-    """Vampire drain analysis — battery loss while parked overnight.
+    """Vampire drain analysis -- battery loss while parked overnight.
 
     Checks for periods where the car was parked (no drives) for 8+ hours
     and measures battery drop.
@@ -1871,11 +1871,11 @@ async def tesla_vampire_drain(days: int = 14) -> str:
     lines.append(f"\nAverage drain rate: {avg_rate}%/hr")
     if avg_rate > 1.0:
         lines.append(
-            "⚠ Above normal — check sentry mode camera activity "
+            "! Above normal -- check sentry mode camera activity "
             "or third-party app polling"
         )
     elif avg_rate > 0.5:
-        lines.append("Slightly elevated — sentry mode active?")
+        lines.append("Slightly elevated -- sentry mode active?")
     else:
         lines.append("Normal range for a parked Tesla")
 
