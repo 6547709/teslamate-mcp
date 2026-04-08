@@ -1,13 +1,9 @@
-"""Tesla MCP Server -- TeslaMate analytics + Owner API real-time data.
+"""Tesla MCP Server -- TeslaMate vehicle analytics.
 
 See README.md (English) or README_zh.md for full documentation.
 
-Single-file FastMCP server. Stdio transport. Works with TeslaMate, Owner API,
-or both -- tools are available based on which backends you configure.
-
-Two data paths:
-  1. TeslaMate Postgres (read-only) -- historical telemetry and analytics
-  2. Tesla Owner API (read-only live data from TeslaMate DB)
+Single-file FastMCP server. Stdio transport. All data is read-only
+from TeslaMate's PostgreSQL database -- no Owner API, no token decryption.
 
 Read tools (TeslaMate):
   tesla_status            -- Current vehicle state (battery, range, location, climate)
@@ -18,8 +14,12 @@ Read tools (TeslaMate):
   tesla_location_history  -- Where the car has been, time at each location
   tesla_state_history     -- Vehicle state transitions (online/asleep/offline)
   tesla_software_updates  -- Firmware version history
-
-Analytics tools (TeslaMate):
+  tesla_driving_score    -- Driving behaviour score
+  tesla_trips_by_category -- Trip classification (commute, long_trip, etc.)
+  tesla_trip_categories   -- Count trips by category
+  tesla_monthly_report    -- Single month summary with comparison
+  tesla_tpms_status        -- Current tyre pressures with anomaly warnings
+  tesla_tpms_history       -- Recent TPMS history
   tesla_savings           -- Gas savings scorecard
   tesla_trip_cost         -- Estimate trip cost to a destination
   tesla_efficiency_by_temp -- Efficiency curve by temperature
@@ -28,9 +28,14 @@ Analytics tools (TeslaMate):
   tesla_longest_trips     -- Top drives ranked by distance
   tesla_monthly_summary   -- Monthly driving summary
   tesla_vampire_drain     -- Battery loss while parked
-
-Live data tool (Owner API):
-  tesla_live              -- Real-time vehicle data from Owner API
+  tesla_live              -- Latest polled vehicle state (from positions table)
+  calculate_eco_savings_vs_ice -- ICE vs EV cost/CO2 comparison
+  generate_travel_narrative_context -- Travel timeline for LLM blogging
+  get_vehicle_persona_status -- Vehicle activity/fatigue/persona metrics
+  check_driving_achievements -- Driving achievements (eco, midnight, cold)
+  get_charging_vintage_data -- Single charge detailed parameters
+  generate_weekend_blindbox -- Rare one-time destinations as blindbox recommendation
+  generate_monthly_driving_report -- Polished Markdown monthly report
 
 Environment variables:
   # TeslaMate Postgres
@@ -39,9 +44,6 @@ Environment variables:
   TESLAMATE_DB_USER     -- Postgres user (default: teslamate)
   TESLAMATE_DB_PASS     -- Postgres password
   TESLAMATE_DB_NAME     -- Postgres database (default: teslamate)
-
-  # Encryption key (TeslaMate's ENCRYPTION_KEY -- required for Owner API)
-  ENCRYPTION_KEY        -- AES-256 key used to decrypt tokens from DB
 
   # Vehicle config
   TESLA_CAR_ID          -- TeslaMate car ID (default: 1)
@@ -65,12 +67,9 @@ import os
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-import httpx
 import psycopg2
 import psycopg2.extras
 from fastmcp import FastMCP
-
-import tesla_auth  # noqa: F401  token 读取与解密
 
 # -- Configuration ------------------------------------------------------------
 
@@ -81,14 +80,7 @@ DB_USER = os.environ.get("TESLAMATE_DB_USER", "teslamate")
 DB_PASS = os.environ.get("TESLAMATE_DB_PASS", "")
 DB_NAME = os.environ.get("TESLAMATE_DB_NAME", "teslamate")
 
-# Encryption key (same as TeslaMate's ENCRYPTION_KEY)
-ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
-if not ENCRYPTION_KEY:
-    raise RuntimeError("ENCRYPTION_KEY environment variable is required")
-
-# Owner API (read from TeslaMate DB -- no file, no manual refresh)
-OWNER_API_URL = "https://owner-api.tesla.com"
-HAS_OWNER_API = bool(DB_HOST and DB_PASS and ENCRYPTION_KEY)
+# Owner API is no longer used -- all data comes from TeslaMate PostgreSQL
 
 # Vehicle-specific
 CAR_ID = int(os.environ.get("TESLA_CAR_ID", "1"))
@@ -138,40 +130,6 @@ LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "20"))
 LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "20"))
 
 mcp = FastMCP("tesla")
-
-# -- Owner API Token (delegated to tesla_auth) --------------------------------
-
-def _get_access_token() -> str:
-    """从 tesla_auth 获取解密后的 access token。"""
-    return tesla_auth.get_decrypted_access_token()
-
-
-async def _owner_api_get(path: str) -> dict:
-    """GET from Tesla Owner API，使用 tesla_auth 中的解密 token。
-
-    若遇到 401 Unauthorized，说明 access token 已过期，
-    自动清除缓存并重试一次（TeslaMate 会在此时自动刷新 token）。
-    """
-    if not HAS_OWNER_API:
-        raise RuntimeError("Owner API 未配置。请设置 TESLAMATE_DB_HOST、TESLAMATE_DB_PASS 和 ENCRYPTION_KEY。")
-
-    token = _get_access_token()
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            f"{OWNER_API_URL}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if resp.status_code == 401:
-            # Token 过期，清除缓存并重试
-            tesla_auth.clear_token_cache()
-            token = _get_access_token()
-            resp = await client.get(
-                f"{OWNER_API_URL}{path}",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        resp.raise_for_status()
-        return resp.json()
-
 
 # -- DB helper -----------------------------------------------------------------
 
@@ -989,153 +947,156 @@ async def tesla_software_updates() -> str:
     return "\n".join(lines)
 
 
-# -- Owner API Live Data -------------------------------------------------------
+# -- Live Data (from positions table) -------------------------------------------
 
 
 @mcp.tool()
 async def tesla_live() -> str:
-    """Live vehicle data from Tesla Owner API -- real-time battery, charging, climate.
+    """Latest polled vehicle state from TeslaMate -- battery, climate, location.
 
-    Uses tokens shared with TeslaMate (decrypted from DB). More current than
-    TeslaMate which polls on intervals.
+    Data comes from TeslaMate's positions table (polled periodically, not
+    real-time). Fields like sentry mode, lock status, and media are not
+    available in TeslaMate and are omitted.
     """
-    if not HAS_OWNER_API:
-        return "Owner API not configured. Set ENCRYPTION_KEY and TeslaMate DB env vars."
+    # Latest position snapshot
+    pos = _query_one(f"""
+        SELECT battery_level, ideal_battery_range_km,
+               is_climate_on, inside_temp, outside_temp, driver_temp_setting,
+               odometer, speed, power,
+               latitude, longitude, date
+        FROM positions
+        WHERE car_id = {CAR_ID}
+        ORDER BY date DESC
+        LIMIT 1
+    """)
 
-    # Get vehicle list to find vehicle_id
-    vehicles_resp = await _owner_api_get("/api/1/vehicles")
-    vehicles = vehicles_resp.get("response", [])
-    if not vehicles:
-        return "No vehicles found."
+    # Latest charging session (to determine charging state)
+    charge = _query_one(f"""
+        SELECT start_date, end_date, charge_energy_added,
+               start_battery_level, end_battery_level,
+               charge_limit_soc
+        FROM charging_processes
+        WHERE car_id = {CAR_ID}
+        ORDER BY start_date DESC
+        LIMIT 1
+    """)
 
-    # Find the first vehicle (or filter by CAR_ID - for multi-car support later)
-    vehicle = vehicles[0]
-    vehicle_id = vehicle.get("id")
-    if not vehicle_id:
-        return "Could not determine vehicle ID from API response."
+    # Latest software version
+    update = _query_one(f"""
+        SELECT version FROM updates
+        WHERE car_id = {CAR_ID}
+        ORDER BY start_date DESC
+        LIMIT 1
+    """)
 
-    # Get live vehicle data
-    data = await _owner_api_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
-    r = data.get("response", {})
-    cs = r.get("charge_state", {})
-    cl = r.get("climate_state", {})
-    vs = r.get("vehicle_state", {})
-    ds = r.get("drive_state", {})
+    # Vehicle name
+    car = _query_one(f"SELECT name, model FROM cars WHERE id = {CAR_ID} LIMIT 1")
 
-    vehicle_name = vs.get("vehicle_name") or "Tesla"
-    lines = [f"**{vehicle_name}** (live)\n"]
+    if not pos:
+        return "No position data found. Is TeslaMate running?"
 
-    # Battery range - API returns miles
-    bat_range = cs.get('battery_range', 0)
+    vehicle_name = (car.get("name") or car.get("model") or "Tesla") if car else "Tesla"
+    lines = [f"**{vehicle_name}** (TeslaMate polled)\n"]
+
+    # Battery
+    bat = pos.get("battery_level")
+    range_km = pos.get("ideal_battery_range_km")
     if USE_METRIC_UNITS:
-        bat_range_km = round(bat_range * 1.60934)
-        lines.append(f"Battery: {cs.get('battery_level')}% ({bat_range_km} km)")
+        lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
     else:
-        lines.append(f"Battery: {cs.get('battery_level')}% ({bat_range:.0f} mi)")
+        range_mi = _km_to_mi(range_km)
+        lines.append(f"Battery: {bat}% ({range_mi} mi)")
 
-    lines.append(
-        f"Charging: {cs.get('charging_state')} (limit {cs.get('charge_limit_soc')}%)"
+    # Charging state
+    is_charging = (
+        charge
+        and charge.get("end_date") is None
+        and charge.get("start_date") is not None
     )
-    if cs.get("charging_state") == "Charging":
-        rate = cs.get("charge_rate", 0)
-        added = cs.get("charge_energy_added", 0)
-        mins = cs.get("minutes_to_full_charge", 0)
-        if USE_METRIC_UNITS:
-            rate_kmh = round(rate * 1.60934)
-            lines.append(f"  Rate: {rate_kmh} km/h, {added:.1f} kWh added, {mins} min to full")
-        else:
-            lines.append(f"  Rate: {rate} mph, {added:.1f} kWh added, {mins} min to full")
+    if is_charging:
+        added = charge.get("charge_energy_added") or 0
+        limit = charge.get("charge_limit_soc") or "?"
+        lines.append(f"Charging: Yes (added {added:.1f} kWh, limit {limit}%)")
+    else:
+        lines.append("Charging: Not charging")
 
-    inside_t = _format_temp(cl.get("inside_temp"))
-    outside_t = _format_temp(cl.get("outside_temp"))
+    # Climate
+    inside_t = _format_temp(pos.get("inside_temp"))
+    outside_t = _format_temp(pos.get("outside_temp"))
     lines.append(
-        f"Climate: {'ON' if cl.get('is_climate_on') else 'Off'}"
+        f"Climate: {'ON' if pos.get('is_climate_on') else 'Off'}"
         f", inside {inside_t}, outside {outside_t}"
     )
-    if cl.get("is_climate_on"):
-        target_t = _format_temp(cl.get("driver_temp_setting"))
+    if pos.get("is_climate_on"):
+        target_t = _format_temp(pos.get("driver_temp_setting"))
         lines.append(f"  Target: {target_t}")
 
-    lines.append(f"Locked: {'Yes' if vs.get('locked') else 'No'}")
-    lines.append(f"Sentry: {'On' if vs.get('sentry_mode') else 'Off'}")
-    lines.append(f"Software: {vs.get('car_version', '?')}")
+    # Odometer
+    odo_km = pos.get("odometer")
+    if odo_km:
+        lines.append(f"Odometer: {_format_distance(odo_km)}")
 
-    # Odometer - API returns miles
-    odo = vs.get('odometer', 0)
-    if USE_METRIC_UNITS:
-        odo_km = round(odo * 1.60934)
-        lines.append(f"Odometer: {odo_km:,} km")
-    else:
-        lines.append(f"Odometer: {odo:,.0f} mi")
-
-    if ds.get("speed"):
-        speed = ds['speed']
+    # Speed
+    speed = pos.get("speed")
+    if speed is not None and speed > 0:
         if USE_METRIC_UNITS:
-            speed_kmh = round(speed * 1.60934)
-            lines.append(f"Driving: {speed_kmh} km/h")
+            lines.append(f"Driving: {round(speed * 3.6)} km/h")
         else:
-            lines.append(f"Driving: {speed} mph")
+            lines.append(f"Driving: {round(speed * 2.237)} mph")
     else:
         lines.append("Driving: Parked")
 
-    # Vehicle location
-    lat = ds.get("latitude")
-    lon = ds.get("longitude")
+    # Location
+    lat = pos.get("latitude")
+    lon = pos.get("longitude")
     if lat and lon:
         lines.append(f"Location: {lat:.5f}, {lon:.5f}")
-        # Try to match with TeslaMate geofences
         try:
             nearby = _query_one(
-                f"""
-                SELECT name, latitude, longitude, radius,
-                       6371 * 2 * ASIN(SQRT(
-                           POWER(SIN((RADIANS(%s) - RADIANS(latitude)) / 2), 2) +
-                           COS(RADIANS(%s)) * COS(RADIANS(latitude)) *
-                           POWER(SIN((RADIANS(%s) - RADIANS(longitude)) / 2), 2)
-                       )) AS distance_km
-                FROM geofences
-                ORDER BY distance_km ASC LIMIT 1
-                """,
-                (lat, lat, lon),
+                """
+                SELECT name, radius, dist.distance_m FROM geofences,
+                LATERAL (SELECT (6371000 * acos(
+                           cos(radians(%s)) * cos(radians(latitude))
+                           * cos(radians(longitude) - radians(%s))
+                           + sin(radians(%s)) * sin(radians(latitude))
+                   )) AS distance_m) dist
+                WHERE dist.distance_m <= radius
+                ORDER BY dist.distance_m
+                LIMIT 1
+            """,
+                (lat, lon, lat),
             )
             if nearby and nearby.get("name"):
-                dist = nearby.get("distance_km", 0)
-                dist_str = f" ({dist:.1f}km away)" if dist and dist > 0.5 else ""
+                dist = nearby.get("distance_m", 0)
+                dist_str = f" ({dist / 1000:.1f}km away)" if dist and dist > 500 else ""
                 lines.append(f"  Near: {nearby['name']}{dist_str}")
         except Exception:
-            pass  # Geofence lookup is best-effort
+            pass
     else:
         lines.append("Location: unavailable")
 
+    # TPMS
     tires = []
-    for pos, label in [("fl", "FL"), ("fr", "FR"), ("rl", "RL"), ("rr", "RR")]:
-        bar = vs.get(f"tpms_pressure_{pos}")
-        if bar:
-            warn = " !" if vs.get(f"tpms_soft_warning_{pos}") else ""
+    for pos_key, label in [
+        ("tpms_pressure_fl", "FL"),
+        ("tpms_pressure_fr", "FR"),
+        ("tpms_pressure_rl", "RL"),
+        ("tpms_pressure_rr", "RR"),
+    ]:
+        bar = pos.get(pos_key)
+        if bar is not None:
             if USE_METRIC_UNITS:
-                tires.append(f"{label}:{bar:.2f} bar{warn}")
+                tires.append(f"{label}:{bar:.2f} bar")
             else:
-                psi = round(bar * 14.5038, 1)
-                tires.append(f"{label}:{psi} psi{warn}")
+                tires.append(f"{label}:{round(bar * 14.5038, 1)} psi")
     if tires:
         lines.append(f"Tires: {', '.join(tires)}")
 
-    media = vs.get("media_info", {})
-    title = media.get("now_playing_title", "")
-    artist = media.get("now_playing_artist", "")
-    if title:
-        playing = title
-        if artist:
-            playing = f"{artist} -- {title}"
-        lines.append(f"Playing: {playing} ({media.get('now_playing_source', '?')})")
+    # Software version
+    if update and update.get("version"):
+        lines.append(f"Software: {update['version']}")
 
-    update = vs.get("software_update", {})
-    if update.get("status") and update.get("version", "").strip():
-        lines.append(
-            f"Update available: {update['version'].strip()} "
-            f"(est. {update.get('expected_duration_sec', 0) // 60} min)"
-        )
-
+    lines.append(f"Last poll: {str(pos.get('date', ''))[:19]}")
     return "\n".join(lines)
 
 
@@ -1616,56 +1577,58 @@ async def tesla_monthly_report(year: int, month: int) -> str:
 async def tesla_tpms_status() -> str:
     """Current TPMS pressures with warnings for anomalies.
 
-    Warns if any tire is below TESLA_TPMS_MIN_THRESHOLD or above
-    TESLA_TPMS_MAX_THRESHOLD, or if any tire differs from the average by > 0.15 bar.
+    Reads from the latest position record in TeslaMate.
+    Warns if any tyre is below TESLA_TPMS_MIN_THRESHOLD or above
+    TESLA_TPMS_MAX_THRESHOLD, or differs from the average by > 0.15 bar.
     """
-    if not HAS_OWNER_API:
-        return "Owner API not configured."
+    pos = _query_one(f"""
+        SELECT date,
+               tpms_pressure_fl, tpms_pressure_fr,
+               tpms_pressure_rl, tpms_pressure_rr
+        FROM positions
+        WHERE car_id = {CAR_ID}
+          AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL
+               OR tpms_pressure_rl IS NOT NULL OR tpms_pressure_rr IS NOT NULL)
+        ORDER BY date DESC
+        LIMIT 1
+    """)
 
-    vehicles_resp = await _owner_api_get("/api/1/vehicles")
-    vehicles = vehicles_resp.get("response", [])
-    if not vehicles:
-        return "No vehicles found."
-    vehicle_id = vehicles[0].get("id")
-    if not vehicle_id:
-        return "Could not determine vehicle ID from API response."
-
-    data = await _owner_api_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
-    vs = data.get("response", {}).get("vehicle_state", {})
-
-    positions = [("fl", "Front Left"), ("fr", "Front Right"),
-                 ("rl", "Rear Left"), ("rr", "Rear Right")]
+    positions = [
+        ("tpms_pressure_fl", "Front Left"),
+        ("tpms_pressure_fr", "Front Right"),
+        ("tpms_pressure_rl", "Rear Left"),
+        ("tpms_pressure_rr", "Rear Right"),
+    ]
     pressures = {}
     lines = ["**TPMS Status**\n"]
 
-    for pos, label in positions:
-        bar = vs.get(f"tpms_pressure_{pos}")
+    if not pos:
+        return "No TPMS data available."
+
+    for key, label in positions:
+        bar = pos.get(key)
         if bar is None:
             lines.append(f"{label}: N/A")
             continue
-        psi = round(bar * 14.5038, 1)
         if USE_METRIC_UNITS:
             display = f"{bar:.2f} bar"
         else:
-            display = f"{psi} psi"
+            display = f"{round(bar * 14.5038, 1)} psi"
         status = "OK"
         if bar < TPMS_MIN:
             status = f"LOW (< {TPMS_MIN} bar)"
         elif bar > TPMS_MAX:
             status = f"HIGH (> {TPMS_MAX} bar)"
-        soft = vs.get(f"tpms_soft_warning_{pos}")
-        if soft:
-            status = status + " + SOFT WARNING"
-        pressures[pos] = bar
+        pressures[key] = bar
         lines.append(f"{label}: {display} -- {status}")
 
-    # Check consistency
+    # Consistency check
     if len(pressures) >= 3:
         vals = list(pressures.values())
         avg = sum(vals) / len(vals)
-        for pos, bar in pressures.items():
+        for key, bar in pressures.items():
             if abs(bar - avg) > TPMS_WARN_DELTA:
-                label = dict(positions).get(pos, pos)
+                label = dict(positions).get(key, key)
                 if USE_METRIC_UNITS:
                     lines.append(f"  ! {label} deviates {abs(bar-avg):.2f} bar from average")
                 else:
@@ -1675,6 +1638,7 @@ async def tesla_tpms_status() -> str:
         else:
             lines.append(f"Average: {round(avg*14.5038,1)} psi")
 
+    lines.append(f"\nLast reading: {str(pos.get('date', ''))[:19]}")
     return "\n".join(lines)
 
 

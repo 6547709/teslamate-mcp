@@ -1,7 +1,7 @@
 [project]
 name = "mcp-teslamate-fleet"
 version = "0.1.0"
-description = "MCP server for TeslaMate analytics + Owner API real-time data"
+description = "MCP server for TeslaMate analytics — all data from TeslaMate PostgreSQL, no Tesla API token required"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ mcp-teslamate-fleet = "tesla:mcp.run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-include = ["tesla.py", "tesla_auth.py"]
+include = ["tesla.py"]
 
 [build-system]
 requires = ["hatchling"]

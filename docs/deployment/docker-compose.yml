@@ -1,6 +1,5 @@
 # TeslaMate MCP — Docker Compose snippet
 # Add this to your existing teslamate docker-compose.yml
-# IMPORTANT: ENCRYPTION_KEY must match your teslamate service's ENCRYPTION_KEY
 
 services:
   teslamate-mcp:
@@ -16,8 +15,6 @@ services:
       - TESLAMATE_DB_USER=teslamate
       - TESLAMATE_DB_PASS=secret
       - TESLAMATE_DB_NAME=teslamate
-      # Encryption key — MUST match your teslamate service's ENCRYPTION_KEY
-      - ENCRYPTION_KEY=your_teslamate_encryption_key_here
       # HTTP server mode
       - MCP_TRANSPORT=streamable-http
       - HTTP_HOST=0.0.0.0

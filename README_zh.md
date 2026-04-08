@@ -2,9 +2,9 @@
 
 [English](README.md) | [中文](README_zh.md)
 
-基于 **TeslaMate** 历史数据和 **Tesla Owner API** 实时数据的 MCP 服务器。仅读取数据，不包含车辆控制功能。支持 [Claude Code](https://claude.ai/code)、[OpenClaw](https://openclaw.dev) 及所有 MCP 兼容客户端。
+基于 **TeslaMate** PostgreSQL 数据库的 MCP 服务器。仅读取数据，不包含车辆控制功能。支持 [Claude Code](https://claude.ai/code)、[OpenClaw](https://openclaw.dev) 及所有 MCP 兼容客户端。
 
-**上游项目：** 本项目 fork 自 [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet)，进行了大幅改造，使用 TeslaMate 原生 Owner API Token（无需单独配置 Fleet API）。
+**上游项目：** 本项目 fork 自 [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet)，进行了大幅定制化改造。
 
 ---
 
@@ -17,7 +17,7 @@
 | **状态** | `tesla_status`、`tesla_drives`、`tesla_charging_history`、`tesla_battery_health`、`tesla_efficiency`、`tesla_location_history`、`tesla_state_history`、`tesla_software_updates` | TeslaMate 数据库 |
 | **分析** | `tesla_savings`、`tesla_trip_cost`、`tesla_efficiency_by_temp`、`tesla_charging_by_location`、`tesla_top_destinations`、`tesla_longest_trips`、`tesla_monthly_summary`、`tesla_vampire_drain`、`calculate_eco_savings_vs_ice` | TeslaMate 数据库 |
 | **增强** | `tesla_driving_score`、`tesla_trips_by_category`、`tesla_trip_categories`、`tesla_monthly_report`、`tesla_tpms_status`、`tesla_tpms_history`、`generate_travel_narrative_context`、`get_vehicle_persona_status` | TeslaMate 数据库 |
-| **实时** | `tesla_live`（GPS、电池、温度、充电状态） | Tesla Owner API |
+| **实时** | `tesla_live`（GPS、电池、温度、充电状态） | TeslaMate 数据库 |
 
 ### 新增工具说明
 
@@ -77,8 +77,6 @@ services:
       - TESLAMATE_DB_USER=teslamate
       - TESLAMATE_DB_PASS=secret
       - TESLAMATE_DB_NAME=teslamate
-      # 加密密钥（必须与 teslamate 服务的 ENCRYPTION_KEY 一致）
-      - ENCRYPTION_KEY=你的teslamate加密密钥
       # HTTP 服务模式
       - MCP_TRANSPORT=streamable-http
       - HTTP_HOST=0.0.0.0
@@ -93,8 +91,6 @@ services:
     depends_on:
       - database
 ```
-
-> **重要：** `ENCRYPTION_KEY` 必须与 teslamate 服务中配置的值一致。在 teslamate 的 `docker-compose.yml` 环境变量中查找。
 
 **2. 启动容器：**
 
@@ -158,7 +154,6 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 | `TESLAMATE_DB_USER` | `teslamate` | 数据库用户名 |
 | `TESLAMATE_DB_PASS` | *（必填）* | 数据库密码 |
 | `TESLAMATE_DB_NAME` | `teslamate` | 数据库名称 |
-| `ENCRYPTION_KEY` | *（必填）* | 必须与 teslamate 服务的 `ENCRYPTION_KEY` 完全一致 |
 
 ### 服务模式
 
@@ -223,26 +218,19 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 
 ## 工作原理
 
-单文件 Python 服务器（~1700 行），使用 **FastMCP** 框架。两条数据路径：
+单文件 Python 服务器（~2700 行），使用 **FastMCP** 框架。直接从 TeslaMate PostgreSQL 数据库读取所有数据：
 
 ```
-┌─────────────┐     ┌──────────────┐
-│  TeslaMate   │────▶│   Postgres   │──┐
-│  (数据记录)   │     │  (TeslaMate) │  │
-└─────────────┘     └──────────────┘  │   ┌───────────┐     ┌────────────┐
-                                       ├──▶│ tesla.py  │────▶│ MCP 客户端  │
-                                       │   │(HTTP/:8080)│     │(OpenClaw,   │
-┌─────────────┐     ┌──────────────┐  │   └───────────┘     │Claude Code) │
-│  Tesla       │────▶│ Owner API    │──┘                     └────────────┘
-│  Owner API   │     │(Token 来自   │
-└─────────────┘     │ TeslaMate DB) │
-                    └──────────────┘
+┌─────────────┐     ┌──────────────┐     ┌───────────┐     ┌────────────┐
+│  TeslaMate   │────▶│   Postgres   │────▶│ tesla.py  │────▶│ MCP 客户端  │
+│  (数据记录)   │     │  (TeslaMate) │     │(HTTP/:8080)│     │(OpenClaw,   │
+└─────────────┘     └──────────────┘     └───────────┘     │Claude Code) │
+                                                            └────────────┘
 ```
 
 **核心机制：**
-- OAuth Token 直接从 TeslaMate 的 PostgreSQL 数据库读取，使用 `ENCRYPTION_KEY` 解密
-- 无需单独注册 Tesla 开发者账号或配置 Fleet API
-- TeslaMate 自动处理 Token 刷新
+- 所有数据直接来自 TeslaMate PostgreSQL 数据库，无需 Tesla Owner API
+- 无需单独注册 Tesla 开发者账号或配置任何 API Token
 
 ---
 
@@ -270,7 +258,7 @@ git push origin v0.1.0
 
 ## 致谢
 
-本项目 fork 自 [@lodordev](https://github.com/lodordev) 的 [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet)，感谢原作者提供了 Tesla MCP 整合的基础架构。本 fork 在此基础上进行了认证方式重构（使用 TeslaMate 原生 Owner API Token）、移除车辆控制功能（提升安全性）、以及新增增强分析功能。
+本项目 fork 自 [@lodordev](https://github.com/lodordev) 的 [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet)，感谢原作者提供了 Tesla MCP 整合的基础架构。本 fork 在此基础上移除了车辆控制功能（提升安全性）、所有数据仅从 TeslaMate 数据库读取（无需任何 Tesla API Token）、以及新增增强分析功能。
 
 使用 [FastMCP](https://github.com/jlowin/fastmcp) 和 [TeslaMate](https://github.com/teslamate-org/teslamate) 构建。
 

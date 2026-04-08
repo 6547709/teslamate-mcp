@@ -2,9 +2,9 @@
 
 [English](README.md) | [中文](README_zh.md)
 
-A Model Context Protocol (MCP) server providing Tesla vehicle analytics through **TeslaMate** historical data and **Tesla Owner API** real-time data. Read-only — no vehicle commands. Works with [Claude Code](https://claude.ai/code), [OpenClaw](https://openclaw.dev), and any MCP-compatible client.
+A Model Context Protocol (MCP) server providing Tesla vehicle analytics through **TeslaMate** PostgreSQL database. Read-only — no vehicle commands. Works with [Claude Code](https://claude.ai/code), [OpenClaw](https://openclaw.dev), and any MCP-compatible client.
 
-**Upstream:** This project is a fork of [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet), refactored to use TeslaMate's native Owner API tokens (no separate Fleet API setup required).
+**Upstream:** This project is a fork of [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet), heavily customized for this deployment.
 
 ---
 
@@ -17,7 +17,7 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 | **Status** | `tesla_status`, `tesla_drives`, `tesla_charging_history`, `tesla_battery_health`, `tesla_efficiency`, `tesla_location_history`, `tesla_state_history`, `tesla_software_updates` | TeslaMate DB |
 | **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain`, `calculate_eco_savings_vs_ice` | TeslaMate DB |
 | **Enhanced** | `tesla_driving_score`, `tesla_trips_by_category`, `tesla_trip_categories`, `tesla_monthly_report`, `tesla_tpms_status`, `tesla_tpms_history`, `generate_travel_narrative_context`, `get_vehicle_persona_status` | TeslaMate DB |
-| **Live** | `tesla_live` (GPS, battery, climate, charging) | Tesla Owner API |
+| **Live** | `tesla_live` (GPS, battery, climate, charging) | TeslaMate DB |
 
 ### New Tools
 
@@ -77,8 +77,6 @@ services:
       - TESLAMATE_DB_USER=teslamate
       - TESLAMATE_DB_PASS=secret
       - TESLAMATE_DB_NAME=teslamate
-      # Encryption key (same ENCRYPTION_KEY as your teslamate service)
-      - ENCRYPTION_KEY=your_teslamate_encryption_key_here
       # HTTP server mode
       - MCP_TRANSPORT=streamable-http
       - HTTP_HOST=0.0.0.0
@@ -94,7 +92,6 @@ services:
       - database
 ```
 
-> **Important:** The `ENCRYPTION_KEY` must match the one configured in your teslamate service. Find it in your teslamate `docker-compose.yml` environment variables.
 
 **2. Start the container:**
 
@@ -160,7 +157,6 @@ All configuration is via environment variables.
 | `TESLAMATE_DB_USER` | `teslamate` | PostgreSQL user |
 | `TESLAMATE_DB_PASS` | *(required)* | PostgreSQL password |
 | `TESLAMATE_DB_NAME` | `teslamate` | Database name |
-| `ENCRYPTION_KEY` | *(required)* | Must match your teslamate's `ENCRYPTION_KEY` |
 
 ### Server Mode
 
@@ -225,26 +221,19 @@ Set to `-1` for unlimited results.
 
 ## Architecture
 
-Single-file Python server (~1700 lines) using **FastMCP**. Two data paths:
+Single-file Python server (~2700 lines) using **FastMCP**. All data comes directly from TeslaMate PostgreSQL:
 
 ```
-┌─────────────┐     ┌──────────────┐
-│  TeslaMate   │────▶│   Postgres   │──┐
-│  (logger)    │     │  (TeslaMate) │  │
-└─────────────┘     └──────────────┘  │   ┌───────────┐     ┌────────────┐
-                                       ├──▶│ tesla.py  │────▶│ MCP Client │
-                                       │   │(HTTP/:8080)│     │(OpenClaw,   │
-┌─────────────┐     ┌──────────────┐  │   └───────────┘     │ Claude Code)│
-│  Tesla       │────▶│ Owner API    │──┘                     └────────────┘
-│  Owner API   │     │(tokens from  │
-└─────────────┘     │ TeslaMate DB) │
-                    └──────────────┘
+┌─────────────┐     ┌──────────────┐     ┌───────────┐     ┌────────────┐
+│  TeslaMate   │────▶│   Postgres   │────▶│ tesla.py  │────▶│ MCP Client │
+│  (logger)    │     │  (TeslaMate) │     │(HTTP/:8080)│     │(OpenClaw,   │
+└─────────────┘     └──────────────┘     └───────────┘     │ Claude Code)│
+                                                            └────────────┘
 ```
 
 **How it works:**
-- Tokens are read directly from TeslaMate's PostgreSQL database, encrypted with your `ENCRYPTION_KEY`
-- No separate Tesla Developer account or Fleet API setup required
-- TeslaMate handles all OAuth token refresh automatically
+- All data is read directly from TeslaMate's PostgreSQL database
+- No Tesla Owner API, no separate Tesla Developer account, no API tokens required
 
 ---
 
@@ -272,7 +261,7 @@ The image will be available at `ghcr.io/<your-username>/teslamate-mcp:<tag>`.
 
 ## Acknowledgments
 
-This project is a fork of [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet) by [@lodordev](https://github.com/lodordev). The original project provided the foundation for Tesla MCP integration. This fork refactors the authentication to use TeslaMate's native Owner API tokens, removes command functionality for security, and adds enhanced analytics features.
+This project is a fork of [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet) by [@lodordev](https://github.com/lodordev). The original project provided the foundation for Tesla MCP integration. This fork removes command functionality for security, uses TeslaMate database as the sole data source, and adds enhanced analytics features.
 
 Built with [FastMCP](https://github.com/jlowin/fastmcp) and [TeslaMate](https://github.com/teslamate-org/teslamate).
 
