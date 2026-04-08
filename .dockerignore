@@ -4,5 +4,4 @@ __pycache__
 .github
 *.egg-info
 .eggs
-*.md
 docs
