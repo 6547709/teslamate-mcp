@@ -64,7 +64,8 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 import psycopg2
@@ -80,6 +81,10 @@ DB_PORT = int(os.environ.get("TESLAMATE_DB_PORT", "5432"))
 DB_USER = os.environ.get("TESLAMATE_DB_USER", "teslamate")
 DB_PASS = os.environ.get("TESLAMATE_DB_PASS", "")
 DB_NAME = os.environ.get("TESLAMATE_DB_NAME", "teslamate")
+
+# User timezone (for display/output -- DB stores UTC)
+TIMEZONE = os.environ.get("TIMEZONE", "Asia/Shanghai")
+USER_TZ = ZoneInfo(TIMEZONE)
 
 # Owner API is no longer used -- all data comes from TeslaMate PostgreSQL
 
@@ -131,6 +136,32 @@ LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "20"))
 LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "20"))
 
 mcp = FastMCP("tesla")
+
+# -- Timezone helpers ----------------------------------------------------------
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as a timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _format_dt(dt: datetime | None) -> str:
+    """Convert a UTC datetime to user timezone string, or 'N/A' if None."""
+    if dt is None:
+        return "N/A"
+    # Handle cases where a string was passed instead of datetime
+    if isinstance(dt, str):
+        if not dt:
+            return "N/A"
+        try:
+            dt = datetime.fromisoformat(dt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return dt[:16]
+    # Ensure UTC-aware
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(USER_TZ).strftime("%Y-%m-%d %H:%M")
+
 
 # -- DB helper -----------------------------------------------------------------
 
@@ -360,7 +391,7 @@ async def tesla_status() -> str:
             else:
                 lines.append("Location: unknown")
 
-        lines.append(f"Last update: {str(pos.get('date', 'unknown'))[:19]}")
+        lines.append(f"Last update: {_format_dt(pos.get('date'))}")
 
     if charge and charge.get("end_date"):
         kwh = charge.get("charge_energy_added") or 0
@@ -380,7 +411,7 @@ async def tesla_charging_history(days: int = 30) -> str:
 
     Shows energy added, duration, battery range, and location for each session.
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
         SELECT cp.start_date, cp.end_date,
@@ -419,7 +450,7 @@ async def tesla_charging_history(days: int = 30) -> str:
         start_pct = r.get("start_battery_level", "?")
         end_pct = r.get("end_battery_level", "?")
         loc = r.get("location") or "Unknown"
-        date_str = str(r.get("start_date", ""))[:16]
+        date_str = _format_dt(r.get("start_date"))
         cost_str = f" (RMB{cost:.2f})" if cost else ""
         lines.append(
             f"- {date_str}: {kwh:.1f} kWh, {dur} min, {start_pct}% -> {end_pct}%, {loc}{cost_str}"
@@ -436,7 +467,7 @@ async def tesla_drives(days: int = 30) -> str:
 
     Shows the last N days of driving activity with energy consumption.
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
         SELECT d.start_date, d.end_date,
@@ -469,7 +500,7 @@ async def tesla_drives(days: int = 30) -> str:
         total_min += dur
         start = r.get("start_location") or "?"
         end = r.get("end_location") or "?"
-        date_str = str(r.get("start_date", ""))[:16]
+        date_str = _format_dt(r.get("start_date"))
         range_start = r.get("start_ideal_range_km") or 0
         range_end = r.get("end_ideal_range_km") or 0
         kwh = max(0, (range_start - range_end) * KWH_PER_KM)
@@ -674,7 +705,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20) ->
 
     lines = [f"**{category.upper()} Trips** ({len(classified)} results)\n"]
     for r in classified:
-        date = str(r.get("start_date", ""))[:16]
+        date = _format_dt(r.get("start_date"))
         dist_km = r.get("distance") or 0
         dur = r.get("duration_min") or 0
         start = r.get("start_location") or "?"
@@ -754,7 +785,7 @@ async def tesla_battery_health() -> str:
         lines = ["**Battery Health** (snapshots at ~100% charge)\n"]
         for r in rows:
             range_km = r.get("ideal_battery_range_km")
-            date_str = str(r.get("date", ""))[:10]
+            date_str = _format_dt(r.get("date"))[:10]
             lines.append(f"- {date_str}: {_format_distance(range_km)} ideal range at 100%")
         return "\n".join(lines)
 
@@ -781,7 +812,7 @@ async def tesla_efficiency(days: int = 90) -> str:
 
     Shows weekly average efficiency from driving data.
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
         SELECT date_trunc('week', start_date) AS week,
@@ -826,7 +857,7 @@ async def tesla_location_history(days: int = 7) -> str:
 
     Groups positions by proximity and shows time at each cluster.
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
 
     rows = _query(
         f"""
@@ -875,7 +906,7 @@ async def tesla_state_history(days: int = 7) -> str:
 
     Shows when the car was awake vs sleeping, useful for vampire drain analysis.
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
         SELECT state, start_date, end_date
@@ -896,7 +927,7 @@ async def tesla_state_history(days: int = 7) -> str:
     for r in rows:
         st = r.get("state", "unknown")
         start = r.get("start_date")
-        end = r.get("end_date") or datetime.utcnow()
+        end = r.get("end_date") or _utcnow()
         if start:
             dur_h = (end - start).total_seconds() / 3600
             totals[st] = totals.get(st, 0) + dur_h
@@ -907,7 +938,7 @@ async def tesla_state_history(days: int = 7) -> str:
     lines.append("\nRecent transitions:")
     for r in rows[:20]:
         st = r.get("state", "?")
-        start = str(r.get("start_date", ""))[:16]
+        start = _format_dt(r.get("start_date"))
         end = r.get("end_date")
         dur = ""
         if end and r.get("start_date"):
@@ -935,7 +966,7 @@ async def tesla_software_updates() -> str:
     lines = ["**Software Updates**\n"]
     for r in rows:
         ver = r.get("version", "unknown")
-        start = str(r.get("start_date", ""))[:16]
+        start = _format_dt(r.get("start_date"))
         end = r.get("end_date")
         dur = ""
         if end and r.get("start_date"):
@@ -1091,7 +1122,7 @@ async def tesla_live() -> str:
     if update and update.get("version"):
         lines.append(f"Software: {update['version']}")
 
-    lines.append(f"Last poll: {str(pos.get('date', ''))[:19]}")
+    lines.append(f"Last poll: {_format_dt(pos.get('date'))}")
     return "\n".join(lines)
 
 
@@ -1464,7 +1495,7 @@ async def tesla_longest_trips(limit: int = 10) -> str:
         dur = r.get("duration_min") or 0
         start = r.get("start_loc") or "?"
         end = r.get("end_loc") or "?"
-        date = str(r.get("start_date", ""))[:10]
+        date = _format_dt(r.get("start_date"))[:10]
         kwh = r.get("consumption_kwh") or 0
         lines.append(f"{i}. {_format_distance(dist_km)} -- {start} -> {end} ({date}, {dur}min, {kwh:.1f}kWh)")
 
@@ -1633,7 +1664,7 @@ async def tesla_tpms_status() -> str:
         else:
             lines.append(f"Average: {round(avg*14.5038,1)} psi")
 
-    lines.append(f"\nLast reading: {str(pos.get('date', ''))[:19]}")
+    lines.append(f"\nLast reading: {_format_dt(pos.get('date'))}")
     return "\n".join(lines)
 
 
@@ -1647,7 +1678,7 @@ async def tesla_tpms_history(days: int = 30) -> str:
     Args:
         days: Number of days to look back (default: 30)
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
         SELECT date,
@@ -1668,7 +1699,7 @@ async def tesla_tpms_history(days: int = 30) -> str:
     unit_label = "bar" if USE_METRIC_UNITS else "psi"
     lines = [f"**TPMS History** (last {days} days, {len(rows)} records)\n"]
     for r in rows:
-        date = str(r.get("date", ""))[:16]
+        date = _format_dt(r.get("date"))
         fl = r.get("tpms_pressure_fl")
         fr = r.get("tpms_pressure_fr")
         rl = r.get("tpms_pressure_rl")
@@ -1780,7 +1811,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
     Args:
         days: Number of days to analyze (default: 14)
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
         WITH ordered AS (
@@ -1815,7 +1846,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
         total_drain += drain
         hours = r.get("hours_parked", 0)
         rate = round(drain / hours, 2) if hours > 0 else 0
-        date = str(r.get("prev_date", ""))[:10]
+        date = _format_dt(r.get("prev_date"))[:10]
         lines.append(f"- {date}: -{drain}% over {hours:.0f}h ({rate}%/hr)")
 
     avg_rate = round(
@@ -1859,7 +1890,7 @@ async def calculate_eco_savings_vs_ice(
         gas_price: Gas price per litre in RMB (default: 8.0)
         electricity_price: Electricity cost per kWh in RMB (default: 0.5)
     """
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
 
     # Total driving distance from drives table
     drive_row = _query_one(
@@ -1979,7 +2010,7 @@ async def generate_travel_narrative_context(
         stay_label = "important_stop" if stay_minutes > 60 else ("short_stop" if stay_minutes > 0 else "none")
 
         timeline.append({
-            "time_window": f"{str(start_date)[:19]} → {str(end_date)[:19]}",
+            "time_window": f"{_format_dt(start_date)} → {_format_dt(end_date)}",
             "from": r.get("start_name") or "Unknown",
             "to": r.get("end_name") or "Unknown",
             "distance_km": round(r.get("distance") or 0, 1),
@@ -2001,6 +2032,8 @@ async def generate_travel_narrative_context(
 @mcp.tool()
 async def get_vehicle_persona_status(
     days_lookback: int = 7,
+    year: int = None,
+    month: int = None,
 ) -> str:
     """Get vehicle persona status -- activity, fatigue, extremes, and health metrics.
 
@@ -2008,9 +2041,34 @@ async def get_vehicle_persona_status(
     including idle ratio, longest continuous drive, max speed, and vampire drain.
 
     Args:
-        days_lookback: Number of days to analyze (default: 7)
+        days_lookback: Number of days to analyze (default: 7, used when year/month not set)
+        year: Specific year to analyze (e.g. 2025). Use with month for single month.
+        month: Specific month to analyze (1-12). Requires year to be set.
     """
-    cutoff = (datetime.now() - timedelta(days=days_lookback)).isoformat()
+    # Determine query period
+    period_str = None
+    if year is not None and month is not None:
+        # Specific month
+        start = datetime(year, month, 1, tzinfo=timezone.utc)
+        if month == 12:
+            end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        period_str = f"{year}-{month:02d}"
+        total_period_hours = (end - start).total_seconds() / 3600
+    elif year is not None:
+        # Full year
+        start = datetime(year, 1, 1, tzinfo=timezone.utc)
+        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        period_str = str(year)
+        total_period_hours = (end - start).total_seconds() / 3600
+    else:
+        # Fallback to days_lookback
+        start = _utcnow() - timedelta(days=days_lookback)
+        period_str = None  # use days in result
+        total_period_hours = days_lookback * 24.0
+
+    cutoff = start.isoformat()
 
     # -- Active: total distance
     drive_rows = _query(
@@ -2054,14 +2112,13 @@ async def get_vehicle_persona_status(
         (cutoff,),
     )
 
-    total_period_hours = days_lookback * 24.0
     idle_hours = 0.0
     driving_hours = 0.0
     for s in state_rows:
-        start = s.get("start_date")
-        end = s.get("end_date") or datetime.utcnow()
-        if start:
-            hours = (end - start).total_seconds() / 3600.0
+        st = s.get("start_date")
+        en = s.get("end_date") or _utcnow()
+        if st:
+            hours = (en - st).total_seconds() / 3600.0
             if s.get("state") == "driving":
                 driving_hours += hours
             else:
@@ -2112,7 +2169,7 @@ async def get_vehicle_persona_status(
 
     import json
     result = {
-        "period_days": days_lookback,
+        "period": period_str if period_str else f"last_{days_lookback}_days",
         "activity": {
             "total_distance_km": round(total_km, 1),
             "total_trips": trip_count,
@@ -2150,7 +2207,7 @@ async def check_driving_achievements(days: int = 30) -> str:
         days: Number of days to look back (default: 30)
     """
     import json
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     unlocked = []
 
     # Achievement 1:极限续航幸存者 -- start_battery_level <= 5
@@ -2169,7 +2226,7 @@ async def check_driving_achievements(days: int = 30) -> str:
     for r in low_battery_rows:
         unlocked.append({
             "achievement": "极限续航幸存者",
-            "triggered_at": str(r["start_date"])[:19],
+            "triggered_at": _format_dt(r["start_date"]),
             "start_battery_pct": r["start_battery_level"],
             "charge_energy_kwh": round(r["charge_energy_added"] or 0, 1),
             "end_battery_pct": r["end_battery_level"],
@@ -2198,7 +2255,7 @@ async def check_driving_achievements(days: int = 30) -> str:
         unlocked.append({
             "achievement": "午夜幽灵",
             "triggered_at": f"过去 {days} 天内共 {len(midnight_drives)} 次",
-            "first_midnight_drive": str(earliest["start_date"])[:19],
+            "first_midnight_drive": _format_dt(earliest["start_date"]),
             "total_midnight_drives": len(midnight_drives),
             "evidence": (
                 f"在凌晨 00:00~04:00 时段内共出行 {len(midnight_drives)} 次，"
@@ -2223,7 +2280,7 @@ async def check_driving_achievements(days: int = 30) -> str:
     for r in cold_drives:
         unlocked.append({
             "achievement": "冰雪勇士",
-            "triggered_at": str(r["start_date"])[:19],
+            "triggered_at": _format_dt(r["start_date"]),
             "temperature_c": round(r["outside_temp_avg"], 1),
             "distance_km": round(r["distance"], 1),
             "duration_min": r["duration_min"] or 0,
@@ -2322,7 +2379,7 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
 
     result = {
         "charge_id": row.get("id"),
-        "time_window": f"{str(row.get('start_date') or '')[:19]} → {str(row.get('end_date') or '')[:19]}",
+        "time_window": f"{_format_dt(row.get('start_date'))} → {_format_dt(row.get('end_date'))}",
         "temperature_condition": temp_label,
         "outside_temp_c": round(temp, 1) if temp is not None else None,
         "starting_soc": start_soc_label,
@@ -2354,7 +2411,7 @@ async def generate_weekend_blindbox(
     import json
     import random
 
-    cutoff = (datetime.now() - timedelta(days=months_lookback * 30)).isoformat()
+    cutoff = (_utcnow() - timedelta(days=months_lookback * 30)).isoformat()
     min_stay_min = int(min_stay_hours * 60)
 
     # Window-function query: LEAD to compute stay gap, COUNT to compute visit frequency
@@ -2416,7 +2473,7 @@ async def generate_weekend_blindbox(
     stay_label = f"{stay_h}h {stay_m}m" if stay_h > 0 else f"{stay_m}m"
 
     result = {
-        "date": str(chosen["start_date"])[:10],
+        "date": _format_dt(chosen["start_date"])[:10],
         "location": chosen["address"] or chosen["address_name"] or "未知地点",
         "stay_duration": stay_label,
         "stay_duration_min": round(stay_min),
@@ -2439,17 +2496,17 @@ async def generate_monthly_driving_report(
         electricity_price: RMB/kWh fallback when cost is not recorded (default: 0.5)
     """
     if target_month is None:
-        today = datetime.now()
-        first_of_month = datetime(today.year, today.month, 1)
+        today = _utcnow()
+        first_of_month = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
         last_month = first_of_month - timedelta(days=1)
         target_month = last_month.strftime("%Y-%m")
 
     year, month = map(int, target_month.split("-"))
-    start = datetime(year, month, 1)
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
     if month == 12:
-        end = datetime(year + 1, 1, 1)
+        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
     else:
-        end = datetime(year, month + 1, 1)
+        end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
 
     start_iso = start.isoformat()
     end_iso = end.isoformat()
