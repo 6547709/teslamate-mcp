@@ -1377,11 +1377,13 @@ async def tesla_monthly_report(year: int, month: int) -> str:
     """
     start = datetime(year, month, 1)
     if month == 12:
-        prev_start = datetime(year, 11, 1)
         next_start = datetime(year + 1, 1, 1)
     else:
-        prev_start = datetime(year, month - 1, 1)
         next_start = datetime(year, month + 1, 1)
+    if month == 1:
+        prev_start = datetime(year - 1, 12, 1)
+    else:
+        prev_start = datetime(year, month - 1, 1)
 
     # Current month data
     rows = _query(
