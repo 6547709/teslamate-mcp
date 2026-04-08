@@ -958,10 +958,11 @@ async def tesla_live() -> str:
     available in TeslaMate and are omitted.
     """
     # Latest position snapshot
-    pos = _query_one(f"""
-        SELECT battery_level,
+    pos = _query_one("""
+        SELECT battery_level, ideal_battery_range_km,
                is_climate_on, inside_temp, outside_temp,
-               odometer, speed,
+               driver_temp_setting,
+               odometer, speed, power,
                latitude, longitude, date
         FROM positions
         WHERE car_id = %s
@@ -972,8 +973,7 @@ async def tesla_live() -> str:
     # Latest charging session (to determine charging state)
     charge = _query_one("""
         SELECT start_date, end_date, charge_energy_added,
-               start_battery_level, end_battery_level,
-               charge_limit_soc
+               start_battery_level, end_battery_level
         FROM charging_processes
         WHERE car_id = %s
         ORDER BY start_date DESC
@@ -1014,8 +1014,7 @@ async def tesla_live() -> str:
     )
     if is_charging:
         added = charge.get("charge_energy_added") or 0
-        limit = charge.get("charge_limit_soc") or "?"
-        lines.append(f"Charging: Yes (added {added:.1f} kWh, limit {limit}%)")
+        lines.append(f"Charging: Yes (added {added:.1f} kWh)")
     else:
         lines.append("Charging: Not charging")
 
