@@ -1921,6 +1921,302 @@ async def tesla_vampire_drain(days: int = 14) -> str:
     return "\n".join(lines)
 
 
+# -- Eco & Persona Tools --------------------------------------------------------
+
+
+@mcp.tool()
+async def calculate_eco_savings_vs_ice(
+    days: int = 30,
+    ice_mpg: float = 8.0,
+    gas_price: float = 8.0,
+    electricity_price: float = 0.5,
+) -> str:
+    """Calculate eco savings and carbon reduction compared to an ICE vehicle.
+
+    Compares Tesla's actual electricity costs against a hypothetical ICE vehicle
+    consuming the same distance in fuel, plus CO2 savings and tree equivalents.
+
+    Args:
+        days: Number of days to look back (default: 30)
+        ice_mpg: ICE vehicle fuel consumption in L/100km (default: 8.0)
+        gas_price: Gas price per litre in RMB (default: 8.0)
+        electricity_price: Electricity cost per kWh in RMB (default: 0.5)
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    # Total driving distance from drives table
+    drive_row = _query_one(
+        f"""
+        SELECT COALESCE(SUM(distance), 0) AS total_km
+        FROM drives
+        WHERE car_id = {CAR_ID} AND start_date >= %s
+        """,
+        (cutoff,),
+    )
+    total_km = drive_row["total_km"] if drive_row else 0.0
+
+    # Charging: prefer cost from charging_processes.cost, fallback to energy * price
+    charge_rows = _query(
+        f"""
+        SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh,
+               COALESCE(SUM(cost), 0) AS total_cost
+        FROM charging_processes
+        WHERE car_id = {CAR_ID} AND start_date >= %s AND end_date IS NOT NULL
+        """,
+        (cutoff,),
+    )
+    charge_row = charge_rows[0] if charge_rows else {}
+    total_kwh = charge_row.get("total_kwh", 0.0) or 0.0
+    total_cost = charge_row.get("total_cost", 0.0) or 0.0
+
+    # Fallback: use energy * electricity_price if cost not recorded
+    if total_cost == 0 and total_kwh > 0:
+        actual_electricity_cost = round(total_kwh * electricity_price, 2)
+    else:
+        actual_electricity_cost = round(total_cost, 2)
+
+    # ICE baseline
+    fuel_liters = (total_km / 100.0) * ice_mpg          # L
+    ice_cost = round(fuel_liters * gas_price, 2)         # RMB
+    ice_co2_kg = round(fuel_liters * 2.3, 2)              # kg CO2
+
+    # EV actual
+    ev_co2_kg = round(total_kwh * 0.58, 2)                # kg CO2
+
+    # Savings
+    money_saved = round(ice_cost - actual_electricity_cost, 2)
+    co2_reduced_kg = round(ice_co2_kg - ev_co2_kg, 2)
+    tree_equivalents = round(co2_reduced_kg / 18.0, 1)
+
+    import json
+    result = {
+        "period_days": days,
+        "total_distance_km": round(total_km, 1),
+        "total_charged_kwh": round(total_kwh, 1),
+        "electricity_cost_actual": actual_electricity_cost,
+        "ice_vehicle": {
+            "ice_mpg_L_per_100km": ice_mpg,
+            "gas_price_RMB_per_liter": gas_price,
+            "fuel_consumed_liters": round(fuel_liters, 1),
+            "fuel_cost_RMB": ice_cost,
+            "co2_emissions_kg": ice_co2_kg,
+        },
+        "ev_actual": {
+            "co2_emissions_kg": ev_co2_kg,
+        },
+        "savings": {
+            "money_saved_RMB": money_saved,
+            "co2_reduced_kg": co2_reduced_kg,
+            "tree_equivalents": tree_equivalents,
+        },
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def generate_travel_narrative_context(
+    start_time: str,
+    end_time: str,
+) -> str:
+    """Generate a travel narrative timeline for LLM-powered travel blogging.
+
+    Extracts structured drive and stop data within a time window for
+    generating travel narratives or Vlog scripts.
+
+    Args:
+        start_time: ISO8601 start time (e.g. "2026-03-01T00:00:00")
+        end_time: ISO8601 end time (e.g. "2026-03-03T23:59:59")
+    """
+    rows = _query(
+        f"""
+        SELECT d.start_date, d.end_date,
+               d.distance, d.duration_min, d.outside_temp_avg,
+               sa.display_name AS start_name,
+               ea.display_name AS end_name,
+               d.start_address_id, d.end_address_id
+        FROM drives d
+        LEFT JOIN addresses sa ON d.start_address_id = sa.id
+        LEFT JOIN addresses ea ON d.end_address_id = ea.id
+        WHERE d.car_id = {CAR_ID}
+          AND d.start_date >= %s AND d.start_date <= %s
+        ORDER BY d.start_date ASC
+        """,
+        (start_time, end_time),
+    )
+
+    if not rows:
+        import json
+        return json.dumps({"timeline": [], "message": "No drives found in this time window."}, ensure_ascii=False, indent=2)
+
+    timeline = []
+    for i, r in enumerate(rows):
+        start_date = r.get("start_date")
+        end_date = r.get("end_date")
+        next_start = rows[i + 1].get("start_date") if i + 1 < len(rows) else None
+
+        # Stay duration: gap between this drive's end and next drive's start
+        stay_minutes = 0
+        if next_start and end_date:
+            delta = (next_start - end_date).total_seconds() / 60.0
+            stay_minutes = max(0, round(delta))
+        stay_label = "important_stop" if stay_minutes > 60 else ("short_stop" if stay_minutes > 0 else "none")
+
+        timeline.append({
+            "time_window": f"{str(start_date)[:19]} → {str(end_date)[:19]}",
+            "from": r.get("start_name") or "Unknown",
+            "to": r.get("end_name") or "Unknown",
+            "distance_km": round(r.get("distance") or 0, 1),
+            "duration_min": r.get("duration_min") or 0,
+            "temperature_c": round(r.get("outside_temp_avg"), 1) if r.get("outside_temp_avg") is not None else None,
+            "stay_after_arrival_min": stay_minutes,
+            "stay_type": stay_label,
+        })
+
+    import json
+    result = {
+        "period": {"start": start_time, "end": end_time},
+        "total_drives": len(timeline),
+        "timeline": timeline,
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_vehicle_persona_status(
+    days_lookback: int = 7,
+) -> str:
+    """Get vehicle persona status -- activity, fatigue, extremes, and health metrics.
+
+    Provides structured metrics for an LLM to roleplay a "vehicle with personality",
+    including idle ratio, longest continuous drive, max speed, and vampire drain.
+
+    Args:
+        days_lookback: Number of days to analyze (default: 7)
+    """
+    cutoff = (datetime.now() - timedelta(days=days_lookback)).isoformat()
+
+    # -- Active: total distance
+    drive_rows = _query(
+        f"""
+        SELECT COALESCE(SUM(distance), 0) AS total_km,
+               MAX(duration_min) AS max_single_drive_min,
+               MAX(speed_max) AS max_speed_kmh,
+               COUNT(*) AS trip_count
+        FROM drives
+        WHERE car_id = {CAR_ID} AND start_date >= %s
+        """,
+        (cutoff,),
+    )
+    drive_r = drive_rows[0] if drive_rows else {}
+    total_km = drive_r.get("total_km") or 0.0
+    max_single_drive_min = drive_r.get("max_single_drive_min") or 0
+    max_speed_kmh = drive_r.get("max_speed_kmh") or 0.0
+    trip_count = drive_r.get("trip_count") or 0
+
+    # Longest single drive: find the drive record with max duration
+    longest_drive_row = _query_one(
+        f"""
+        SELECT distance, duration_min
+        FROM drives
+        WHERE car_id = {CAR_ID} AND start_date >= %s
+        ORDER BY duration_min DESC
+        LIMIT 1
+        """,
+        (cutoff,),
+    )
+    longest_drive_km = longest_drive_row.get("distance") or 0 if longest_drive_row else 0
+
+    # -- Idle time: states not 'driving'
+    state_rows = _query(
+        f"""
+        SELECT state, start_date, end_date
+        FROM states
+        WHERE car_id = {CAR_ID} AND start_date >= %s
+        ORDER BY start_date ASC
+        """,
+        (cutoff,),
+    )
+
+    total_period_hours = days_lookback * 24.0
+    idle_hours = 0.0
+    driving_hours = 0.0
+    for s in state_rows:
+        start = s.get("start_date")
+        end = s.get("end_date") or datetime.utcnow()
+        if start:
+            hours = (end - start).total_seconds() / 3600.0
+            if s.get("state") == "driving":
+                driving_hours += hours
+            else:
+                idle_hours += hours
+
+    # Clamp: if computed hours exceed total period, cap idle percentage at 100
+    if idle_hours + driving_hours > total_period_hours:
+        idle_hours = total_period_hours - driving_hours
+    idle_percentage = round(idle_hours / total_period_hours * 100, 1) if total_period_hours > 0 else 0.0
+
+    # -- Vampire drain: battery drop while not driving / not charging
+    vampire_rows = _query(
+        f"""
+        WITH ordered AS (
+            SELECT date, battery_level, id,
+                   LAG(battery_level) OVER (ORDER BY date) AS prev_level,
+                   LAG(date) OVER (ORDER BY date) AS prev_date
+            FROM positions
+            WHERE car_id = {CAR_ID} AND date >= %s AND battery_level IS NOT NULL
+            ORDER BY date
+        )
+        SELECT battery_level, prev_level,
+               prev_level - battery_level AS drain,
+               EXTRACT(EPOCH FROM (date - prev_date)) / 3600 AS hours_gap
+        FROM ordered
+        WHERE prev_level IS NOT NULL
+          AND prev_level - battery_level > 0
+          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
+          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
+        """,
+        (cutoff,),
+    )
+    vampire_drain_pct = 0.0
+    if vampire_rows:
+        total_drain = sum(r.get("drain", 0) for r in vampire_rows)
+        total_hours = sum(r.get("hours_gap", 1) for r in vampire_rows)
+        vampire_drain_pct = round(total_drain / len(vampire_rows), 2)
+
+    # -- Persona assessment
+    if idle_percentage > 85:
+        persona = "闲得发慌 (Bored to death)"
+    elif idle_percentage > 60:
+        persona = "悠闲自得 (Relaxed)"
+    elif driving_hours > 0 and (driving_hours / total_period_hours) > 0.3:
+        persona = "疲惫不堪 (Exhausted)"
+    else:
+        persona = "元气满满 (Full of energy)"
+
+    import json
+    result = {
+        "period_days": days_lookback,
+        "activity": {
+            "total_distance_km": round(total_km, 1),
+            "total_trips": trip_count,
+            "idle_percentage": idle_percentage,
+            "driving_hours": round(driving_hours, 1),
+        },
+        "fatigue": {
+            "max_continuous_drive_min": max_single_drive_min,
+            "max_continuous_drive_km": round(longest_drive_km, 1),
+        },
+        "extremes": {
+            "max_speed_kmh": round(max_speed_kmh, 1),
+        },
+        "health": {
+            "vampire_drain_estimate_pct": vampire_drain_pct,
+        },
+        "persona": persona,
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":

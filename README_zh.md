@@ -10,14 +10,47 @@
 
 ## 功能特性
 
-**20+ 工具**，分为四类：
+**23+ 工具**，分为四类：
 
 | 分类 | 工具 | 数据来源 |
 |------|------|---------|
 | **状态** | `tesla_status`、`tesla_drives`、`tesla_charging_history`、`tesla_battery_health`、`tesla_efficiency`、`tesla_location_history`、`tesla_state_history`、`tesla_software_updates` | TeslaMate 数据库 |
-| **分析** | `tesla_savings`、`tesla_trip_cost`、`tesla_efficiency_by_temp`、`tesla_charging_by_location`、`tesla_top_destinations`、`tesla_longest_trips`、`tesla_monthly_summary`、`tesla_vampire_drain` | TeslaMate 数据库 |
-| **增强** | `tesla_driving_score`、`tesla_trips_by_category`、`tesla_trip_categories`、`tesla_monthly_report`、`tesla_tpms_status`、`tesla_tpms_history` | TeslaMate 数据库 |
+| **分析** | `tesla_savings`、`tesla_trip_cost`、`tesla_efficiency_by_temp`、`tesla_charging_by_location`、`tesla_top_destinations`、`tesla_longest_trips`、`tesla_monthly_summary`、`tesla_vampire_drain`、`calculate_eco_savings_vs_ice` | TeslaMate 数据库 |
+| **增强** | `tesla_driving_score`、`tesla_trips_by_category`、`tesla_trip_categories`、`tesla_monthly_report`、`tesla_tpms_status`、`tesla_tpms_history`、`generate_travel_narrative_context`、`get_vehicle_persona_status` | TeslaMate 数据库 |
 | **实时** | `tesla_live`（GPS、电池、温度、充电状态） | Tesla Owner API |
+
+### 新增工具说明
+
+#### `calculate_eco_savings_vs_ice` — 节能减排计算器
+对比特斯拉与燃油车在同一行驶里程下的成本和碳排放差异。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `days` | `30` | 回溯天数 |
+| `ice_mpg` | `8.0` | 燃油车百公里油耗（L/100km） |
+| `gas_price` | `8.0` | 汽油单价（元/升） |
+| `electricity_price` | `0.5` | 充电单价（元/度） |
+
+返回 JSON：ICE 基准油耗/成本/碳排、EV 实际碳排、节省金额、减少碳排放量、种树当量。
+
+#### `generate_travel_narrative_context` — 行车游记时间线生成器
+为 LLM 生成行车游记或 Vlog 脚本提供结构化的行程上下文。
+
+| 参数 | 说明 |
+|------|------|
+| `start_time` | ISO8601 开始时间 |
+| `end_time` | ISO8601 结束时间 |
+
+返回时间线 JSON 数组，每段包含起终点名称、里程、时长、气温、到达后停留时长及停留类型（重要停留/短停/无停留）。
+
+#### `get_vehicle_persona_status` — 车辆"性格"状态面板
+为 LLM 扮演"有性格的数字车辆"提供活跃度、疲劳度、极限行为和健康度指标。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `days_lookback` | `7` | 回溯天数 |
+
+返回 JSON：活跃度（总里程、静置占比）、疲劳度（单次最长连续行驶）、极限行为（最高车速）、健康度（吸血鬼耗电估算）、中文性格标签（元气满满/疲惫不堪/闲得发慌/悠闲自得）。
 
 ---
 

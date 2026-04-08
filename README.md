@@ -10,14 +10,47 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ## Features
 
-**20+ tools** across four categories:
+**23+ tools** across four categories:
 
 | Category | Tools | Data Source |
 |----------|-------|-------------|
 | **Status** | `tesla_status`, `tesla_drives`, `tesla_charging_history`, `tesla_battery_health`, `tesla_efficiency`, `tesla_location_history`, `tesla_state_history`, `tesla_software_updates` | TeslaMate DB |
-| **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain` | TeslaMate DB |
-| **Enhanced** | `tesla_driving_score`, `tesla_trips_by_category`, `tesla_trip_categories`, `tesla_monthly_report`, `tesla_tpms_status`, `tesla_tpms_history` | TeslaMate DB |
+| **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain`, `calculate_eco_savings_vs_ice` | TeslaMate DB |
+| **Enhanced** | `tesla_driving_score`, `tesla_trips_by_category`, `tesla_trip_categories`, `tesla_monthly_report`, `tesla_tpms_status`, `tesla_tpms_history`, `generate_travel_narrative_context`, `get_vehicle_persona_status` | TeslaMate DB |
 | **Live** | `tesla_live` (GPS, battery, climate, charging) | Tesla Owner API |
+
+### New Tools
+
+#### `calculate_eco_savings_vs_ice` — Eco Savings Calculator
+Compare Tesla's electricity costs vs a hypothetical ICE vehicle over the same distance.
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `days` | `30` | Lookback days |
+| `ice_mpg` | `8.0` | ICE vehicle fuel consumption (L/100km) |
+| `gas_price` | `8.0` | Gas price per litre (RMB) |
+| `electricity_price` | `0.5` | Electricity price per kWh (RMB) |
+
+Returns JSON: ICE baseline (fuel/cost/CO2), EV actual CO2, money saved, CO2 reduced, tree equivalents.
+
+#### `generate_travel_narrative_context` — Travel Narrative Timeline Generator
+Extracts structured drive and stop data for LLM-powered travel blogging or Vlog scripting.
+
+| Param | Description |
+|-------|-------------|
+| `start_time` | ISO8601 start time |
+| `end_time` | ISO8601 end time |
+
+Returns a timeline JSON array with from/to names, distance, duration, temperature, stay duration after arrival, and stay type (important_stop / short_stop / none).
+
+#### `get_vehicle_persona_status` — Vehicle Persona Status Panel
+Provides activity, fatigue, extreme behaviour, and health metrics for an LLM to roleplay a "vehicle with personality".
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `days_lookback` | `7` | Lookback days |
+
+Returns JSON: activity (total km, idle %), fatigue (longest continuous drive), extremes (max speed), health (vampire drain estimate), and Chinese persona label (元气满满 / 疲惫不堪 / 闲得发慌 / 悠闲自得).
 
 ---
 
