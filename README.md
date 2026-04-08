@@ -36,6 +36,8 @@ services:
       - MCP_TRANSPORT=streamable-http
       - HTTP_HOST=0.0.0.0
       - HTTP_PORT=8080
+      - USE_METRIC_UNITS=true
+      - TESLA_ELECTRICITY_RATE_RMB=0.6
       - TESLA_CAR_ID=1
       - TESLA_BATTERY_KWH=75
       - TESLA_BATTERY_RANGE_KM=525

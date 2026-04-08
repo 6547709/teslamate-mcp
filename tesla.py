@@ -1091,6 +1091,35 @@ async def tesla_live() -> str:
     else:
         lines.append("Driving: Parked")
 
+    # Vehicle location
+    lat = ds.get("latitude")
+    lon = ds.get("longitude")
+    if lat and lon:
+        lines.append(f"Location: {lat:.5f}, {lon:.5f}")
+        # Try to match with TeslaMate geofences
+        try:
+            nearby = _query_one(
+                f"""
+                SELECT name, latitude, longitude, radius,
+                       6371 * 2 * ASIN(SQRT(
+                           POWER(SIN((RADIANS(%s) - RADIANS(latitude)) / 2), 2) +
+                           COS(RADIANS(%s)) * COS(RADIANS(latitude)) *
+                           POWER(SIN((RADIANS(%s) - RADIANS(longitude)) / 2), 2)
+                       )) AS distance_km
+                FROM geofences
+                ORDER BY distance_km ASC LIMIT 1
+                """,
+                (lat, lat, lon),
+            )
+            if nearby and nearby.get("name"):
+                dist = nearby.get("distance_km", 0)
+                dist_str = f" ({dist:.1f}km away)" if dist and dist > 0.5 else ""
+                lines.append(f"  Near: {nearby['name']}{dist_str}")
+        except Exception:
+            pass  # Geofence lookup is best-effort
+    else:
+        lines.append("Location: unavailable")
+
     tires = []
     for pos, label in [("fl", "FL"), ("fr", "FR"), ("rl", "RL"), ("rr", "RR")]:
         bar = vs.get(f"tpms_pressure_{pos}")
