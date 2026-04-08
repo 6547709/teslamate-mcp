@@ -24,13 +24,18 @@ services:
   teslamate-mcp:
     image: ghcr.io/<your-github-username>/teslamate-mcp:latest
     restart: always
+    ports:
+      - "30002:8080"
     environment:
       - ENCRYPTION_KEY=<your-teslamate-encryption-key>
-      - DATABASE_HOST=database
-      - DATABASE_PORT=5432
-      - DATABASE_USER=teslamate
-      - DATABASE_PASS=secret
-      - DATABASE_NAME=teslamate
+      - TESLAMATE_DB_HOST=database
+      - TESLAMATE_DB_PORT=5432
+      - TESLAMATE_DB_USER=teslamate
+      - TESLAMATE_DB_PASS=secret
+      - TESLAMATE_DB_NAME=teslamate
+      - MCP_TRANSPORT=streamable-http
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PORT=8080
       - TESLA_CAR_ID=1
       - TESLA_BATTERY_KWH=75
       - TESLA_BATTERY_RANGE_KM=525
