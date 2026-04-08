@@ -56,13 +56,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import math
 import os
-import time
 from datetime import datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import httpx
 import psycopg2
@@ -153,8 +150,8 @@ def _decrypt_tokens() -> dict:
             "Set TESLAMATE_DB_HOST, TESLAMATE_DB_PASS, and ENCRYPTION_KEY."
         )
 
-    conn = _get_conn()
     try:
+        conn = _get_conn()
         with conn.cursor() as cur:
             cur.execute("SELECT access, refresh FROM tokens LIMIT 1")
             row = cur.fetchone()
@@ -163,7 +160,8 @@ def _decrypt_tokens() -> dict:
             encrypted_access = row[0]
             encrypted_refresh = row[1]
     finally:
-        conn.close()
+        if 'conn' in locals():
+            conn.close()
 
     # Derive AES-256 key from ENCRYPTION_KEY
     key = hashlib.sha256(ENCRYPTION_KEY.encode()).digest()
