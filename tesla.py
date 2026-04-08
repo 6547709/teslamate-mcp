@@ -1,11 +1,11 @@
-"""Tesla MCP Server — TeslaMate analytics + Fleet API commands.
+"""Tesla MCP Server — TeslaMate analytics + Owner API real-time data.
 
-Single-file FastMCP server. Stdio transport. Works with TeslaMate, Fleet API,
+Single-file FastMCP server. Stdio transport. Works with TeslaMate, Owner API,
 or both — tools are available based on which backends you configure.
 
 Two data paths:
   1. TeslaMate Postgres (read-only) — historical telemetry and analytics
-  2. Tesla Fleet API via HTTP proxy (commands + live data)
+  2. Tesla Owner API (read-only live data from TeslaMate DB)
 
 Read tools (TeslaMate):
   tesla_status            — Current vehicle state (battery, range, location, climate)
@@ -27,22 +27,8 @@ Analytics tools (TeslaMate):
   tesla_monthly_summary   — Monthly driving summary
   tesla_vampire_drain     — Battery loss while parked
 
-Live data tool (Fleet API):
-  tesla_live              — Real-time vehicle data from Fleet API
-
-Command tools (Fleet API + HTTP proxy):
-  tesla_climate_on        — Start climate preconditioning
-  tesla_climate_off       — Stop climate
-  tesla_set_temp          — Set cabin temperature
-  tesla_charge_start      — Start charging
-  tesla_charge_stop       — Stop charging
-  tesla_set_charge_limit  — Set charge limit percentage
-  tesla_lock              — Lock doors
-  tesla_unlock            — Unlock doors (requires confirm=True)
-  tesla_honk              — Honk horn
-  tesla_flash             — Flash headlights
-  tesla_trunk             — Open/close trunk or frunk (requires confirm=True)
-  tesla_sentry            — Toggle sentry mode
+Live data tool (Owner API):
+  tesla_live              — Real-time vehicle data from Owner API
 
 Environment variables:
   # TeslaMate Postgres
@@ -52,13 +38,8 @@ Environment variables:
   TESLAMATE_DB_PASS     — Postgres password
   TESLAMATE_DB_NAME     — Postgres database (default: teslamate)
 
-  # Fleet API
-  TESLA_PROXY_URL       — HTTP proxy URL for commands (e.g. https://localhost:4443)
-  TESLA_FLEET_URL       — Fleet API URL (default: NA region)
-  TESLA_VIN             — Vehicle VIN
-  TESLA_TOKEN_FILE      — Path to tokens.json (Fleet API OAuth tokens)
-  TESLA_CLIENT_ID       — Fleet API client ID (for token refresh)
-  TESLA_CLIENT_SECRET   — Fleet API client secret (for token refresh)
+  # Encryption key (TeslaMate's ENCRYPTION_KEY — required for Owner API)
+  ENCRYPTION_KEY        — AES-256 key used to decrypt tokens from DB
 
   # Vehicle config
   TESLA_CAR_ID          — TeslaMate car ID (default: 1)
@@ -69,29 +50,21 @@ Environment variables:
   TESLA_ELECTRICITY_RATE — $/kWh (default: 0.12)
   TESLA_GAS_PRICE        — $/gallon for comparison (default: 3.50)
   TESLA_GAS_MPG          — Comparable gas vehicle MPG (default: 28)
-
-  # TLS
-  TESLA_VERIFY_SSL      — TLS verification for proxy (default: true)
-
-Safety:
-  - Unlock, trunk, and window commands require confirm=True parameter
-  - Rate limit: 40 commands/day (hard cap)
-  - All commands counted for audit trail
 """
 
 from __future__ import annotations
 
-import json
+import base64
+import hashlib
 import math
 import os
-import time
 from datetime import datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import httpx
 import psycopg2
 import psycopg2.extras
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastmcp import FastMCP
 
 # -- Configuration ------------------------------------------------------------
@@ -103,15 +76,14 @@ DB_USER = os.environ.get("TESLAMATE_DB_USER", "teslamate")
 DB_PASS = os.environ.get("TESLAMATE_DB_PASS", "")
 DB_NAME = os.environ.get("TESLAMATE_DB_NAME", "teslamate")
 
-# Fleet API (commands + live data)
-PROXY_URL = os.environ.get("TESLA_PROXY_URL", "").rstrip("/")
-FLEET_URL = os.environ.get(
-    "TESLA_FLEET_URL", "https://fleet-api.prd.na.vn.cloud.tesla.com"
-).rstrip("/")
-VIN = os.environ.get("TESLA_VIN", "")
-TOKEN_FILE = os.environ.get("TESLA_TOKEN_FILE", "")
-CLIENT_ID = os.environ.get("TESLA_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("TESLA_CLIENT_SECRET", "")
+# Encryption key (same as TeslaMate's ENCRYPTION_KEY)
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
+if not ENCRYPTION_KEY:
+    raise RuntimeError("ENCRYPTION_KEY environment variable is required")
+
+# Owner API (read from TeslaMate DB — no file, no manual refresh)
+OWNER_API_URL = "https://owner-api.tesla.com"
+HAS_OWNER_API = bool(DB_HOST and DB_PASS and ENCRYPTION_KEY)
 
 # Vehicle-specific
 CAR_ID = int(os.environ.get("TESLA_CAR_ID", "1"))
@@ -119,176 +91,94 @@ BATTERY_KWH = float(os.environ.get("TESLA_BATTERY_KWH", "75"))
 BATTERY_RANGE_KM = float(os.environ.get("TESLA_BATTERY_RANGE_KM", "525"))
 KWH_PER_KM = BATTERY_KWH / BATTERY_RANGE_KM
 
-# Cost defaults (overridable per-call on savings/trip tools)
+# Cost defaults
 ELECTRICITY_RATE = float(os.environ.get("TESLA_ELECTRICITY_RATE", "0.12"))
 GAS_PRICE = float(os.environ.get("TESLA_GAS_PRICE", "3.50"))
 GAS_MPG = int(os.environ.get("TESLA_GAS_MPG", "28"))
 
-# TLS verification (set false for self-signed proxy certs)
-VERIFY_SSL = os.environ.get("TESLA_VERIFY_SSL", "true").lower() not in (
-    "false",
-    "0",
-    "no",
-)
+# TPMS thresholds (bar)
+TPMS_MIN = float(os.environ.get("TESLA_TPMS_MIN_THRESHOLD", "2.0"))
+TPMS_MAX = float(os.environ.get("TESLA_TPMS_MAX_THRESHOLD", "2.5"))
+TPMS_WARN_DELTA = 0.15  # bar — warn if any tire differs from average by this much
 
 # Backend availability
 HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
-HAS_FLEET_API = bool(VIN and TOKEN_FILE)
-HAS_PROXY = bool(PROXY_URL and VIN and TOKEN_FILE)
 
 mcp = FastMCP("tesla")
 
-# -- Rate limiting -------------------------------------------------------------
+# -- Owner API Token Decryption -----------------------------------------------
 
-_command_count: int = 0
-_command_day: str = ""
-DAILY_COMMAND_LIMIT = 40
+_cached_owner_token: dict | None = None
 
 
-def _check_rate_limit() -> str | None:
-    """Check daily command rate limit. Returns error message or None if OK."""
-    global _command_count, _command_day
-    today = datetime.now().strftime("%Y-%m-%d")
-    if today != _command_day:
-        _command_day = today
-        _command_count = 0
-    if _command_count >= DAILY_COMMAND_LIMIT:
-        return (
-            f"Daily command limit reached ({DAILY_COMMAND_LIMIT}). Resets at midnight."
+def _decrypt_tokens() -> dict:
+    """Read and decrypt Owner API tokens from TeslaMate PostgreSQL.
+
+    Tokens are stored encrypted in the 'tokens' table using AES-256-GCM.
+    The ENCRYPTION_KEY is hashed with SHA256 to produce the AES key.
+    """
+    global _cached_owner_token
+
+    if _cached_owner_token:
+        return _cached_owner_token
+
+    if not HAS_OWNER_API:
+        raise RuntimeError(
+            "Owner API not configured. "
+            "Set TESLAMATE_DB_HOST, TESLAMATE_DB_PASS, and ENCRYPTION_KEY."
         )
-    return None
 
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT access, refresh FROM tokens LIMIT 1")
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("No tokens found in TeslaMate database.")
+            encrypted_access = row[0]
+            encrypted_refresh = row[1]
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
-def _log_command(cmd: str) -> None:
-    """Increment command counter."""
-    global _command_count
-    _command_count += 1
+    # Derive AES-256 key from ENCRYPTION_KEY
+    key = hashlib.sha256(ENCRYPTION_KEY.encode()).digest()
+    aesgcm = AESGCM(key)
 
+    def decrypt(encrypted_token: str) -> str:
+        if not encrypted_token:
+            return ""
+        # Ciphertext format: | IV (12 bytes) | Ciphertag (16 bytes) | Ciphertext |
+        data = base64.b64decode(encrypted_token)
+        iv = data[:12]
+        ciphertext = data[12:]
+        return aesgcm.decrypt(iv, ciphertext, None).decode()
 
-# -- Token management ----------------------------------------------------------
-
-_cached_token: str = ""
-_token_expiry: float = 0
+    _cached_owner_token = {
+        "access": decrypt(encrypted_access),
+        "refresh": decrypt(encrypted_refresh),
+    }
+    return _cached_owner_token
 
 
 def _get_access_token() -> str:
-    """Get a valid Fleet API access token, refreshing if needed."""
-    global _cached_token, _token_expiry
-
-    if _cached_token and time.time() < _token_expiry - 300:
-        return _cached_token
-
-    if not TOKEN_FILE:
-        raise RuntimeError(
-            "TESLA_TOKEN_FILE not set. "
-            "Set this to the path of your Fleet API tokens.json file."
-        )
-
-    token_path = Path(TOKEN_FILE)
-    if not token_path.exists():
-        raise RuntimeError(f"Token file not found: {TOKEN_FILE}")
-
-    tokens = json.loads(token_path.read_text())
-    access_token = tokens.get("access_token", "")
-    refresh_token = tokens.get("refresh_token", "")
-    expires_in = tokens.get("expires_in", 0)
-
-    # Check if token is still valid (rough estimate)
-    file_mtime = token_path.stat().st_mtime
-    token_age = time.time() - file_mtime
-    if token_age < expires_in - 600:
-        _cached_token = access_token
-        _token_expiry = file_mtime + expires_in
-        return access_token
-
-    # Refresh the token
-    if not refresh_token or not CLIENT_ID or not CLIENT_SECRET:
-        _cached_token = access_token
-        _token_expiry = time.time() + 300
-        return access_token
-
-    resp = httpx.post(
-        "https://auth.tesla.com/oauth2/v3/token",
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
-        timeout=15.0,
-    )
-    if resp.status_code == 200:
-        new_tokens = resp.json()
-        token_path.write_text(json.dumps(new_tokens))
-        _cached_token = new_tokens["access_token"]
-        _token_expiry = time.time() + new_tokens.get("expires_in", 28800)
-        return _cached_token
-
-    # Refresh failed — use existing token
-    _cached_token = access_token
-    _token_expiry = time.time() + 60
-    return access_token
+    """Get a valid Owner API access token from TeslaMate database."""
+    tokens = _decrypt_tokens()
+    return tokens.get("access", "")
 
 
-# -- Fleet API helpers ---------------------------------------------------------
-
-
-async def _fleet_get(path: str) -> dict:
-    """GET from Fleet API (direct, for data reads)."""
-    if not HAS_FLEET_API:
-        raise RuntimeError(
-            "Fleet API not configured. "
-            "Set TESLA_VIN and TESLA_TOKEN_FILE environment variables."
-        )
+async def _owner_api_get(path: str) -> dict:
+    """GET from Tesla Owner API using tokens from TeslaMate DB."""
+    if not HAS_OWNER_API:
+        raise RuntimeError("Owner API not configured.")
     token = _get_access_token()
-    async with httpx.AsyncClient(timeout=15.0, verify=VERIFY_SSL) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
-            f"{FLEET_URL}{path}",
+            f"{OWNER_API_URL}{path}",
             headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()
         return resp.json()
-
-
-async def _fleet_command(command: str, body: dict | None = None) -> dict:
-    """Send a vehicle command through the HTTP proxy (signed)."""
-    if not HAS_PROXY:
-        return {
-            "error": (
-                "Fleet API proxy not configured. "
-                "Set TESLA_PROXY_URL, TESLA_VIN, and TESLA_TOKEN_FILE."
-            )
-        }
-    if not VIN:
-        return {"error": "TESLA_VIN not set."}
-
-    limit_err = _check_rate_limit()
-    if limit_err:
-        return {"result": False, "reason": limit_err}
-
-    token = _get_access_token()
-    url = f"{PROXY_URL}/api/1/vehicles/{VIN}/command/{command}"
-    try:
-        async with httpx.AsyncClient(timeout=30.0, verify=VERIFY_SSL) as client:
-            resp = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=body or {},
-            )
-            try:
-                result = resp.json()
-            except Exception:
-                return {
-                    "error": f"Non-JSON response ({resp.status_code}): "
-                    f"{resp.text[:200]}"
-                }
-            _log_command(command)
-            return result
-    except Exception as e:
-        return {"error": f"Command failed: {e}"}
 
 
 # -- DB helper -----------------------------------------------------------------
@@ -616,6 +506,234 @@ async def tesla_drives(days: int = 30) -> str:
 
 
 @mcp.tool()
+async def tesla_driving_score(
+    period: str = "recent_n",
+    n: int = 10,
+    year: int | None = None,
+    month: int | None = None,
+) -> str:
+    """Driving score based on acceleration, braking, and speed habits.
+
+    Args:
+        period: "recent_n" (default), "monthly", or "yearly"
+        n: Number of recent drives to score (default: 10, used when period="recent_n")
+        year: Year for monthly/yearly period
+        month: Month (1-12) for monthly period
+    """
+    # Build date filter
+    if period == "recent_n":
+        rows = _query(
+            f"""
+            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+                   d.speed_max, d.start_date
+            FROM drives d
+            WHERE d.car_id = %s AND d.distance > 0
+            ORDER BY d.start_date DESC LIMIT %s
+            """,
+            (CAR_ID, n),
+        )
+        label = f"last {len(rows)} drives"
+    elif period == "monthly":
+        if not year or not month:
+            return "year and month are required for monthly period"
+        start = datetime(year, month, 1)
+        if month == 12:
+            end = datetime(year + 1, 1, 1)
+        else:
+            end = datetime(year, month + 1, 1)
+        rows = _query(
+            f"""
+            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+                   d.speed_max, d.start_date
+            FROM drives d
+            WHERE d.car_id = %s AND d.distance > 0
+              AND d.start_date >= %s AND d.start_date < %s
+            ORDER BY d.start_date DESC
+            """,
+            (CAR_ID, start.isoformat(), end.isoformat()),
+        )
+        label = f"{year}-{month:02d}"
+    elif period == "yearly":
+        if not year:
+            return "year is required for yearly period"
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        rows = _query(
+            f"""
+            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+                   d.speed_max, d.start_date
+            FROM drives d
+            WHERE d.car_id = %s AND d.distance > 0
+              AND d.start_date >= %s AND d.start_date < %s
+            ORDER BY d.start_date DESC
+            """,
+            (CAR_ID, start.isoformat(), end.isoformat()),
+        )
+        label = str(year)
+    else:
+        return f"Unknown period: {period}. Use recent_n, monthly, or yearly."
+
+    if not rows:
+        return f"No drives found for {label}."
+
+    # Score calculation
+    POWER_ACCEL_THRESHOLD = 50   # kW — above this = aggressive acceleration
+    POWER_BRAKE_THRESHOLD = -30  # kW — below this = harsh braking
+    SPEED_THRESHOLD_KMH = 130     # km/h — above this = speeding
+
+    score = 100
+    details = []
+
+    for r in rows:
+        power_max = r.get("power_max") or 0
+        power_min = r.get("power_min") or 0
+        speed_max = r.get("speed_max") or 0
+
+        if power_max > POWER_ACCEL_THRESHOLD:
+            deduct = min(5, round((power_max - POWER_ACCEL_THRESHOLD) / 10))
+            score -= deduct
+            details.append(f"hard accel ({power_max:.0f} kW)")
+
+        if power_min < POWER_BRAKE_THRESHOLD:
+            deduct = min(5, round((abs(power_min) - abs(POWER_BRAKE_THRESHOLD)) / 10))
+            score -= deduct
+            details.append(f"hard brake ({power_min:.0f} kW)")
+
+        if speed_max > SPEED_THRESHOLD_KMH:
+            deduct = min(3, round((speed_max - SPEED_THRESHOLD_KMH) / 20))
+            score -= deduct
+            details.append(f"high speed ({speed_max:.0f} km/h)")
+
+    score = max(0, min(100, score))
+
+    lines = [f"**Driving Score — {label}**\n"]
+    lines.append(f"Score: {score}/100")
+    if details:
+        lines.append(f"Events: {', '.join(details[:5])}")
+    lines.append(f"Drives analyzed: {len(rows)}")
+    return "\n".join(lines)
+
+
+# -- Trip Classification Logic -----------------------------------------------
+
+TRIP_THRESHOLD_KM = 100  # drives longer than this = "long_trip"
+COMMUTE_PAIRS = [
+    ("home", "work"),
+    ("work", "home"),
+]
+
+
+def _classify_trip(start_geofence: str | None, end_geofence: str | None, distance_km: float) -> str:
+    """Classify a trip based on geofence names and distance."""
+    start = (start_geofence or "").lower()
+    end = (end_geofence or "").lower()
+
+    # Long trip check first
+    if distance_km > TRIP_THRESHOLD_KM:
+        return "long_trip"
+
+    # Commute: home <-> work
+    for home_key, work_key in COMMUTE_PAIRS:
+        if (home_key in start and work_key in end) or (home_key in end and work_key in start):
+            return "commute"
+
+    # Shopping keywords
+    shopping_keywords = ["mall", "store", "shop", "market", "supermarket", "grocery"]
+    if any(kw in start or kw in end for kw in shopping_keywords):
+        return "shopping"
+
+    # Leisure keywords
+    leisure_keywords = ["park", "beach", "restaurant", "cafe", "movie", "gym", "playground"]
+    if any(kw in start or kw in end for kw in leisure_keywords):
+        return "leisure"
+
+    return "other"
+
+
+@mcp.tool()
+async def tesla_trips_by_category(category: str = "commute", limit: int = 20) -> str:
+    """Get trips filtered by category.
+
+    Args:
+        category: "commute", "shopping", "leisure", "long_trip", or "other"
+        limit: Max trips to return (default: 20)
+    """
+    rows = _query(
+        f"""
+        SELECT d.start_date, d.distance, d.duration_min,
+               sa.display_name AS start_location,
+               ea.display_name AS end_location
+        FROM drives d
+        LEFT JOIN addresses sa ON d.start_address_id = sa.id
+        LEFT JOIN addresses ea ON d.end_address_id = ea.id
+        WHERE d.car_id = %s AND d.distance > 0
+        ORDER BY d.start_date DESC LIMIT %s
+        """,
+        (CAR_ID, limit * 3),
+    )
+
+    classified = []
+    for r in rows:
+        dist_km = r.get("distance") or 0
+        cat = _classify_trip(
+            r.get("start_location"),
+            r.get("end_location"),
+            dist_km,
+        )
+        if cat == category:
+            classified.append(r)
+        if len(classified) >= limit:
+            break
+
+    if not classified:
+        return f"No {category} trips found."
+
+    lines = [f"**{category.upper()} Trips** ({len(classified)} results)\n"]
+    for r in classified:
+        date = str(r.get("start_date", ""))[:16]
+        dist_mi = _km_to_mi(r.get("distance") or 0)
+        dur = r.get("duration_min") or 0
+        start = r.get("start_location") or "?"
+        end = r.get("end_location") or "?"
+        lines.append(f"- {date}: {dist_mi} mi, {dur} min, {start} → {end}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_trip_categories() -> str:
+    """Show count of trips by category for recent drives."""
+    rows = _query(
+        f"""
+        SELECT d.distance,
+               sa.display_name AS start_location,
+               ea.display_name AS end_location
+        FROM drives d
+        LEFT JOIN addresses sa ON d.start_address_id = sa.id
+        LEFT JOIN addresses ea ON d.end_address_id = ea.id
+        WHERE d.car_id = %s AND d.distance > 0
+        ORDER BY d.start_date DESC LIMIT 100
+        """,
+        (CAR_ID,),
+    )
+
+    counts = {"commute": 0, "shopping": 0, "leisure": 0, "long_trip": 0, "other": 0}
+    for r in rows:
+        cat = _classify_trip(
+            r.get("start_location"),
+            r.get("end_location"),
+            r.get("distance") or 0,
+        )
+        counts[cat] += 1
+
+    total = sum(counts.values())
+    lines = ["**Trip Categories** (last 100 drives)\n"]
+    for cat, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+        pct = round(cnt / total * 100) if total > 0 else 0
+        lines.append(f"- {cat}: {cnt} ({pct}%)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def tesla_battery_health() -> str:
     """Battery degradation trend — range at 100% charge over time.
 
@@ -846,23 +964,33 @@ async def tesla_software_updates() -> str:
     return "\n".join(lines)
 
 
-# -- Fleet API Live Data -------------------------------------------------------
+# -- Owner API Live Data -------------------------------------------------------
 
 
 @mcp.tool()
 async def tesla_live() -> str:
-    """Live vehicle data from Fleet API — real-time battery, charging, climate, locks, sentry.
+    """Live vehicle data from Tesla Owner API — real-time battery, charging, climate.
 
-    More current than TeslaMate (which polls on intervals). Use this when you need
-    the latest state right now.
+    Uses tokens shared with TeslaMate (decrypted from DB). More current than
+    TeslaMate which polls on intervals.
     """
-    if not VIN:
-        return "TESLA_VIN not set."
+    if not HAS_OWNER_API:
+        return "Owner API not configured. Set ENCRYPTION_KEY and TeslaMate DB env vars."
 
-    data = await _fleet_get(
-        f"/api/1/vehicles/{VIN}/vehicle_data"
-        f"?endpoints=charge_state%3Bclimate_state%3Bvehicle_state%3Bdrive_state"
-    )
+    # Get vehicle list to find vehicle_id
+    vehicles_resp = await _owner_api_get("/api/1/vehicles")
+    vehicles = vehicles_resp.get("response", [])
+    if not vehicles:
+        return "No vehicles found."
+
+    # Find the first vehicle (or filter by CAR_ID - for multi-car support later)
+    vehicle = vehicles[0]
+    vehicle_id = vehicle.get("id")
+    if not vehicle_id:
+        return "Could not determine vehicle ID from API response."
+
+    # Get live vehicle data
+    data = await _owner_api_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
     r = data.get("response", {})
     cs = r.get("charge_state", {})
     cl = r.get("climate_state", {})
@@ -929,143 +1057,7 @@ async def tesla_live() -> str:
             f"(est. {update.get('expected_duration_sec', 0) // 60} min)"
         )
 
-    lines.append(f"\nCommands today: {_command_count}/{DAILY_COMMAND_LIMIT}")
     return "\n".join(lines)
-
-
-# -- Fleet API Command Tools ---------------------------------------------------
-
-
-def _cmd_result(result: dict | None, success_msg: str) -> str:
-    """Parse a Fleet API command response into a user-friendly message."""
-    if not result:
-        return "Failed: no response from proxy"
-    if result.get("error"):
-        return f"Failed: {result['error']}"
-    resp = result.get("response", {})
-    if resp and resp.get("result"):
-        return success_msg
-    return f"Failed: {resp.get('reason', 'unknown')}"
-
-
-@mcp.tool()
-async def tesla_climate_on() -> str:
-    """Start climate preconditioning — heats or cools cabin to target temp."""
-    result = await _fleet_command("auto_conditioning_start")
-    return _cmd_result(result, "Climate started. Cabin will reach target temperature.")
-
-
-@mcp.tool()
-async def tesla_climate_off() -> str:
-    """Stop climate preconditioning."""
-    result = await _fleet_command("auto_conditioning_stop")
-    return _cmd_result(result, "Climate stopped.")
-
-
-@mcp.tool()
-async def tesla_set_temp(temp_f: int = 70) -> str:
-    """Set cabin temperature target (Fahrenheit). Both driver and passenger.
-
-    Args:
-        temp_f: Target temperature in Fahrenheit (60-85 reasonable range)
-    """
-    temp_c = round((temp_f - 32) * 5 / 9, 1)
-    result = await _fleet_command(
-        "set_temps",
-        {
-            "driver_temp": temp_c,
-            "passenger_temp": temp_c,
-        },
-    )
-    return _cmd_result(result, f"Temperature set to {temp_f}°F ({temp_c}°C).")
-
-
-@mcp.tool()
-async def tesla_charge_start() -> str:
-    """Start charging (vehicle must be plugged in)."""
-    result = await _fleet_command("charge_start")
-    return _cmd_result(result, "Charging started.")
-
-
-@mcp.tool()
-async def tesla_charge_stop() -> str:
-    """Stop charging."""
-    result = await _fleet_command("charge_stop")
-    return _cmd_result(result, "Charging stopped.")
-
-
-@mcp.tool()
-async def tesla_set_charge_limit(percent: int = 80) -> str:
-    """Set charge limit percentage (50-100).
-
-    Args:
-        percent: Charge limit as percentage. 80% is recommended for daily use.
-    """
-    if percent < 50 or percent > 100:
-        return "Charge limit must be between 50 and 100."
-    result = await _fleet_command("set_charge_limit", {"percent": percent})
-    return _cmd_result(result, f"Charge limit set to {percent}%.")
-
-
-@mcp.tool()
-async def tesla_lock() -> str:
-    """Lock all doors."""
-    result = await _fleet_command("door_lock")
-    return _cmd_result(result, "Doors locked.")
-
-
-@mcp.tool()
-async def tesla_unlock(confirm: bool = False) -> str:
-    """Unlock all doors. Requires confirm=True for safety.
-
-    Args:
-        confirm: Must be True to execute. Prevents accidental unlocks.
-    """
-    if not confirm:
-        return "Unlock requires confirm=True. This will physically unlock the car."
-    result = await _fleet_command("door_unlock")
-    return _cmd_result(result, "Doors unlocked.")
-
-
-@mcp.tool()
-async def tesla_honk() -> str:
-    """Honk the horn."""
-    result = await _fleet_command("honk_horn")
-    return _cmd_result(result, "Horn honked.")
-
-
-@mcp.tool()
-async def tesla_flash() -> str:
-    """Flash the headlights."""
-    result = await _fleet_command("flash_lights")
-    return _cmd_result(result, "Lights flashed.")
-
-
-@mcp.tool()
-async def tesla_trunk(which: str = "rear", confirm: bool = False) -> str:
-    """Open or close the trunk or frunk. Requires confirm=True.
-
-    Args:
-        which: "rear" for trunk, "front" for frunk
-        confirm: Must be True to execute.
-    """
-    if not confirm:
-        return f"Trunk ({which}) requires confirm=True."
-    if which not in ("rear", "front"):
-        return "which must be 'rear' or 'front'"
-    result = await _fleet_command("actuate_trunk", {"which_trunk": which})
-    return _cmd_result(result, f"{'Trunk' if which == 'rear' else 'Frunk'} actuated.")
-
-
-@mcp.tool()
-async def tesla_sentry(on: bool = True) -> str:
-    """Toggle sentry mode on or off.
-
-    Args:
-        on: True to enable, False to disable sentry mode.
-    """
-    result = await _fleet_command("set_sentry_mode", {"on": on})
-    return _cmd_result(result, f"Sentry mode {'enabled' if on else 'disabled'}.")
 
 
 # -- Analytics Tools -----------------------------------------------------------
@@ -1377,6 +1369,179 @@ async def tesla_longest_trips(limit: int = 10) -> str:
         kwh = r.get("consumption_kwh") or 0
         lines.append(f"{i}. {mi} mi — {start} → {end} ({date}, {dur}min, {kwh:.1f}kWh)")
 
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_monthly_report(year: int, month: int) -> str:
+    """Monthly driving report with stats and comparison to previous month.
+
+    Args:
+        year: Year (e.g., 2026)
+        month: Month (1-12)
+    """
+    start = datetime(year, month, 1)
+    if month == 12:
+        next_start = datetime(year + 1, 1, 1)
+    else:
+        next_start = datetime(year, month + 1, 1)
+    if month == 1:
+        prev_start = datetime(year - 1, 12, 1)
+    else:
+        prev_start = datetime(year, month - 1, 1)
+
+    # Current month data
+    rows = _query(
+        f"""
+        SELECT COUNT(*) AS trips,
+               COALESCE(SUM(distance), 0) AS total_km,
+               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                   * {KWH_PER_KM}), 0) AS total_kwh,
+               COALESCE(SUM(duration_min), 0) AS total_min
+        FROM drives
+        WHERE car_id = %s AND distance > 0
+          AND start_date >= %s AND start_date < %s
+        """,
+        (CAR_ID, start.isoformat(), next_start.isoformat()),
+    )
+    r = rows[0] if rows else {}
+
+    trips = r.get("trips") or 0
+    km = r.get("total_km") or 0
+    kwh = r.get("total_kwh") or 0
+    minutes = r.get("total_min") or 0
+    mi = round(km * 0.621371)
+    wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
+    cost = round(kwh * ELECTRICITY_RATE, 2)
+
+    # Previous month for comparison
+    prev_rows = _query(
+        f"""
+        SELECT COALESCE(SUM(distance), 0) AS total_km,
+               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                   * {KWH_PER_KM}), 0) AS total_kwh
+        FROM drives
+        WHERE car_id = %s AND distance > 0
+          AND start_date >= %s AND start_date < %s
+        """,
+        (CAR_ID, prev_start.isoformat(), start.isoformat()),
+    )
+    prev_r = prev_rows[0] if prev_rows else {}
+    prev_km = prev_r.get("total_km") or 0
+    prev_kwh = prev_r.get("total_kwh") or 0
+
+    lines = [f"**Monthly Report — {year}-{month:02d}**\n"]
+    lines.append(f"Trips: {trips}")
+    lines.append(f"Distance: {mi} mi ({km:.1f} km)")
+    lines.append(f"Energy: {kwh:.1f} kWh")
+    lines.append(f"Avg efficiency: {wh_mi} Wh/mi")
+    lines.append(f"Est. cost: ${cost}")
+    lines.append(f"Time driving: {minutes} min")
+
+    if prev_km > 0:
+        dist_delta = round((km - prev_km) / prev_km * 100)
+        eff_delta = round((kwh - prev_kwh) / prev_kwh * 100) if prev_kwh > 0 else 0
+        lines.append(f"\nvs prev month: distance {dist_delta:+d}%, energy {eff_delta:+d}%")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_tpms_status() -> str:
+    """Current TPMS pressures with warnings for anomalies.
+
+    Warns if any tire is below TESLA_TPMS_MIN_THRESHOLD or above
+    TESLA_TPMS_MAX_THRESHOLD, or if any tire differs from the average by > 0.15 bar.
+    """
+    if not HAS_OWNER_API:
+        return "Owner API not configured."
+
+    vehicles_resp = await _owner_api_get("/api/1/vehicles")
+    vehicles = vehicles_resp.get("response", [])
+    if not vehicles:
+        return "No vehicles found."
+    vehicle_id = vehicles[0].get("id")
+    if not vehicle_id:
+        return "Could not determine vehicle ID from API response."
+
+    data = await _owner_api_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
+    vs = data.get("response", {}).get("vehicle_state", {})
+
+    positions = [("fl", "Front Left"), ("fr", "Front Right"),
+                 ("rl", "Rear Left"), ("rr", "Rear Right")]
+    pressures = {}
+    lines = ["**TPMS Status**\n"]
+
+    for pos, label in positions:
+        bar = vs.get(f"tpms_pressure_{pos}")
+        if bar is None:
+            lines.append(f"{label}: N/A")
+            continue
+        psi = round(bar * 14.5038, 1)
+        status = "OK"
+        if bar < TPMS_MIN:
+            status = f"LOW (< {TPMS_MIN} bar)"
+        elif bar > TPMS_MAX:
+            status = f"HIGH (> {TPMS_MAX} bar)"
+        soft = vs.get(f"tpms_soft_warning_{pos}")
+        if soft:
+            status = status + " + SOFT WARNING"
+        pressures[pos] = bar
+        lines.append(f"{label}: {psi} PSI ({bar:.2f} bar) — {status}")
+
+    # Check consistency
+    if len(pressures) >= 3:
+        vals = list(pressures.values())
+        avg = sum(vals) / len(vals)
+        for pos, bar in pressures.items():
+            if abs(bar - avg) > TPMS_WARN_DELTA:
+                label = dict(positions).get(pos, pos)
+                lines.append(f"  ⚠ {label} deviates {abs(bar-avg):.2f} bar from average")
+        lines.append(f"Average: {round(avg*14.5038,1)} PSI ({round(avg,2)} bar)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_tpms_history(days: int = 30) -> str:
+    """Recent TPMS pressure history from TeslaMate.
+
+    Shows the average and min/max pressures recorded in positions table.
+    Note: TeslaMate only stores positions during drives/charging, not while parked.
+
+    Args:
+        days: Number of days to look back (default: 30)
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = _query(
+        f"""
+        SELECT date,
+               tpms_pressure_fl, tpms_pressure_fr,
+               tpms_pressure_rl, tpms_pressure_rr
+        FROM positions
+        WHERE car_id = %s AND date >= %s
+          AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL)
+        ORDER BY date DESC
+        LIMIT 20
+        """,
+        (CAR_ID, cutoff),
+    )
+
+    if not rows:
+        return f"No TPMS data in the last {days} days."
+
+    lines = [f"**TPMS History** (last {days} days, {len(rows)} records)\n"]
+    for r in rows:
+        date = str(r.get("date", ""))[:16]
+        fl = r.get("tpms_pressure_fl")
+        fr = r.get("tpms_pressure_fr")
+        rl = r.get("tpms_pressure_rl")
+        rr = r.get("tpms_pressure_rr")
+        fl_s = f"{round(fl*14.5038,1)}" if fl else "—"
+        fr_s = f"{round(fr*14.5038,1)}" if fr else "—"
+        rl_s = f"{round(rl*14.5038,1)}" if rl else "—"
+        rr_s = f"{round(rr*14.5038,1)}" if rr else "—"
+        lines.append(f"{date}: FL={fl_s} FR={fr_s} RL={rl_s} RR={rr_s} PSI")
     return "\n".join(lines)
 
 
