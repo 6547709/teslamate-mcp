@@ -96,6 +96,11 @@ ELECTRICITY_RATE = float(os.environ.get("TESLA_ELECTRICITY_RATE", "0.12"))
 GAS_PRICE = float(os.environ.get("TESLA_GAS_PRICE", "3.50"))
 GAS_MPG = int(os.environ.get("TESLA_GAS_MPG", "28"))
 
+# TPMS thresholds (bar)
+TPMS_MIN = float(os.environ.get("TESLA_TPMS_MIN_THRESHOLD", "2.0"))
+TPMS_MAX = float(os.environ.get("TESLA_TPMS_MAX_THRESHOLD", "2.5"))
+TPMS_WARN_DELTA = 0.15  # bar — warn if any tire differs from average by this much
+
 # Backend availability
 HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
 
@@ -1438,6 +1443,105 @@ async def tesla_monthly_report(year: int, month: int) -> str:
         eff_delta = round((kwh - prev_kwh) / prev_kwh * 100) if prev_kwh > 0 else 0
         lines.append(f"\nvs prev month: distance {dist_delta:+d}%, energy {eff_delta:+d}%")
 
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_tpms_status() -> str:
+    """Current TPMS pressures with warnings for anomalies.
+
+    Warns if any tire is below TESLA_TPMS_MIN_THRESHOLD or above
+    TESLA_TPMS_MAX_THRESHOLD, or if any tire differs from the average by > 0.15 bar.
+    """
+    if not HAS_OWNER_API:
+        return "Owner API not configured."
+
+    vehicles_resp = await _owner_api_get("/api/1/vehicles")
+    vehicles = vehicles_resp.get("response", [])
+    if not vehicles:
+        return "No vehicles found."
+    vehicle_id = vehicles[0].get("id")
+    if not vehicle_id:
+        return "Could not determine vehicle ID from API response."
+
+    data = await _owner_api_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
+    vs = data.get("response", {}).get("vehicle_state", {})
+
+    positions = [("fl", "Front Left"), ("fr", "Front Right"),
+                 ("rl", "Rear Left"), ("rr", "Rear Right")]
+    pressures = {}
+    lines = ["**TPMS Status**\n"]
+
+    for pos, label in positions:
+        bar = vs.get(f"tpms_pressure_{pos}")
+        if bar is None:
+            lines.append(f"{label}: N/A")
+            continue
+        psi = round(bar * 14.5038, 1)
+        status = "OK"
+        if bar < TPMS_MIN:
+            status = f"LOW (< {TPMS_MIN} bar)"
+        elif bar > TPMS_MAX:
+            status = f"HIGH (> {TPMS_MAX} bar)"
+        soft = vs.get(f"tpms_soft_warning_{pos}")
+        if soft:
+            status = "SOFT WARNING"
+        pressures[pos] = bar
+        lines.append(f"{label}: {psi} PSI ({bar:.2f} bar) — {status}")
+
+    # Check consistency
+    if len(pressures) >= 3:
+        vals = list(pressures.values())
+        avg = sum(vals) / len(vals)
+        for pos, bar in pressures.items():
+            if abs(bar - avg) > TPMS_WARN_DELTA:
+                label = dict(positions).get(pos, pos)
+                lines.append(f"  ⚠ {label} deviates {abs(bar-avg):.2f} bar from average")
+        lines.append(f"Average: {round(avg*14.5038,1)} PSI ({round(avg,2)} bar)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_tpms_history(days: int = 30) -> str:
+    """Recent TPMS pressure history from TeslaMate.
+
+    Shows the average and min/max pressures recorded in positions table.
+    Note: TeslaMate only stores positions during drives/charging, not while parked.
+
+    Args:
+        days: Number of days to look back (default: 30)
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = _query(
+        f"""
+        SELECT date,
+               tpms_pressure_fl, tpms_pressure_fr,
+               tpms_pressure_rl, tpms_pressure_rr
+        FROM positions
+        WHERE car_id = %s AND date >= %s
+          AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL)
+        ORDER BY date DESC
+        LIMIT 20
+        """,
+        (CAR_ID, cutoff),
+    )
+
+    if not rows:
+        return f"No TPMS data in the last {days} days."
+
+    lines = [f"**TPMS History** (last {days} days, {len(rows)} records)\n"]
+    for r in rows:
+        date = str(r.get("date", ""))[:16]
+        fl = r.get("tpms_pressure_fl")
+        fr = r.get("tpms_pressure_fr")
+        rl = r.get("tpms_pressure_rl")
+        rr = r.get("tpms_pressure_rr")
+        fl_s = f"{round(fl*14.5038,1)}" if fl else "—"
+        fr_s = f"{round(fr*14.5038,1)}" if fr else "—"
+        rl_s = f"{round(rl*14.5038,1)}" if rl else "—"
+        rr_s = f"{round(rr*14.5038,1)}" if rr else "—"
+        lines.append(f"{date}: FL={fl_s} FR={fr_s} RL={rl_s} RR={rr_s} PSI")
     return "\n".join(lines)
 
 
