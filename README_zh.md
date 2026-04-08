@@ -168,6 +168,24 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 | `TESLA_TPMS_MIN_THRESHOLD` | `2.0` | 低压警告阈值（bar） |
 | `TESLA_TPMS_MAX_THRESHOLD` | `2.5` | 高压警告阈值（bar） |
 
+### 查询限制
+
+设为 `-1` 表示不限制返回数量。
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `TESLA_LIMIT_DRIVES` | `50` | `tesla_drives` 最大返回条数 |
+| `TESLA_LIMIT_CHARGING` | `50` | `tesla_charging_history` 最大返回条数 |
+| `TESLA_LIMIT_TRIP_CATEGORIES` | `100` | `tesla_trip_categories` 分析的行程数 |
+| `TESLA_LIMIT_BATTERY_HEALTH` | `24` | `tesla_battery_health` 月度快照数量 |
+| `TESLA_LIMIT_BATTERY_SAMPLES` | `20` | `tesla_battery_health` 回退采样数 |
+| `TESLA_LIMIT_LOCATION_HISTORY` | `20` | `tesla_location_history` 位置聚类数量 |
+| `TESLA_LIMIT_STATE_HISTORY` | `100` | `tesla_state_history` 状态转换数量 |
+| `TESLA_LIMIT_SOFTWARE_UPDATES` | `20` | `tesla_software_updates` 软件更新数量 |
+| `TESLA_LIMIT_CHARGING_BY_LOCATION` | `15` | `tesla_charging_by_location` 充电地点数量 |
+| `TESLA_LIMIT_TPMS_HISTORY` | `20` | `tesla_tpms_history` 胎压历史记录数 |
+| `TESLA_LIMIT_VAMPIRE_DRAIN` | `20` | `tesla_vampire_drain` 吸血鬼耗电事件数 |
+
 ---
 
 ## 工作原理

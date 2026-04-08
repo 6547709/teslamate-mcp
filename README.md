@@ -170,6 +170,24 @@ All configuration is via environment variables.
 | `TESLA_TPMS_MIN_THRESHOLD` | `2.0` | Low pressure warning (bar) |
 | `TESLA_TPMS_MAX_THRESHOLD` | `2.5` | High pressure warning (bar) |
 
+### Query Limits
+
+Set to `-1` for unlimited results.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TESLA_LIMIT_DRIVES` | `50` | Max drives returned by `tesla_drives` |
+| `TESLA_LIMIT_CHARGING` | `50` | Max charging sessions by `tesla_charging_history` |
+| `TESLA_LIMIT_TRIP_CATEGORIES` | `100` | Drives analyzed by `tesla_trip_categories` |
+| `TESLA_LIMIT_BATTERY_HEALTH` | `24` | Monthly snapshots in `tesla_battery_health` |
+| `TESLA_LIMIT_BATTERY_SAMPLES` | `20` | Fallback sample limit for `tesla_battery_health` |
+| `TESLA_LIMIT_LOCATION_HISTORY` | `20` | Location clusters in `tesla_location_history` |
+| `TESLA_LIMIT_STATE_HISTORY` | `100` | State transitions in `tesla_state_history` |
+| `TESLA_LIMIT_SOFTWARE_UPDATES` | `20` | Software updates returned by `tesla_software_updates` |
+| `TESLA_LIMIT_CHARGING_BY_LOCATION` | `15` | Locations in `tesla_charging_by_location` |
+| `TESLA_LIMIT_TPMS_HISTORY` | `20` | TPMS records in `tesla_tpms_history` |
+| `TESLA_LIMIT_VAMPIRE_DRAIN` | `20` | Drain events in `tesla_vampire_drain` |
+
 ---
 
 ## Architecture

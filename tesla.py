@@ -119,6 +119,25 @@ HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")  # "stdio" or "streamable-http"
 
+# -- Query limits (set to -1 for no limit) ------------------------------------
+def _limit_sql(raw_limit: int | None) -> str:
+    """Return SQL LIMIT clause; -1 means no limit."""
+    if raw_limit is None or raw_limit < 0:
+        return ""
+    return f"LIMIT {raw_limit}"
+
+LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "50"))
+LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "50"))
+LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "100"))
+LIMIT_BATTERY_HEALTH     = int(os.environ.get("TESLA_LIMIT_BATTERY_HEALTH", "24"))
+LIMIT_BATTERY_SAMPLES    = int(os.environ.get("TESLA_LIMIT_BATTERY_SAMPLES", "20"))
+LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "20"))
+LIMIT_STATE_HISTORY      = int(os.environ.get("TESLA_LIMIT_STATE_HISTORY", "100"))
+LIMIT_SOFTWARE_UPDATES   = int(os.environ.get("TESLA_LIMIT_SOFTWARE_UPDATES", "20"))
+LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "15"))
+LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "20"))
+LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "20"))
+
 mcp = FastMCP("tesla")
 
 # -- Owner API Token Decryption -----------------------------------------------
@@ -464,7 +483,7 @@ async def tesla_charging_history(days: int = 30) -> str:
         )
         WHERE cp.car_id = {CAR_ID} AND cp.start_date >= %s
         ORDER BY cp.start_date DESC
-        LIMIT 50
+        {_limit_sql(LIMIT_CHARGING)}
     """,
         (cutoff,),
     )
@@ -510,7 +529,7 @@ async def tesla_drives(days: int = 30) -> str:
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
         WHERE d.car_id = {CAR_ID} AND d.start_date >= %s
         ORDER BY d.start_date DESC
-        LIMIT 50
+        {_limit_sql(LIMIT_DRIVES)}
     """,
         (cutoff,),
     )
@@ -755,7 +774,8 @@ async def tesla_trip_categories() -> str:
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
         WHERE d.car_id = %s AND d.distance > 0
-        ORDER BY d.start_date DESC LIMIT 100
+        ORDER BY d.start_date DESC
+        {_limit_sql(LIMIT_TRIP_CATEGORIES)}
         """,
         (CAR_ID,),
     )
@@ -770,7 +790,8 @@ async def tesla_trip_categories() -> str:
         counts[cat] += 1
 
     total = sum(counts.values())
-    lines = ["**Trip Categories** (last 100 drives)\n"]
+    cap_note = f" (last {len(rows)} drives)" if LIMIT_TRIP_CATEGORIES > 0 and len(rows) >= LIMIT_TRIP_CATEGORIES else f" ({len(rows)} drives)"
+    lines = [f"**Trip Categories**{cap_note}\n"]
     for cat, cnt in sorted(counts.items(), key=lambda x: -x[1]):
         pct = round(cnt / total * 100) if total > 0 else 0
         lines.append(f"- {cat}: {cnt} ({pct}%)")
@@ -793,7 +814,7 @@ async def tesla_battery_health() -> str:
           AND ideal_battery_range_km IS NOT NULL
         GROUP BY date_trunc('month', date)
         ORDER BY month DESC
-        LIMIT 24
+        {_limit_sql(LIMIT_BATTERY_HEALTH)}
     """)
 
     if not rows:
@@ -804,7 +825,7 @@ async def tesla_battery_health() -> str:
               AND battery_level >= 99
               AND ideal_battery_range_km IS NOT NULL
             ORDER BY date DESC
-            LIMIT 20
+            {_limit_sql(LIMIT_BATTERY_SAMPLES)}
         """)
         if not rows:
             return "Not enough data for battery health. Need positions at 100% charge."
@@ -897,7 +918,7 @@ async def tesla_location_history(days: int = 7) -> str:
         WHERE car_id = {CAR_ID} AND date >= %s
         GROUP BY ROUND(latitude::numeric, 3), ROUND(longitude::numeric, 3)
         ORDER BY position_count DESC
-        LIMIT 20
+        {_limit_sql(LIMIT_LOCATION_HISTORY)}
     """,
         (cutoff,),
     )
@@ -940,7 +961,7 @@ async def tesla_state_history(days: int = 7) -> str:
         FROM states
         WHERE car_id = {CAR_ID} AND start_date >= %s
         ORDER BY start_date DESC
-        LIMIT 100
+        {_limit_sql(LIMIT_STATE_HISTORY)}
     """,
         (cutoff,),
     )
@@ -984,7 +1005,7 @@ async def tesla_software_updates() -> str:
         FROM updates
         WHERE car_id = {CAR_ID}
         ORDER BY start_date DESC
-        LIMIT 20
+        {_limit_sql(LIMIT_SOFTWARE_UPDATES)}
     """)
 
     if not rows:
@@ -1436,7 +1457,7 @@ async def tesla_charging_by_location() -> str:
         WHERE cp.car_id = {CAR_ID} AND cp.end_date IS NOT NULL
         GROUP BY a.display_name
         ORDER BY total_kwh DESC
-        LIMIT 15
+        {_limit_sql(LIMIT_CHARGING_BY_LOC)}
     """)
 
     if not rows:
@@ -1697,7 +1718,7 @@ async def tesla_tpms_history(days: int = 30) -> str:
         WHERE car_id = %s AND date >= %s
           AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL)
         ORDER BY date DESC
-        LIMIT 20
+        {_limit_sql(LIMIT_TPMS_HISTORY)}
         """,
         (CAR_ID, cutoff),
     )
@@ -1823,7 +1844,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 8
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 48
         ORDER BY drain DESC
-        LIMIT 20
+        {_limit_sql(LIMIT_VAMPIRE_DRAIN)}
     """,
         (cutoff,),
     )

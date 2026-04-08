@@ -32,5 +32,12 @@ services:
       # Optional TPMS thresholds
       # - TESLA_TPMS_MIN_THRESHOLD=2.0
       # - TESLA_TPMS_MAX_THRESHOLD=2.5
+      # Optional query limits (set to -1 for unlimited)
+      # - TESLA_LIMIT_DRIVES=50
+      # - TESLA_LIMIT_CHARGING=50
+      # - TESLA_LIMIT_TRIP_CATEGORIES=100
+      # - TESLA_LIMIT_BATTERY_HEALTH=24
+      # - TESLA_LIMIT_STATE_HISTORY=100
+      # - TESLA_LIMIT_VAMPIRE_DRAIN=20
     depends_on:
       - database
