@@ -609,6 +609,125 @@ async def tesla_driving_score(
     return "\n".join(lines)
 
 
+# -- Trip Classification Logic -----------------------------------------------
+
+TRIP_THRESHOLD_KM = 100  # drives longer than this = "long_trip"
+COMMUTE_PAIRS = [
+    ("home", "work"),
+    ("work", "home"),
+]
+
+
+def _classify_trip(start_geofence: str | None, end_geofence: str | None, distance_km: float) -> str:
+    """Classify a trip based on geofence names and distance."""
+    start = (start_geofence or "").lower()
+    end = (end_geofence or "").lower()
+
+    # Long trip check first
+    if distance_km > TRIP_THRESHOLD_KM:
+        return "long_trip"
+
+    # Commute: home <-> work
+    for home_key, work_key in COMMUTE_PAIRS:
+        if (home_key in start and work_key in end) or (home_key in end and work_key in start):
+            return "commute"
+
+    # Shopping keywords
+    shopping_keywords = ["mall", "store", "shop", "market", "supermarket", "grocery"]
+    if any(kw in start or kw in end for kw in shopping_keywords):
+        return "shopping"
+
+    # Leisure keywords
+    leisure_keywords = ["park", "beach", "restaurant", "cafe", "movie", "gym", "playground"]
+    if any(kw in start or kw in end for kw in leisure_keywords):
+        return "leisure"
+
+    return "other"
+
+
+@mcp.tool()
+async def tesla_trips_by_category(category: str = "commute", limit: int = 20) -> str:
+    """Get trips filtered by category.
+
+    Args:
+        category: "commute", "shopping", "leisure", "long_trip", or "other"
+        limit: Max trips to return (default: 20)
+    """
+    rows = _query(
+        f"""
+        SELECT d.start_date, d.distance, d.duration_min,
+               sa.display_name AS start_location,
+               ea.display_name AS end_location
+        FROM drives d
+        LEFT JOIN addresses sa ON d.start_address_id = sa.id
+        LEFT JOIN addresses ea ON d.end_address_id = ea.id
+        WHERE d.car_id = %s AND d.distance > 0
+        ORDER BY d.start_date DESC LIMIT %s
+        """,
+        (CAR_ID, limit * 3),
+    )
+
+    classified = []
+    for r in rows:
+        dist_km = r.get("distance") or 0
+        cat = _classify_trip(
+            r.get("start_location"),
+            r.get("end_location"),
+            dist_km,
+        )
+        if cat == category:
+            classified.append(r)
+        if len(classified) >= limit:
+            break
+
+    if not classified:
+        return f"No {category} trips found."
+
+    lines = [f"**{category.upper()} Trips** ({len(classified)} results)\n"]
+    for r in classified:
+        date = str(r.get("start_date", ""))[:16]
+        dist_mi = _km_to_mi(r.get("distance") or 0)
+        dur = r.get("duration_min") or 0
+        start = r.get("start_location") or "?"
+        end = r.get("end_location") or "?"
+        lines.append(f"- {date}: {dist_mi} mi, {dur} min, {start} → {end}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_trip_categories() -> str:
+    """Show count of trips by category for recent drives."""
+    rows = _query(
+        f"""
+        SELECT d.distance,
+               sa.display_name AS start_location,
+               ea.display_name AS end_location
+        FROM drives d
+        LEFT JOIN addresses sa ON d.start_address_id = sa.id
+        LEFT JOIN addresses ea ON d.end_address_id = ea.id
+        WHERE d.car_id = %s AND d.distance > 0
+        ORDER BY d.start_date DESC LIMIT 100
+        """,
+        (CAR_ID,),
+    )
+
+    counts = {"commute": 0, "shopping": 0, "leisure": 0, "long_trip": 0, "other": 0}
+    for r in rows:
+        cat = _classify_trip(
+            r.get("start_location"),
+            r.get("end_location"),
+            r.get("distance") or 0,
+        )
+        counts[cat] += 1
+
+    total = sum(counts.values())
+    lines = ["**Trip Categories** (last 100 drives)\n"]
+    for cat, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+        pct = round(cnt / total * 100) if total > 0 else 0
+        lines.append(f"- {cat}: {cnt} ({pct}%)")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def tesla_battery_health() -> str:
     """Battery degradation trend — range at 100% charge over time.
