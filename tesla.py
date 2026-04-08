@@ -104,6 +104,11 @@ TPMS_WARN_DELTA = 0.15  # bar — warn if any tire differs from average by this 
 # Backend availability
 HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
 
+# HTTP server mode (for containerized deployment)
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")  # "stdio" or "streamable-http"
+
 mcp = FastMCP("tesla")
 
 # -- Owner API Token Decryption -----------------------------------------------
@@ -1664,4 +1669,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    if MCP_TRANSPORT == "streamable-http":
+        mcp.run(transport="streamable-http", host=HTTP_HOST, port=HTTP_PORT)
+    else:
+        mcp.run()

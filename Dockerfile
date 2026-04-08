@@ -7,4 +7,6 @@ RUN pip install --no-cache-dir -e .
 
 COPY tesla.py ./
 
-ENTRYPOINT ["mcp-teslamate-fleet"]
+EXPOSE 8080
+
+CMD ["python", "tesla.py"]
