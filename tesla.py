@@ -68,10 +68,23 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 
+import time
+import threading
+
 import psycopg2
 import psycopg2.extras
+import psycopg2.extensions
+import psycopg2.pool
 import httpx
 from fastmcp import FastMCP
+
+# -- Register Decimal→float adapter globally so psycopg2 returns float directly --
+_DEC2FLOAT = psycopg2.extensions.new_type(
+    psycopg2.extensions.DECIMAL.values,
+    'DEC2FLOAT',
+    lambda value, curs: float(value) if value is not None else None,
+)
+psycopg2.extensions.register_type(_DEC2FLOAT)
 
 # -- Configuration ------------------------------------------------------------
 
@@ -165,24 +178,48 @@ def _format_dt(dt: datetime | None) -> str:
 
 # -- DB helper -----------------------------------------------------------------
 
+# Connection pool (lazy-initialized, thread-safe)
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+
+def _init_pool():
+    """Lazily create the connection pool on first use."""
+    global _pool
+    if _pool is not None:
+        return
+    with _pool_lock:
+        if _pool is not None:
+            return
+        if not HAS_TESLAMATE:
+            raise RuntimeError(
+                "TeslaMate database not configured. "
+                "Set TESLAMATE_DB_HOST and TESLAMATE_DB_PASS environment variables. "
+                "See README for setup instructions."
+            )
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=8,
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASS,
+            dbname=DB_NAME,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            options="-c statement_timeout=30000",  # 30s query timeout
+        )
+
 
 def _get_conn():
-    """Get a Postgres connection to TeslaMate's database."""
-    if not HAS_TESLAMATE:
-        raise RuntimeError(
-            "TeslaMate database not configured. "
-            "Set TESLAMATE_DB_HOST and TESLAMATE_DB_PASS environment variables. "
-            "See README for setup instructions."
-        )
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASS,
-        dbname=DB_NAME,
-        cursor_factory=psycopg2.extras.RealDictCursor,
-        connect_timeout=10,
-    )
+    """Get a connection from the pool."""
+    _init_pool()
+    return _pool.getconn()
+
+
+def _put_conn(conn):
+    """Return a connection to the pool."""
+    if _pool is not None:
+        _pool.putconn(conn)
 
 
 def _query(sql: str, params: tuple = ()) -> list[dict]:
@@ -191,23 +228,42 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
-            rows = []
-            for row in cur.fetchall():
-                rows.append(
-                    {
-                        k: float(v) if isinstance(v, Decimal) else v
-                        for k, v in dict(row).items()
-                    }
-                )
-            return rows
+            return [dict(row) for row in cur.fetchall()]
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        conn.close()
+        _put_conn(conn)
 
 
 def _query_one(sql: str, params: tuple = ()) -> dict | None:
-    """Execute a read-only query and return first result."""
-    rows = _query(sql, params)
-    return rows[0] if rows else None
+    """Execute a read-only query and return first result (fetchone)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
+
+
+# -- Simple TTL cache for low-frequency data -----------------------------------
+
+_cache: dict[str, dict] = {}
+
+
+def _cached_query_one(key: str, sql: str, params: tuple = (), ttl: int = 300) -> dict | None:
+    """Query with TTL cache — ideal for rarely-changing data (car info, sw version)."""
+    now = time.time()
+    if key in _cache and now - _cache[key]["ts"] < ttl:
+        return _cache[key]["data"]
+    result = _query_one(sql, params)
+    _cache[key] = {"data": result, "ts": now}
+    return result
 
 
 def _km_to_mi(km: float | None) -> float | None:
@@ -264,74 +320,54 @@ async def tesla_status() -> str:
 
     Returns the latest position snapshot and vehicle info from TeslaMate.
     """
-    car = _query_one(
+    # Car info rarely changes — cache for 10 minutes
+    car = _cached_query_one(
+        f"car_{CAR_ID}",
         "SELECT id, name, model, efficiency FROM cars WHERE id = %s LIMIT 1",
-        (CAR_ID,)
+        (CAR_ID,), ttl=600,
     )
 
-    pos = _query_one("""
-        SELECT battery_level,
-               is_climate_on, inside_temp, outside_temp,
-               odometer, speed,
-               latitude, longitude, date
-        FROM positions
-        WHERE car_id = %s
-        ORDER BY date DESC
-        LIMIT 1
-    """, (CAR_ID,))
+    # Single query: latest position + state + charging + software version
+    combined = _query_one("""
+        SELECT
+            p.battery_level, p.is_climate_on, p.inside_temp, p.outside_temp,
+            p.odometer, p.speed, p.latitude, p.longitude, p.date AS pos_date,
+            s.state AS vehicle_state,
+            cp.charge_energy_added, cp.duration_min AS charge_duration,
+            cp.start_battery_level AS charge_start_pct,
+            cp.end_battery_level AS charge_end_pct,
+            cp.start_date AS charge_start, cp.end_date AS charge_end,
+            u.version AS sw_version
+        FROM (
+            SELECT * FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
+        ) p
+        LEFT JOIN LATERAL (
+            SELECT state FROM states WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+        ) s ON true
+        LEFT JOIN LATERAL (
+            SELECT charge_energy_added, duration_min, start_battery_level,
+                   end_battery_level, start_date, end_date
+            FROM charging_processes WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+        ) cp ON true
+        LEFT JOIN LATERAL (
+            SELECT version FROM updates WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+        ) u ON true
+    """, (CAR_ID, CAR_ID, CAR_ID, CAR_ID))
 
-    state = _query_one("""
-        SELECT state, start_date, end_date
-        FROM states
-        WHERE car_id = %s
-        ORDER BY start_date DESC
-        LIMIT 1
-    """, (CAR_ID,))
+    if not combined:
+        return "No vehicle data found. Is TeslaMate running?"
 
-    charge = _query_one("""
-        SELECT charge_energy_added, duration_min,
-               start_battery_level, end_battery_level,
-               start_date, end_date
-        FROM charging_processes
-        WHERE car_id = %s
-        ORDER BY start_date DESC
-        LIMIT 1
-    """, (CAR_ID,))
-
-    # Check geofence for current position
+    # Geofence lookup (lightweight — geofences table is tiny)
     geofence = None
-    if pos and pos.get("latitude") and pos.get("longitude"):
-        geofence = _query_one(
-            """
-            SELECT name, radius, dist.distance_m FROM geofences,
-            LATERAL (SELECT (6371000 * acos(
-                       cos(radians(%s)) * cos(radians(latitude))
-                       * cos(radians(longitude) - radians(%s))
-                       + sin(radians(%s)) * sin(radians(latitude))
-                   )) AS distance_m) dist
-            WHERE dist.distance_m <= radius
-            ORDER BY dist.distance_m
+    lat, lon = combined.get("latitude"), combined.get("longitude")
+    if lat and lon:
+        geofence = _query_one("""
+            SELECT name FROM geofences
+            WHERE latitude BETWEEN %s - 0.01 AND %s + 0.01
+              AND longitude BETWEEN %s - 0.01 AND %s + 0.01
+            ORDER BY (latitude - %s)^2 + (longitude - %s)^2
             LIMIT 1
-        """,
-            (pos["latitude"], pos["longitude"], pos["latitude"]),
-        )
-        if geofence is None:
-            geofence = _query_one(
-                """
-                SELECT name FROM geofences
-                WHERE ABS(latitude - %s) < 0.01 AND ABS(longitude - %s) < 0.01
-                ORDER BY ABS(latitude - %s) + ABS(longitude - %s)
-                LIMIT 1
-            """,
-                (pos["latitude"], pos["longitude"], pos["latitude"], pos["longitude"]),
-            )
-
-    update = _query_one(f"""
-        SELECT version FROM updates
-        WHERE car_id = {CAR_ID}
-        ORDER BY start_date DESC
-        LIMIT 1
-    """)
+        """, (lat, lat, lon, lon, lat, lon))
 
     lines = []
     if car:
@@ -339,65 +375,63 @@ async def tesla_status() -> str:
         model = car.get("model") or ""
         lines.append(f"**{name}** ({model})")
 
-    if update and update.get("version"):
-        lines.append(f"Software: {update['version']}")
+    if combined.get("sw_version"):
+        lines.append(f"Software: {combined['sw_version']}")
 
-    if pos:
-        bat = pos.get("battery_level")
+    bat = combined.get("battery_level")
+    if bat is not None:
         range_km = BATTERY_RANGE_KM * bat / 100
         lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
 
-        is_charging = (
-            charge
-            and charge.get("end_date") is None
-            and charge.get("start_date") is not None
-        )
-        if is_charging:
-            kwh = charge.get("charge_energy_added") or 0
-            lines.append(f"Charging: Yes ({kwh:.1f} kWh added so far)")
+    is_charging = (
+        combined.get("charge_end") is None
+        and combined.get("charge_start") is not None
+    )
+    if is_charging:
+        kwh = combined.get("charge_energy_added") or 0
+        lines.append(f"Charging: Yes ({kwh:.1f} kWh added so far)")
+    else:
+        lines.append("Charging: Not charging")
+
+    if combined.get("is_climate_on"):
+        inside_t = _format_temp(combined.get("inside_temp"))
+        line = "Climate: ON"
+        if inside_t != "N/A":
+            line += f", cabin {inside_t}"
+        lines.append(line)
+    else:
+        inside_t = _format_temp(combined.get("inside_temp"))
+        outside_t = _format_temp(combined.get("outside_temp"))
+        parts = ["Climate: Off"]
+        if inside_t != "N/A":
+            parts.append(f"cabin {inside_t}")
+        if outside_t != "N/A":
+            parts.append(f"outside {outside_t}")
+        lines.append(", ".join(parts))
+
+    odo_km = combined.get("odometer")
+    if odo_km:
+        lines.append(f"Odometer: {_format_distance(odo_km)}")
+
+    vehicle_state = combined.get("vehicle_state")
+    if vehicle_state:
+        lines.append(f"State: {vehicle_state}")
+
+    if geofence and geofence.get("name"):
+        lines.append(f"Location: {geofence['name']}")
+    else:
+        if lat is not None and lon is not None:
+            lines.append(f"Location: {lat:.4f}, {lon:.4f}")
         else:
-            lines.append("Charging: Not charging")
+            lines.append("Location: unknown")
 
-        if pos.get("is_climate_on"):
-            inside_t = _format_temp(pos.get("inside_temp"))
-            line = "Climate: ON"
-            if inside_t != "N/A":
-                line += f", cabin {inside_t}"
-            lines.append(line)
-        else:
-            inside_t = _format_temp(pos.get("inside_temp"))
-            outside_t = _format_temp(pos.get("outside_temp"))
-            parts = ["Climate: Off"]
-            if inside_t != "N/A":
-                parts.append(f"cabin {inside_t}")
-            if outside_t != "N/A":
-                parts.append(f"outside {outside_t}")
-            lines.append(", ".join(parts))
+    lines.append(f"Last update: {_format_dt(combined.get('pos_date'))}")
 
-        odo_km = pos.get("odometer")
-        if odo_km:
-            lines.append(f"Odometer: {_format_distance(odo_km)}")
-
-        if state:
-            vehicle_state = state.get("state", "unknown")
-            lines.append(f"State: {vehicle_state}")
-
-        if geofence and geofence.get("name"):
-            lines.append(f"Location: {geofence['name']}")
-        else:
-            lat, lon = pos.get("latitude"), pos.get("longitude")
-            if lat is not None and lon is not None:
-                lines.append(f"Location: {lat:.4f}, {lon:.4f}")
-            else:
-                lines.append("Location: unknown")
-
-        lines.append(f"Last update: {_format_dt(pos.get('date'))}")
-
-    if charge and charge.get("end_date"):
-        kwh = charge.get("charge_energy_added") or 0
-        dur = charge.get("duration_min") or 0
-        start_bat = charge.get("start_battery_level") or "?"
-        end_bat = charge.get("end_battery_level") or "?"
+    if combined.get("charge_end"):
+        kwh = combined.get("charge_energy_added") or 0
+        dur = combined.get("charge_duration") or 0
+        start_bat = combined.get("charge_start_pct") or "?"
+        end_bat = combined.get("charge_end_pct") or "?"
         lines.append(
             f"Last charge: {kwh:.1f} kWh in {dur} min ({start_bat}% -> {end_bat}%)"
         )
@@ -421,18 +455,19 @@ async def tesla_charging_history(days: int = 30) -> str:
                a.display_name AS location
         FROM charging_processes cp
         LEFT JOIN positions p ON cp.position_id = p.id
-        LEFT JOIN addresses a ON a.id = (
-            SELECT a2.id FROM addresses a2
-            WHERE ABS(a2.latitude - p.latitude) < 0.001
-              AND ABS(a2.longitude - p.longitude) < 0.001
-            ORDER BY ABS(a2.latitude - p.latitude) + ABS(a2.longitude - p.longitude)
+        LEFT JOIN LATERAL (
+            SELECT a2.display_name
+            FROM addresses a2
+            WHERE a2.latitude BETWEEN p.latitude - 0.001 AND p.latitude + 0.001
+              AND a2.longitude BETWEEN p.longitude - 0.001 AND p.longitude + 0.001
+            ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
             LIMIT 1
-        )
-        WHERE cp.car_id = {CAR_ID} AND cp.start_date >= %s
+        ) a ON p.latitude IS NOT NULL
+        WHERE cp.car_id = %s AND cp.start_date >= %s
         ORDER BY cp.start_date DESC
         {_limit_sql(LIMIT_CHARGING)}
     """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
 
     if not rows:
@@ -479,11 +514,11 @@ async def tesla_drives(days: int = 30) -> str:
         FROM drives d
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = {CAR_ID} AND d.start_date >= %s
+        WHERE d.car_id = %s AND d.start_date >= %s
         ORDER BY d.start_date DESC
         {_limit_sql(LIMIT_DRIVES)}
     """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
 
     if not rows:
@@ -538,7 +573,7 @@ async def tesla_driving_score(
     # Build date filter
     if period == "recent_n":
         rows = _query(
-            f"""
+            """
             SELECT d.distance, d.duration_min, d.power_max, d.power_min,
                    d.speed_max, d.start_date
             FROM drives d
@@ -557,7 +592,7 @@ async def tesla_driving_score(
         else:
             end = datetime(year, month + 1, 1)
         rows = _query(
-            f"""
+            """
             SELECT d.distance, d.duration_min, d.power_max, d.power_min,
                    d.speed_max, d.start_date
             FROM drives d
@@ -574,7 +609,7 @@ async def tesla_driving_score(
         start = datetime(year, 1, 1)
         end = datetime(year + 1, 1, 1)
         rows = _query(
-            f"""
+            """
             SELECT d.distance, d.duration_min, d.power_max, d.power_min,
                    d.speed_max, d.start_date
             FROM drives d
@@ -674,7 +709,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20) ->
         limit: Max trips to return (default: 20)
     """
     rows = _query(
-        f"""
+        """
         SELECT d.start_date, d.distance, d.duration_min,
                sa.display_name AS start_location,
                ea.display_name AS end_location
@@ -761,24 +796,24 @@ async def tesla_battery_health() -> str:
                AVG(ideal_battery_range_km) AS avg_ideal_km,
                COUNT(*) AS samples
         FROM positions
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
           AND battery_level = 100
           AND ideal_battery_range_km IS NOT NULL
         GROUP BY date_trunc('month', date)
         ORDER BY month DESC
         {_limit_sql(LIMIT_BATTERY_HEALTH)}
-    """)
+    """, (CAR_ID,))
 
     if not rows:
         rows = _query(f"""
             SELECT date, ideal_battery_range_km
             FROM positions
-            WHERE car_id = {CAR_ID}
+            WHERE car_id = %s
               AND battery_level >= 99
               AND ideal_battery_range_km IS NOT NULL
             ORDER BY date DESC
             {_limit_sql(LIMIT_BATTERY_SAMPLES)}
-        """)
+        """, (CAR_ID,))
         if not rows:
             return "Not enough data for battery health. Need positions at 100% charge."
 
@@ -814,20 +849,20 @@ async def tesla_efficiency(days: int = 90) -> str:
     """
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
-        f"""
+        """
         SELECT date_trunc('week', start_date) AS week,
                SUM(distance) AS total_km,
                SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * {KWH_PER_KM}) AS total_kwh,
+                   * %s) AS total_kwh,
                SUM(duration_min) AS total_min,
                COUNT(*) AS trips,
                AVG(outside_temp_avg) AS avg_temp
         FROM drives
-        WHERE car_id = {CAR_ID} AND start_date >= %s AND distance > 0
+        WHERE car_id = %s AND start_date >= %s AND distance > 0
         GROUP BY date_trunc('week', start_date)
         ORDER BY week DESC
     """,
-        (cutoff,),
+        (KWH_PER_KM, CAR_ID, cutoff,),
     )
 
     if not rows:
@@ -867,12 +902,12 @@ async def tesla_location_history(days: int = 7) -> str:
                MIN(date) AS first_seen,
                MAX(date) AS last_seen
         FROM positions
-        WHERE car_id = {CAR_ID} AND date >= %s
+        WHERE car_id = %s AND date >= %s
         GROUP BY ROUND(latitude::numeric, 3), ROUND(longitude::numeric, 3)
         ORDER BY position_count DESC
         {_limit_sql(LIMIT_LOCATION_HISTORY)}
     """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
 
     if not rows:
@@ -911,11 +946,11 @@ async def tesla_state_history(days: int = 7) -> str:
         f"""
         SELECT state, start_date, end_date
         FROM states
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
         ORDER BY start_date DESC
         {_limit_sql(LIMIT_STATE_HISTORY)}
     """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
 
     if not rows:
@@ -955,10 +990,10 @@ async def tesla_software_updates() -> str:
     rows = _query(f"""
         SELECT version, start_date, end_date
         FROM updates
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
         ORDER BY start_date DESC
         {_limit_sql(LIMIT_SOFTWARE_UPDATES)}
-    """)
+    """, (CAR_ID,))
 
     if not rows:
         return "No software update history found."
@@ -988,48 +1023,46 @@ async def tesla_live() -> str:
     real-time). Fields like sentry mode, lock status, and media are not
     available in TeslaMate and are omitted.
     """
-    # Latest position snapshot
-    pos = _query_one("""
-        SELECT battery_level, ideal_battery_range_km,
-               is_climate_on, inside_temp, outside_temp,
-               driver_temp_setting,
-               odometer, speed, power,
-               latitude, longitude, date
-        FROM positions
-        WHERE car_id = %s
-        ORDER BY date DESC
-        LIMIT 1
-    """, (CAR_ID,))
+    # Car info — cached
+    car = _cached_query_one(
+        f"car_{CAR_ID}",
+        "SELECT name, model FROM cars WHERE id = %s LIMIT 1",
+        (CAR_ID,), ttl=600,
+    )
 
-    # Latest charging session (to determine charging state)
-    charge = _query_one("""
-        SELECT start_date, end_date, charge_energy_added,
-               start_battery_level, end_battery_level
-        FROM charging_processes
-        WHERE car_id = %s
-        ORDER BY start_date DESC
-        LIMIT 1
-    """, (CAR_ID,))
+    # Single combined query: position + charging + software
+    combined = _query_one("""
+        SELECT
+            p.battery_level, p.ideal_battery_range_km,
+            p.is_climate_on, p.inside_temp, p.outside_temp,
+            p.driver_temp_setting,
+            p.odometer, p.speed, p.power,
+            p.latitude, p.longitude, p.date,
+            p.tpms_pressure_fl, p.tpms_pressure_fr,
+            p.tpms_pressure_rl, p.tpms_pressure_rr,
+            cp.start_date AS charge_start, cp.end_date AS charge_end,
+            cp.charge_energy_added,
+            u.version AS sw_version
+        FROM (
+            SELECT * FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
+        ) p
+        LEFT JOIN LATERAL (
+            SELECT start_date, end_date, charge_energy_added
+            FROM charging_processes WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+        ) cp ON true
+        LEFT JOIN LATERAL (
+            SELECT version FROM updates WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+        ) u ON true
+    """, (CAR_ID, CAR_ID, CAR_ID))
 
-    # Latest software version
-    update = _query_one("""
-        SELECT version FROM updates
-        WHERE car_id = %s
-        ORDER BY start_date DESC
-        LIMIT 1
-    """, (CAR_ID,))
-
-    # Vehicle name
-    car = _query_one("SELECT name, model FROM cars WHERE id = %s LIMIT 1", (CAR_ID,))
-
-    if not pos:
+    if not combined:
         return "No position data found. Is TeslaMate running?"
 
     vehicle_name = (car.get("name") or car.get("model") or "Tesla") if car else "Tesla"
     lines = [f"**{vehicle_name}** (TeslaMate polled)\n"]
 
     # Battery
-    bat = pos.get("battery_level")
+    bat = combined.get("battery_level")
     range_km = BATTERY_RANGE_KM * bat / 100  # estimate from battery level + EPA range
     if USE_METRIC_UNITS:
         lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
@@ -1039,31 +1072,30 @@ async def tesla_live() -> str:
 
     # Charging state
     is_charging = (
-        charge
-        and charge.get("end_date") is None
-        and charge.get("start_date") is not None
+        combined.get("charge_end") is None
+        and combined.get("charge_start") is not None
     )
     if is_charging:
-        added = charge.get("charge_energy_added") or 0
+        added = combined.get("charge_energy_added") or 0
         lines.append(f"Charging: Yes (added {added:.1f} kWh)")
     else:
         lines.append("Charging: Not charging")
 
     # Climate
-    inside_t = _format_temp(pos.get("inside_temp"))
-    outside_t = _format_temp(pos.get("outside_temp"))
+    inside_t = _format_temp(combined.get("inside_temp"))
+    outside_t = _format_temp(combined.get("outside_temp"))
     lines.append(
-        f"Climate: {'ON' if pos.get('is_climate_on') else 'Off'}"
+        f"Climate: {'ON' if combined.get('is_climate_on') else 'Off'}"
         f", inside {inside_t}, outside {outside_t}"
     )
 
     # Odometer
-    odo_km = pos.get("odometer")
+    odo_km = combined.get("odometer")
     if odo_km:
         lines.append(f"Odometer: {_format_distance(odo_km)}")
 
     # Speed
-    speed = pos.get("speed")
+    speed = combined.get("speed")
     if speed is not None and speed > 0:
         if USE_METRIC_UNITS:
             lines.append(f"Driving: {round(speed * 3.6)} km/h")
@@ -1073,29 +1105,20 @@ async def tesla_live() -> str:
         lines.append("Driving: Parked")
 
     # Location
-    lat = pos.get("latitude")
-    lon = pos.get("longitude")
+    lat = combined.get("latitude")
+    lon = combined.get("longitude")
     if lat and lon:
         lines.append(f"Location: {lat:.5f}, {lon:.5f}")
         try:
-            nearby = _query_one(
-                """
-                SELECT name, radius, dist.distance_m FROM geofences,
-                LATERAL (SELECT (6371000 * acos(
-                           cos(radians(%s)) * cos(radians(latitude))
-                           * cos(radians(longitude) - radians(%s))
-                           + sin(radians(%s)) * sin(radians(latitude))
-                   )) AS distance_m) dist
-                WHERE dist.distance_m <= radius
-                ORDER BY dist.distance_m
+            nearby = _query_one("""
+                SELECT name FROM geofences
+                WHERE latitude BETWEEN %s - 0.01 AND %s + 0.01
+                  AND longitude BETWEEN %s - 0.01 AND %s + 0.01
+                ORDER BY (latitude - %s)^2 + (longitude - %s)^2
                 LIMIT 1
-            """,
-                (lat, lon, lat),
-            )
+            """, (lat, lat, lon, lon, lat, lon))
             if nearby and nearby.get("name"):
-                dist = nearby.get("distance_m", 0)
-                dist_str = f" ({dist / 1000:.1f}km away)" if dist and dist > 500 else ""
-                lines.append(f"  Near: {nearby['name']}{dist_str}")
+                lines.append(f"  Near: {nearby['name']}")
         except Exception:
             pass
     else:
@@ -1109,7 +1132,7 @@ async def tesla_live() -> str:
         ("tpms_pressure_rl", "RL"),
         ("tpms_pressure_rr", "RR"),
     ]:
-        bar = pos.get(pos_key)
+        bar = combined.get(pos_key)
         if bar is not None:
             if USE_METRIC_UNITS:
                 tires.append(f"{label}:{bar:.2f} bar")
@@ -1119,10 +1142,10 @@ async def tesla_live() -> str:
         lines.append(f"Tires: {', '.join(tires)}")
 
     # Software version
-    if update and update.get("version"):
-        lines.append(f"Software: {update['version']}")
+    if combined.get("sw_version"):
+        lines.append(f"Software: {combined['sw_version']}")
 
-    lines.append(f"Last poll: {_format_dt(pos.get('date'))}")
+    lines.append(f"Last poll: {_format_dt(combined.get('date'))}")
     return "\n".join(lines)
 
 
@@ -1143,19 +1166,19 @@ async def tesla_savings(
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
-    lifetime = _query_one(f"""
+    lifetime = _query_one("""
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * {KWH_PER_KM}), 0) AS total_kwh
-        FROM drives WHERE car_id = {CAR_ID} AND distance > 0
-    """)
-    monthly = _query_one(f"""
+                   * %s), 0) AS total_kwh
+        FROM drives WHERE car_id = %s AND distance > 0
+    """, (KWH_PER_KM, CAR_ID))
+    monthly = _query_one("""
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * {KWH_PER_KM}), 0) AS total_kwh
-        FROM drives WHERE car_id = {CAR_ID} AND distance > 0
+                   * %s), 0) AS total_kwh
+        FROM drives WHERE car_id = %s AND distance > 0
           AND date_trunc('month', start_date) = date_trunc('month', NOW())
-    """)
+    """, (KWH_PER_KM, CAR_ID))
 
     if not lifetime:
         return "No driving data yet."
@@ -1248,13 +1271,13 @@ async def tesla_trip_cost(
     road_mi = round(straight_mi * 1.3, 1)
     round_trip = round(road_mi * 2, 1)
 
-    eff = _query_one(f"""
+    eff = _query_one("""
         SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * {KWH_PER_KM}), 0) AS kwh,
+                   * %s), 0) AS kwh,
                COALESCE(SUM(distance), 0) AS km
-        FROM drives WHERE car_id = {CAR_ID}
+        FROM drives WHERE car_id = %s
           AND start_date >= NOW() - INTERVAL '30 days' AND distance > 0
-    """)
+    """, (KWH_PER_KM, CAR_ID))
 
     if USE_METRIC_UNITS:
         wh_per_km = 180  # default Wh/km
@@ -1322,7 +1345,7 @@ async def tesla_efficiency_by_temp() -> str:
 
     Shows how outside temperature affects energy consumption.
     """
-    rows = _query(f"""
+    rows = _query("""
         SELECT
             CASE
                 WHEN outside_temp_avg < 0 THEN 'Below 32degF'
@@ -1337,14 +1360,14 @@ async def tesla_efficiency_by_temp() -> str:
             COUNT(*) AS trips,
             SUM(distance) AS total_km,
             SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                * {KWH_PER_KM}) AS total_kwh
+                * %s) AS total_kwh
         FROM drives
-        WHERE car_id = {CAR_ID} AND distance > 1
+        WHERE car_id = %s AND distance > 1
           AND (start_ideal_range_km - end_ideal_range_km) > 0
           AND outside_temp_avg IS NOT NULL
         GROUP BY temp_range
         ORDER BY MIN(outside_temp_avg)
-    """)
+    """, (KWH_PER_KM, CAR_ID))
 
     if not rows:
         return "Not enough driving data with temperature readings."
@@ -1402,17 +1425,19 @@ async def tesla_charging_by_location() -> str:
                COALESCE(SUM(cp.cost), 0) AS total_cost
         FROM charging_processes cp
         JOIN positions p ON cp.position_id = p.id
-        LEFT JOIN addresses a ON a.id = (
-            SELECT a2.id FROM addresses a2
-            WHERE ABS(a2.latitude - p.latitude) < 0.005
-              AND ABS(a2.longitude - p.longitude) < 0.005
+        LEFT JOIN LATERAL (
+            SELECT a2.display_name
+            FROM addresses a2
+            WHERE a2.latitude BETWEEN p.latitude - 0.005 AND p.latitude + 0.005
+              AND a2.longitude BETWEEN p.longitude - 0.005 AND p.longitude + 0.005
+            ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
             LIMIT 1
-        )
-        WHERE cp.car_id = {CAR_ID} AND cp.end_date IS NOT NULL
+        ) a ON true
+        WHERE cp.car_id = %s AND cp.end_date IS NOT NULL
         GROUP BY a.display_name
         ORDER BY total_kwh DESC
         {_limit_sql(LIMIT_CHARGING_BY_LOC)}
-    """)
+    """, (CAR_ID,))
 
     if not rows:
         return "No charging data yet."
@@ -1443,18 +1468,18 @@ async def tesla_top_destinations(limit: int = 15) -> str:
         limit: Number of destinations to show (default: 15)
     """
     rows = _query(
-        f"""
+        """
         SELECT ea.display_name AS destination,
                COUNT(*) AS visits,
                COALESCE(SUM(d.distance), 0) AS total_km
         FROM drives d
         JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = {CAR_ID} AND d.distance > 1
+        WHERE d.car_id = %s AND d.distance > 1
         GROUP BY ea.display_name
         ORDER BY visits DESC
         LIMIT %s
     """,
-        (limit,),
+        (CAR_ID, limit,),
     )
 
     if not rows:
@@ -1478,20 +1503,20 @@ async def tesla_longest_trips(limit: int = 10) -> str:
         limit: Number of trips to show (default: 10)
     """
     rows = _query(
-        f"""
+        """
         SELECT d.start_date, d.distance, d.duration_min,
                GREATEST(d.start_ideal_range_km - d.end_ideal_range_km, 0)
-                   * {KWH_PER_KM} AS consumption_kwh,
+                   * %s AS consumption_kwh,
                sa.display_name AS start_loc,
                ea.display_name AS end_loc
         FROM drives d
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = {CAR_ID} AND d.distance > 0
+        WHERE d.car_id = %s AND d.distance > 0
         ORDER BY d.distance DESC
         LIMIT %s
     """,
-        (limit,),
+        (KWH_PER_KM, CAR_ID, limit,),
     )
 
     if not rows:
@@ -1530,17 +1555,17 @@ async def tesla_monthly_report(year: int, month: int) -> str:
 
     # Current month data
     rows = _query(
-        f"""
+        """
         SELECT COUNT(*) AS trips,
                COALESCE(SUM(distance), 0) AS total_km,
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * {KWH_PER_KM}), 0) AS total_kwh,
+                   * %s), 0) AS total_kwh,
                COALESCE(SUM(duration_min), 0) AS total_min
         FROM drives
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (CAR_ID, start.isoformat(), next_start.isoformat()),
+        (KWH_PER_KM, CAR_ID, start.isoformat(), next_start.isoformat()),
     )
     r = rows[0] if rows else {}
 
@@ -1551,15 +1576,15 @@ async def tesla_monthly_report(year: int, month: int) -> str:
 
     # Previous month for comparison
     prev_rows = _query(
-        f"""
+        """
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * {KWH_PER_KM}), 0) AS total_kwh
+                   * %s), 0) AS total_kwh
         FROM drives
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (CAR_ID, prev_start.isoformat(), start.isoformat()),
+        (KWH_PER_KM, CAR_ID, prev_start.isoformat(), start.isoformat()),
     )
     prev_r = prev_rows[0] if prev_rows else {}
     prev_km = prev_r.get("total_km") or 0
@@ -1567,7 +1592,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
 
     # Charging cost from TeslaMate
     charge_rows = _query(
-        f"""
+        """
         SELECT COALESCE(SUM(cp.cost), 0) AS total_cost,
                COALESCE(SUM(cp.charge_energy_added), 0) AS total_kwh
         FROM charging_processes cp
@@ -1615,17 +1640,17 @@ async def tesla_tpms_status() -> str:
     Warns if any tyre is below TESLA_TPMS_MIN_THRESHOLD or above
     TESLA_TPMS_MAX_THRESHOLD, or differs from the average by > 0.15 bar.
     """
-    pos = _query_one(f"""
+    pos = _query_one("""
         SELECT date,
                tpms_pressure_fl, tpms_pressure_fr,
                tpms_pressure_rl, tpms_pressure_rr
         FROM positions
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
           AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL
                OR tpms_pressure_rl IS NOT NULL OR tpms_pressure_rr IS NOT NULL)
         ORDER BY date DESC
         LIMIT 1
-    """)
+    """, (CAR_ID,))
 
     positions = [
         ("tpms_pressure_fl", "Front Left"),
@@ -1734,7 +1759,7 @@ async def tesla_monthly_summary(months: int = 6) -> str:
         months: Number of months to show (default: 6)
     """
     rows = _query(
-        f"""
+        """
         SELECT d.month,
                d.trips,
                d.total_km,
@@ -1746,23 +1771,23 @@ async def tesla_monthly_summary(months: int = 6) -> str:
                    COUNT(id) AS trips,
                    COALESCE(SUM(distance), 0) AS total_km,
                    COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                       * {KWH_PER_KM}), 0) AS total_kwh,
+                       * %s), 0) AS total_kwh,
                    COALESCE(SUM(duration_min), 0) AS total_min
             FROM drives
-            WHERE car_id = {CAR_ID} AND distance > 0
+            WHERE car_id = %s AND distance > 0
             GROUP BY date_trunc('month', start_date)
         ) d
         LEFT JOIN (
             SELECT date_trunc('month', start_date) AS month,
                    SUM(cost) AS total_cost
             FROM charging_processes
-            WHERE car_id = {CAR_ID} AND end_date IS NOT NULL
+            WHERE car_id = %s AND end_date IS NOT NULL
             GROUP BY date_trunc('month', start_date)
         ) c ON d.month = c.month
         ORDER BY d.month DESC
         LIMIT %s
     """,
-        (months,),
+        (KWH_PER_KM, CAR_ID, CAR_ID, months,),
     )
 
     if not rows:
@@ -1827,7 +1852,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
                    LAG(battery_level) OVER (ORDER BY date) AS prev_level,
                    LAG(date) OVER (ORDER BY date) AS prev_date
             FROM positions
-            WHERE car_id = {CAR_ID} AND date >= %s AND battery_level IS NOT NULL
+            WHERE car_id = %s AND date >= %s AND battery_level IS NOT NULL
             ORDER BY date
         )
         SELECT date, prev_date, battery_level, prev_level,
@@ -1841,7 +1866,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
         ORDER BY drain DESC
         {_limit_sql(LIMIT_VAMPIRE_DRAIN)}
     """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
 
     if not rows:
@@ -1902,24 +1927,24 @@ async def calculate_eco_savings_vs_icev(
 
     # Total driving distance from drives table
     drive_row = _query_one(
-        f"""
+        """
         SELECT COALESCE(SUM(distance), 0) AS total_km
         FROM drives
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     total_km = drive_row["total_km"] if drive_row else 0.0
 
     # Charging: prefer cost from charging_processes.cost, fallback to energy * price
     charge_rows = _query(
-        f"""
+        """
         SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh,
                COALESCE(SUM(cost), 0) AS total_cost
         FROM charging_processes
-        WHERE car_id = {CAR_ID} AND start_date >= %s AND end_date IS NOT NULL
+        WHERE car_id = %s AND start_date >= %s AND end_date IS NOT NULL
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     charge_row = charge_rows[0] if charge_rows else {}
     total_kwh = charge_row.get("total_kwh", 0.0) or 0.0
@@ -1984,7 +2009,7 @@ async def generate_travel_narrative_context(
         end_time: ISO8601 end time (e.g. "2026-03-03T23:59:59")
     """
     rows = _query(
-        f"""
+        """
         SELECT d.start_date, d.end_date,
                d.distance, d.duration_min, d.outside_temp_avg,
                sa.display_name AS start_name,
@@ -1993,11 +2018,11 @@ async def generate_travel_narrative_context(
         FROM drives d
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = {CAR_ID}
+        WHERE d.car_id = %s
           AND d.start_date >= %s AND d.start_date <= %s
         ORDER BY d.start_date ASC
         """,
-        (start_time, end_time),
+        (CAR_ID, start_time, end_time),
     )
 
     if not rows:
@@ -2080,15 +2105,15 @@ async def get_vehicle_persona_status(
 
     # -- Active: total distance
     drive_rows = _query(
-        f"""
+        """
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                MAX(duration_min) AS max_single_drive_min,
                MAX(speed_max) AS max_speed_kmh,
                COUNT(*) AS trip_count
         FROM drives
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     drive_r = drive_rows[0] if drive_rows else {}
     total_km = drive_r.get("total_km") or 0.0
@@ -2098,26 +2123,26 @@ async def get_vehicle_persona_status(
 
     # Longest single drive: find the drive record with max duration
     longest_drive_row = _query_one(
-        f"""
+        """
         SELECT distance, duration_min
         FROM drives
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
         ORDER BY duration_min DESC
         LIMIT 1
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     longest_drive_km = longest_drive_row.get("distance") or 0 if longest_drive_row else 0
 
     # -- Idle time: states not 'driving'
     state_rows = _query(
-        f"""
+        """
         SELECT state, start_date, end_date
         FROM states
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
         ORDER BY start_date ASC
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
 
     idle_hours = 0.0
@@ -2139,13 +2164,13 @@ async def get_vehicle_persona_status(
 
     # -- Vampire drain: battery drop while not driving / not charging
     vampire_rows = _query(
-        f"""
+        """
         WITH ordered AS (
             SELECT date, battery_level, id,
                    LAG(battery_level) OVER (ORDER BY date) AS prev_level,
                    LAG(date) OVER (ORDER BY date) AS prev_date
             FROM positions
-            WHERE car_id = {CAR_ID} AND date >= %s AND battery_level IS NOT NULL
+            WHERE car_id = %s AND date >= %s AND battery_level IS NOT NULL
             ORDER BY date
         )
         SELECT battery_level, prev_level,
@@ -2157,7 +2182,7 @@ async def get_vehicle_persona_status(
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     vampire_drain_pct = 0.0
     if vampire_rows:
@@ -2220,16 +2245,16 @@ async def check_driving_achievements(days: int = 30) -> str:
 
     # Achievement 1:极限续航幸存者 -- start_battery_level <= 5
     low_battery_rows = _query(
-        f"""
+        """
         SELECT start_date, start_battery_level, charge_energy_added,
                end_battery_level, duration_min
         FROM charging_processes
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
           AND start_battery_level IS NOT NULL
           AND start_battery_level <= 5
         ORDER BY start_date DESC
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     for r in low_battery_rows:
         unlocked.append({
@@ -2247,16 +2272,16 @@ async def check_driving_achievements(days: int = 30) -> str:
 
     # Achievement 2:午夜幽灵 -- 3+ drives between 00:00 and 04:00
     midnight_drives = _query(
-        f"""
+        """
         SELECT start_date, distance, duration_min,
                outside_temp_avg, end_address_id
         FROM drives
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
           AND EXTRACT(HOUR FROM start_date) >= 0
           AND EXTRACT(HOUR FROM start_date) < 4
         ORDER BY start_date DESC
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     if len(midnight_drives) >= 3:
         earliest = midnight_drives[-1]
@@ -2273,17 +2298,17 @@ async def check_driving_achievements(days: int = 30) -> str:
 
     # Achievement 3:冰雪勇士 -- outside_temp_avg < 0 AND distance > 20
     cold_drives = _query(
-        f"""
+        """
         SELECT start_date, distance, outside_temp_avg,
                duration_min, start_ideal_range_km, end_ideal_range_km
         FROM drives
-        WHERE car_id = {CAR_ID} AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s
           AND outside_temp_avg IS NOT NULL
           AND outside_temp_avg < 0
           AND distance > 20
         ORDER BY start_date DESC
         """,
-        (cutoff,),
+        (CAR_ID, cutoff,),
     )
     for r in cold_drives:
         unlocked.append({
@@ -2320,7 +2345,7 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
 
     if charge_id is not None:
         row = _query_one(
-            f"""
+            """
             SELECT cp.start_date, cp.end_date, cp.duration_min,
                    cp.start_battery_level, cp.end_battery_level,
                    cp.outside_temp_avg, cp.charge_energy_added,
@@ -2328,19 +2353,21 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
                    sa.display_name AS location
             FROM charging_processes cp
             LEFT JOIN positions p ON cp.position_id = p.id
-            LEFT JOIN addresses sa ON sa.id = (
-                SELECT a2.id FROM addresses a2
-                WHERE ABS(a2.latitude - p.latitude) < 0.005
-                  AND ABS(a2.longitude - p.longitude) < 0.005
+            LEFT JOIN LATERAL (
+                SELECT a2.display_name
+                FROM addresses a2
+                WHERE a2.latitude BETWEEN p.latitude - 0.005 AND p.latitude + 0.005
+                  AND a2.longitude BETWEEN p.longitude - 0.005 AND p.longitude + 0.005
+                ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
                 LIMIT 1
-            )
-            WHERE cp.car_id = {CAR_ID} AND cp.id = %s
+            ) sa ON p.latitude IS NOT NULL
+            WHERE cp.car_id = %s AND cp.id = %s
             """,
-            (charge_id,),
+            (CAR_ID, charge_id,),
         )
     else:
         row = _query_one(
-            f"""
+            """
             SELECT cp.id, cp.start_date, cp.end_date, cp.duration_min,
                    cp.start_battery_level, cp.end_battery_level,
                    cp.outside_temp_avg, cp.charge_energy_added,
@@ -2348,16 +2375,19 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
                    sa.display_name AS location
             FROM charging_processes cp
             LEFT JOIN positions p ON cp.position_id = p.id
-            LEFT JOIN addresses sa ON sa.id = (
-                SELECT a2.id FROM addresses a2
-                WHERE ABS(a2.latitude - p.latitude) < 0.005
-                  AND ABS(a2.longitude - p.longitude) < 0.005
+            LEFT JOIN LATERAL (
+                SELECT a2.display_name
+                FROM addresses a2
+                WHERE a2.latitude BETWEEN p.latitude - 0.005 AND p.latitude + 0.005
+                  AND a2.longitude BETWEEN p.longitude - 0.005 AND p.longitude + 0.005
+                ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
                 LIMIT 1
-            )
-            WHERE cp.car_id = {CAR_ID} AND cp.end_date IS NOT NULL
+            ) sa ON p.latitude IS NOT NULL
+            WHERE cp.car_id = %s AND cp.end_date IS NOT NULL
             ORDER BY cp.start_date DESC
             LIMIT 1
-            """
+            """,
+            (CAR_ID,),
         )
 
     if not row:
@@ -2424,7 +2454,7 @@ async def generate_weekend_blindbox(
 
     # Window-function query: LEAD to compute stay gap, COUNT to compute visit frequency
     rows = _query(
-        f"""
+        """
         WITH ranked AS (
             SELECT
                 d.id,
@@ -2439,7 +2469,7 @@ async def generate_weekend_blindbox(
                 COUNT(*) OVER (PARTITION BY d.end_address_id) AS visit_count
             FROM drives d
             LEFT JOIN addresses ea ON d.end_address_id = ea.id
-            WHERE d.car_id = {CAR_ID}
+            WHERE d.car_id = %s
               AND d.start_date >= %s
               AND d.end_date IS NOT NULL
         )
@@ -2454,7 +2484,7 @@ async def generate_weekend_blindbox(
           AND EXTRACT(EPOCH FROM (next_start - end_date)) / 60 >= %s
         ORDER BY start_date DESC
         """,
-        (cutoff, min_stay_min),
+        (CAR_ID, cutoff, min_stay_min),
     )
 
     # Exclude common place names
@@ -2521,7 +2551,7 @@ async def generate_monthly_driving_report(
 
     # -- Drive stats
     drive_rows = _query(
-        f"""
+        """
         SELECT
             COUNT(id) AS trip_count,
             COALESCE(SUM(distance), 0) AS total_km,
@@ -2529,9 +2559,9 @@ async def generate_monthly_driving_report(
             COALESCE(MAX(distance), 0) AS max_single_km,
             COALESCE(MAX(speed_max), 0) AS max_speed_kmh
         FROM drives
-        WHERE car_id = {CAR_ID} AND start_date >= %s AND start_date < %s
+        WHERE car_id = %s AND start_date >= %s AND start_date < %s
         """,
-        (start_iso, end_iso),
+        (CAR_ID, start_iso, end_iso),
     )
     drive_r = drive_rows[0] if drive_rows else {}
     trip_count = drive_r.get("trip_count") or 0
@@ -2542,16 +2572,16 @@ async def generate_monthly_driving_report(
 
     # -- Charge stats
     charge_rows = _query(
-        f"""
+        """
         SELECT
             COUNT(id) AS charge_count,
             COALESCE(SUM(charge_energy_added), 0) AS total_kwh,
             COALESCE(SUM(cost), 0) AS total_cost
         FROM charging_processes
-        WHERE car_id = {CAR_ID} AND start_date >= %s AND start_date < %s
+        WHERE car_id = %s AND start_date >= %s AND start_date < %s
           AND end_date IS NOT NULL
         """,
-        (start_iso, end_iso),
+        (CAR_ID, start_iso, end_iso),
     )
     charge_r = charge_rows[0] if charge_rows else {}
     charge_count = charge_r.get("charge_count") or 0
@@ -2563,13 +2593,13 @@ async def generate_monthly_driving_report(
 
     # -- Vampire drain in the month (for penalty)
     vampire_rows = _query(
-        f"""
+        """
         WITH ordered AS (
             SELECT date, battery_level,
                    LAG(battery_level) OVER (ORDER BY date) AS prev_level,
                    LAG(date) OVER (ORDER BY date) AS prev_date
             FROM positions
-            WHERE car_id = {CAR_ID} AND date >= %s AND date < %s
+            WHERE car_id = %s AND date >= %s AND date < %s
               AND battery_level IS NOT NULL
             ORDER BY date
         )
@@ -2581,7 +2611,7 @@ async def generate_monthly_driving_report(
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
         """,
-        (start_iso, end_iso),
+        (CAR_ID, start_iso, end_iso),
     )
     vampire_penalty = 0
     if vampire_rows:
