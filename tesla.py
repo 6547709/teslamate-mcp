@@ -137,17 +137,17 @@ def _limit_sql(raw_limit: int | None) -> str:
         return ""
     return f"LIMIT {int(raw_limit)}"
 
-LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "50"))
-LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "50"))
-LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "100"))
-LIMIT_BATTERY_HEALTH     = int(os.environ.get("TESLA_LIMIT_BATTERY_HEALTH", "24"))
+LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "200"))
+LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "200"))
+LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "200"))
+LIMIT_BATTERY_HEALTH     = int(os.environ.get("TESLA_LIMIT_BATTERY_HEALTH", "36"))
 LIMIT_BATTERY_SAMPLES    = int(os.environ.get("TESLA_LIMIT_BATTERY_SAMPLES", "20"))
-LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "20"))
-LIMIT_STATE_HISTORY      = int(os.environ.get("TESLA_LIMIT_STATE_HISTORY", "100"))
+LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "30"))
+LIMIT_STATE_HISTORY      = int(os.environ.get("TESLA_LIMIT_STATE_HISTORY", "200"))
 LIMIT_SOFTWARE_UPDATES   = int(os.environ.get("TESLA_LIMIT_SOFTWARE_UPDATES", "20"))
-LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "15"))
-LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "20"))
-LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "20"))
+LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "30"))
+LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "30"))
+LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "30"))
 
 mcp = FastMCP("tesla")
 
@@ -507,6 +507,8 @@ async def tesla_charging_history(days: int = 30) -> str:
 
     cost_note = f", total RMB{total_cost:.2f}" if total_cost > 0 else ""
     lines.append(f"\n**Total:** {total_kwh:.1f} kWh across {len(rows)} sessions{cost_note}")
+    if LIMIT_CHARGING > 0 and len(rows) >= LIMIT_CHARGING:
+        lines.append(f"\n⚠ Results capped at {LIMIT_CHARGING} rows. Increase TESLA_LIMIT_CHARGING or set to -1 for all data.")
     return "\n".join(lines)
 
 
@@ -566,6 +568,8 @@ async def tesla_drives(days: int = 30) -> str:
         f"\n**Total:** {_format_distance(total_km)}, {total_kwh:.1f} kWh, "
         f"{total_min} min across {len(rows)} trips{avg_eff}"
     )
+    if LIMIT_DRIVES > 0 and len(rows) >= LIMIT_DRIVES:
+        lines.append(f"\n⚠ Results capped at {LIMIT_DRIVES} rows. Increase TESLA_LIMIT_DRIVES or set to -1 for all data.")
     return "\n".join(lines)
 
 
@@ -1434,8 +1438,19 @@ async def tesla_efficiency_by_temp() -> str:
 
 
 @mcp.tool()
-async def tesla_charging_by_location() -> str:
-    """Charging patterns by location -- where you charge and how much."""
+async def tesla_charging_by_location(days: int = 0) -> str:
+    """Charging patterns by location -- where you charge and how much.
+
+    Args:
+        days: Number of days to look back (default: 0 = all time)
+    """
+    date_filter = ""
+    params = [CAR_ID]
+    if days > 0:
+        cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+        date_filter = "AND cp.start_date >= %s"
+        params.append(cutoff)
+
     rows = _query(f"""
         SELECT a.display_name AS location,
                COUNT(*) AS sessions,
@@ -1455,16 +1470,17 @@ async def tesla_charging_by_location() -> str:
             ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
             LIMIT 1
         ) a ON true
-        WHERE cp.car_id = %s AND cp.end_date IS NOT NULL
+        WHERE cp.car_id = %s AND cp.end_date IS NOT NULL {date_filter}
         GROUP BY a.display_name
         ORDER BY total_kwh DESC
         {_limit_sql(LIMIT_CHARGING_BY_LOC)}
-    """, (CAR_ID,))
+    """, tuple(params))
 
     if not rows:
         return "No charging data yet."
 
-    lines = ["**Charging by Location**\n"]
+    period = f"last {days} days" if days > 0 else "all time"
+    lines = [f"**Charging by Location** ({period})\n"]
     for r in rows:
         loc = r.get("location") or "Unknown"
         sessions = r.get("sessions", 0)
