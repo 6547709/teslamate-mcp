@@ -1,101 +1,159 @@
 # TeslaMate MCP Server
 
-MCP server for **TeslaMate** historical analytics and **Tesla Owner API** real-time data. Read-only — no vehicle commands. Works with Claude Code, Claude Desktop, Cursor, OpenClaw, and any MCP-compatible client.
+[English](README.md) | [中文](README_zh.md)
+
+A Model Context Protocol (MCP) server providing Tesla vehicle analytics through **TeslaMate** historical data and **Tesla Owner API** real-time data. Read-only — no vehicle commands. Works with [Claude Code](https://claude.ai/code), [OpenClaw](https://openclaw.dev), and any MCP-compatible client.
+
+**Upstream:** This project is a fork of [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet), refactored to use TeslaMate's native Owner API tokens (no separate Fleet API setup required).
+
+---
 
 ## Features
 
-**20+ tools** across three categories:
+**20+ tools** across four categories:
 
-| Category | Tools | Backend |
-|----------|-------|---------|
-| **History** | `tesla_status`, `tesla_drives`, `tesla_charging_history`, `tesla_battery_health`, `tesla_efficiency`, `tesla_location_history`, `tesla_state_history`, `tesla_software_updates` | TeslaMate |
-| **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain` | TeslaMate |
-| **Enhanced** | `tesla_driving_score`, `tesla_trips_by_category`, `tesla_trip_categories`, `tesla_monthly_report`, `tesla_tpms_status`, `tesla_tpms_history` | TeslaMate |
-| **Live** | `tesla_live` | Tesla Owner API |
+| Category | Tools | Data Source |
+|----------|-------|-------------|
+| **Status** | `tesla_status`, `tesla_drives`, `tesla_charging_history`, `tesla_battery_health`, `tesla_efficiency`, `tesla_location_history`, `tesla_state_history`, `tesla_software_updates` | TeslaMate DB |
+| **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain` | TeslaMate DB |
+| **Enhanced** | `tesla_driving_score`, `tesla_trips_by_category`, `tesla_trip_categories`, `tesla_monthly_report`, `tesla_tpms_status`, `tesla_tpms_history` | TeslaMate DB |
+| **Live** | `tesla_live` (GPS, battery, climate, charging) | Tesla Owner API |
+
+---
 
 ## Quick Start
 
-### Docker (Recommended)
+### Deploy on Synology NAS (Docker)
 
-Add to your existing TeslaMate `docker-compose.yml`:
+This service is designed to run alongside your existing TeslaMate installation.
+
+**1. Add to your TeslaMate `docker-compose.yml`:**
 
 ```yaml
 services:
   teslamate-mcp:
-    image: ghcr.io/<your-github-username>/teslamate-mcp:latest
+    image: ghcr.io/<YOUR-GITHUB-USERNAME>/teslamate-mcp:latest
+    container_name: teslamate-mcp
     restart: always
     ports:
       - "30002:8080"
     environment:
-      - ENCRYPTION_KEY=<your-teslamate-encryption-key>
+      # TeslaMate database (same values as your teslamate service)
       - TESLAMATE_DB_HOST=database
       - TESLAMATE_DB_PORT=5432
       - TESLAMATE_DB_USER=teslamate
       - TESLAMATE_DB_PASS=secret
       - TESLAMATE_DB_NAME=teslamate
+      # Encryption key (same ENCRYPTION_KEY as your teslamate service)
+      - ENCRYPTION_KEY=your_teslamate_encryption_key_here
+      # HTTP server mode
       - MCP_TRANSPORT=streamable-http
       - HTTP_HOST=0.0.0.0
       - HTTP_PORT=8080
-      - USE_METRIC_UNITS=true
-      - TESLA_ELECTRICITY_RATE_RMB=0.6
+      # Units and currency
+      - USE_METRIC_UNITS=true      # true = km/°C/¥, false = mi/°F/$
+      - TESLA_ELECTRICITY_RATE_RMB=0.6  # RMB per kWh (your electricity rate)
+      # Vehicle
       - TESLA_CAR_ID=1
-      - TESLA_BATTERY_KWH=75
-      - TESLA_BATTERY_RANGE_KM=525
+      - TESLA_BATTERY_KWH=75        # Your battery capacity in kWh
+      - TESLA_BATTERY_RANGE_KM=525  # EPA range at 100% in km
     depends_on:
       - database
 ```
 
-### Claude Code (`~/.claude/mcp.json`)
+> **Important:** The `ENCRYPTION_KEY` must match the one configured in your teslamate service. Find it in your teslamate `docker-compose.yml` environment variables.
+
+**2. Start the container:**
+
+```bash
+docker-compose up -d teslamate-mcp
+```
+
+**3. Verify it's running:**
+
+```bash
+docker logs teslamate-mcp
+```
+
+You should see:
+```
+Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+```
+
+---
+
+### Configure MCP Client
+
+#### OpenClaw
+
+In your OpenClaw settings, add a new MCP server:
 
 ```json
 {
   "mcpServers": {
-    "tesla": {
-      "command": "docker",
-      "args": [
-        "run", "--rm", "-i",
-        "--env-file", "/path/to/teslamate-mcp.env",
-        "ghcr.io/<your-github-username>/teslamate-mcp:latest"
-      ]
+    "teslamate": {
+      "url": "http://192.168.10.200:30002/mcp"
     }
   }
 }
 ```
 
-### Local Install
+#### Claude Code (`~/.claude/settings.json` or project `.mcp.json`)
 
-```bash
-pip install -e .
-mcp-teslamate-fleet
+```json
+{
+  "mcpServers": {
+    "tesla": {
+      "url": "http://192.168.10.200:30002/mcp"
+    }
+  }
+}
 ```
 
-## Prerequisites
+> **Note:** If Claude Code is running on a different machine than your NAS, ensure port 30002 is accessible through your network.
 
-- **TeslaMate** running with PostgreSQL database accessible
-- **ENCRYPTION_KEY** from your TeslaMate installation (used to decrypt Owner API tokens stored in TeslaMate's database)
+---
 
-## Configuration
+## Environment Variables
 
 All configuration is via environment variables.
 
-### TeslaMate Database
+### TeslaMate Database (Required)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TESLAMATE_DB_HOST` | *(required)* | Postgres host |
-| `TESLAMATE_DB_PORT` | `5432` | Postgres port |
-| `TESLAMATE_DB_USER` | `teslamate` | Postgres user |
-| `TESLAMATE_DB_PASS` | *(required)* | Postgres password |
+| `TESLAMATE_DB_HOST` | *(required)* | PostgreSQL host — use `database` if on same docker network |
+| `TESLAMATE_DB_PORT` | `5432` | PostgreSQL port |
+| `TESLAMATE_DB_USER` | `teslamate` | PostgreSQL user |
+| `TESLAMATE_DB_PASS` | *(required)* | PostgreSQL password |
 | `TESLAMATE_DB_NAME` | `teslamate` | Database name |
-| `ENCRYPTION_KEY` | *(required)* | TeslaMate ENCRYPTION_KEY (for Owner API tokens) |
+| `ENCRYPTION_KEY` | *(required)* | Must match your teslamate's `ENCRYPTION_KEY` |
+
+### Server Mode
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_TRANSPORT` | `stdio` | `stdio` for CLI, `streamable-http` for container |
+| `HTTP_HOST` | `0.0.0.0` | Bind address |
+| `HTTP_PORT` | `8080` | HTTP port inside container |
+
+### Units & Currency
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_METRIC_UNITS` | `false` | `true` = km/°C/¥/Wh/km, `false` = mi/°F/$/Wh/mi |
+| `TESLA_ELECTRICITY_RATE_RMB` | `0.6` | Electricity cost in RMB per kWh |
+| `TESLA_ELECTRICITY_RATE_USD` | `0.12` | Electricity cost in USD per kWh (fallback) |
 
 ### Vehicle
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TESLA_CAR_ID` | `1` | TeslaMate car ID |
+| `TESLA_CAR_ID` | `1` | TeslaMate car ID (check TeslaMate dashboard) |
 | `TESLA_BATTERY_KWH` | `75` | Usable battery capacity in kWh |
 | `TESLA_BATTERY_RANGE_KM` | `525` | EPA range at 100% in km |
+
+**Battery capacity reference:**
 
 | Vehicle | Battery (kWh) | Range (km) |
 |---------|--------------|------------|
@@ -105,52 +163,69 @@ All configuration is via environment variables.
 | Model S Long Range | 100 | 650 |
 | Model X Long Range | 100 | 560 |
 
-### Cost Defaults
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TESLA_ELECTRICITY_RATE` | `0.12` | Electricity cost in $/kWh |
-| `TESLA_GAS_PRICE` | `3.50` | Gas price in $/gallon |
-| `TESLA_GAS_MPG` | `28` | Comparable gas vehicle MPG |
-
-### TPMS (Optional)
+### TPMS Thresholds (Optional)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TESLA_TPMS_MIN_THRESHOLD` | `2.0` | Low pressure warning (bar) |
 | `TESLA_TPMS_MAX_THRESHOLD` | `2.5` | High pressure warning (bar) |
 
+---
+
 ## Architecture
 
-Single-file Python server using **FastMCP**. Two data paths:
+Single-file Python server (~1700 lines) using **FastMCP**. Two data paths:
 
 ```
 ┌─────────────┐     ┌──────────────┐
 │  TeslaMate   │────▶│   Postgres   │──┐
-│  (logger)    │     │  (telemetry) │  │   ┌───────────┐     ┌────────────┐
-└─────────────┘     └──────────────┘  ├──▶│ tesla.py  │────▶│ MCP Client │
-                                       │   │ (server)  │     │ (Claude,   │
-┌─────────────┐     ┌──────────────┐  │   └───────────┘     │  OpenClaw) │
+│  (logger)    │     │  (TeslaMate) │  │
+└─────────────┘     └──────────────┘  │   ┌───────────┐     ┌────────────┐
+                                       ├──▶│ tesla.py  │────▶│ MCP Client │
+                                       │   │(HTTP/:8080)│     │(OpenClaw,   │
+┌─────────────┐     ┌──────────────┐  │   └───────────┘     │ Claude Code)│
 │  Tesla       │────▶│ Owner API    │──┘                     └────────────┘
-│  Owner API   │     │ (tokens from │
-└─────────────┘     │  TeslaMate)  │
+│  Owner API   │     │(tokens from  │
+└─────────────┘     │ TeslaMate DB) │
                     └──────────────┘
 ```
+
+**How it works:**
+- Tokens are read directly from TeslaMate's PostgreSQL database, encrypted with your `ENCRYPTION_KEY`
+- No separate Tesla Developer account or Fleet API setup required
+- TeslaMate handles all OAuth token refresh automatically
+
+---
 
 ## GitHub Actions
 
 Docker images are built and pushed to GitHub Container Registry on each version tag:
 
 ```bash
+# Tag a release
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
+The image will be available at `ghcr.io/<your-username>/teslamate-mcp:<tag>`.
+
+---
+
 ## Limitations
 
 - **Single vehicle** — queries use a configurable `car_id`
-- **Imperial units** — output is in miles, °F, and PSI
-- **Estimated kWh** — energy estimated from ideal range deltas (~90-95% accurate)
+- **Imperial units by default** — set `USE_METRIC_UNITS=true` for metric
+- **Estimated energy** — kWh is estimated from ideal range deltas (~90-95% accuracy)
+
+---
+
+## Acknowledgments
+
+This project is a fork of [loddev/mcp-teslamate-fleet](https://github.com/lodordev/mcp-teslamate-fleet) by [@lodordev](https://github.com/lodordev). The original project provided the foundation for Tesla MCP integration. This fork refactors the authentication to use TeslaMate's native Owner API tokens, removes command functionality for security, and adds enhanced analytics features.
+
+Built with [FastMCP](https://github.com/jlowin/fastmcp) and [TeslaMate](https://github.com/teslamate-org/teslamate).
+
+---
 
 ## License
 

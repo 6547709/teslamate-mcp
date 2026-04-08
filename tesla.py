@@ -1,5 +1,7 @@
 """Tesla MCP Server — TeslaMate analytics + Owner API real-time data.
 
+See README.md (English) or README_zh.md (中文) for full documentation."""
+
 Single-file FastMCP server. Stdio transport. Works with TeslaMate, Owner API,
 or both — tools are available based on which backends you configure.
 
