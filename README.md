@@ -15,19 +15,19 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 | Category | Tools | Data Source |
 |----------|-------|-------------|
 | **Status** | `tesla_status`, `tesla_drives`, `tesla_charging_history`, `tesla_battery_health`, `tesla_efficiency`, `tesla_location_history`, `tesla_state_history`, `tesla_software_updates` | TeslaMate DB |
-| **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain`, `calculate_eco_savings_vs_ice` | TeslaMate DB |
+| **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain`, `calculate_eco_savings_vs_icev` | TeslaMate DB |
 | **Enhanced** | `tesla_driving_score`, `tesla_trips_by_category`, `tesla_trip_categories`, `tesla_monthly_report`, `tesla_tpms_status`, `tesla_tpms_history`, `generate_travel_narrative_context`, `get_vehicle_persona_status` | TeslaMate DB |
 | **Live** | `tesla_live` (GPS, battery, climate, charging) | TeslaMate DB |
 
 ### New Tools
 
-#### `calculate_eco_savings_vs_ice` — Eco Savings Calculator
-Compare Tesla's electricity costs vs a hypothetical ICE vehicle over the same distance.
+#### `calculate_eco_savings_vs_icev` — Eco Savings Calculator
+Compare Tesla's electricity costs vs a hypothetical ICEV (internal combustion engine vehicle) over the same distance.
 
 | Param | Default | Description |
 |-------|---------|-------------|
 | `days` | `30` | Lookback days |
-| `ice_mpg` | `8.0` | ICE vehicle fuel consumption (L/100km) |
+| `icev_mpg` | `8.0` | ICEV fuel consumption (L/100km) |
 | `gas_price` | `8.0` | Gas price per litre (RMB) |
 | `electricity_price` | `0.5` | Electricity price per kWh (RMB) |
 

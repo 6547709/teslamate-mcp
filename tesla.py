@@ -29,7 +29,7 @@ Read tools (TeslaMate):
   tesla_monthly_summary   -- Monthly driving summary
   tesla_vampire_drain     -- Battery loss while parked
   tesla_live              -- Latest polled vehicle state (from positions table)
-  calculate_eco_savings_vs_ice -- ICE vs EV cost/CO2 comparison
+  calculate_eco_savings_vs_icev -- ICEV vs EV cost/CO2 comparison
   generate_travel_narrative_context -- Travel timeline for LLM blogging
   get_vehicle_persona_status -- Vehicle activity/fatigue/persona metrics
   check_driving_achievements -- Driving achievements (eco, midnight, cold)
@@ -1396,6 +1396,8 @@ async def tesla_charging_by_location() -> str:
                COUNT(*) AS sessions,
                COALESCE(SUM(cp.charge_energy_added), 0) AS total_kwh,
                COALESCE(AVG(cp.charge_energy_added), 0) AS avg_kwh,
+               COALESCE(MIN(cp.start_battery_level), 0) AS min_start_battery,
+               COALESCE(MAX(cp.end_battery_level), 0) AS max_end_battery,
                COALESCE(SUM(cp.duration_min), 0) AS total_min,
                COALESCE(SUM(cp.cost), 0) AS total_cost
         FROM charging_processes cp
@@ -1421,8 +1423,14 @@ async def tesla_charging_by_location() -> str:
         sessions = r.get("sessions", 0)
         kwh = r.get("total_kwh", 0)
         total_cost = r.get("total_cost", 0)
+        min_bat = r.get("min_start_battery", 0)
+        max_bat = r.get("max_end_battery", 0)
+        bat_range = f"{min_bat:.0f}%→{max_bat:.0f}%" if min_bat and max_bat else "N/A"
         cost_str = f"RMB{total_cost:.2f}" if total_cost else "N/A"
-        lines.append(f"- **{loc}**: {sessions} sessions, {kwh:.1f} kWh (~{cost_str})")
+        lines.append(
+            f"- **{loc}**: {sessions} sessions, {kwh:.1f} kWh, "
+            f"battery {bat_range} (~{cost_str})"
+        )
 
     return "\n".join(lines)
 
@@ -1873,20 +1881,20 @@ async def tesla_vampire_drain(days: int = 14) -> str:
 
 
 @mcp.tool()
-async def calculate_eco_savings_vs_ice(
+async def calculate_eco_savings_vs_icev(
     days: int = 30,
-    ice_mpg: float = 8.0,
+    icev_mpg: float = 8.0,
     gas_price: float = 8.0,
     electricity_price: float = 0.5,
 ) -> str:
-    """Calculate eco savings and carbon reduction compared to an ICE vehicle.
+    """Calculate eco savings and carbon reduction compared to an ICEV (燃油汽车).
 
-    Compares Tesla's actual electricity costs against a hypothetical ICE vehicle
+    Compares Tesla's actual electricity costs against a hypothetical ICEV
     consuming the same distance in fuel, plus CO2 savings and tree equivalents.
 
     Args:
         days: Number of days to look back (default: 30)
-        ice_mpg: ICE vehicle fuel consumption in L/100km (default: 8.0)
+        icev_mpg: ICEV fuel consumption in L/100km (default: 8.0)
         gas_price: Gas price per litre in RMB (default: 8.0)
         electricity_price: Electricity cost per kWh in RMB (default: 0.5)
     """
@@ -1923,17 +1931,17 @@ async def calculate_eco_savings_vs_ice(
     else:
         actual_electricity_cost = round(total_cost, 2)
 
-    # ICE baseline
-    fuel_liters = (total_km / 100.0) * ice_mpg          # L
-    ice_cost = round(fuel_liters * gas_price, 2)         # RMB
-    ice_co2_kg = round(fuel_liters * 2.3, 2)              # kg CO2
+    # ICEV baseline
+    fuel_liters = (total_km / 100.0) * icev_mpg          # L
+    icev_cost = round(fuel_liters * gas_price, 2)         # RMB
+    icev_co2_kg = round(fuel_liters * 2.3, 2)              # kg CO2
 
     # EV actual
     ev_co2_kg = round(total_kwh * 0.58, 2)                # kg CO2
 
     # Savings
-    money_saved = round(ice_cost - actual_electricity_cost, 2)
-    co2_reduced_kg = round(ice_co2_kg - ev_co2_kg, 2)
+    money_saved = round(icev_cost - actual_electricity_cost, 2)
+    co2_reduced_kg = round(icev_co2_kg - ev_co2_kg, 2)
     tree_equivalents = round(co2_reduced_kg / 18.0, 1)
 
     import json
@@ -1942,12 +1950,12 @@ async def calculate_eco_savings_vs_ice(
         "total_distance_km": round(total_km, 1),
         "total_charged_kwh": round(total_kwh, 1),
         "electricity_cost_actual": actual_electricity_cost,
-        "ice_vehicle": {
-            "ice_mpg_L_per_100km": ice_mpg,
+        "icev": {
+            "icev_mpg_L_per_100km": icev_mpg,
             "gas_price_RMB_per_liter": gas_price,
             "fuel_consumed_liters": round(fuel_liters, 1),
-            "fuel_cost_RMB": ice_cost,
-            "co2_emissions_kg": ice_co2_kg,
+            "fuel_cost_RMB": icev_cost,
+            "co2_emissions_kg": icev_co2_kg,
         },
         "ev_actual": {
             "co2_emissions_kg": ev_co2_kg,
