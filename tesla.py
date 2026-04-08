@@ -69,6 +69,7 @@ from decimal import Decimal
 
 import psycopg2
 import psycopg2.extras
+import httpx
 from fastmcp import FastMCP
 
 # -- Configuration ------------------------------------------------------------
@@ -233,37 +234,38 @@ async def tesla_status() -> str:
     Returns the latest position snapshot and vehicle info from TeslaMate.
     """
     car = _query_one(
-        f"SELECT id, name, model, efficiency FROM cars WHERE id = {CAR_ID} LIMIT 1"
+        "SELECT id, name, model, efficiency FROM cars WHERE id = %s LIMIT 1",
+        (CAR_ID,)
     )
 
-    pos = _query_one(f"""
-        SELECT battery_level, ideal_battery_range_km,
-               is_climate_on, inside_temp, outside_temp, driver_temp_setting,
-               odometer, speed, power,
+    pos = _query_one("""
+        SELECT battery_level,
+               is_climate_on, inside_temp, outside_temp,
+               odometer, speed,
                latitude, longitude, date
         FROM positions
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
         ORDER BY date DESC
         LIMIT 1
-    """)
+    """, (CAR_ID,))
 
-    state = _query_one(f"""
+    state = _query_one("""
         SELECT state, start_date, end_date
         FROM states
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
         ORDER BY start_date DESC
         LIMIT 1
-    """)
+    """, (CAR_ID,))
 
-    charge = _query_one(f"""
+    charge = _query_one("""
         SELECT charge_energy_added, duration_min,
                start_battery_level, end_battery_level,
                start_date, end_date
         FROM charging_processes
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
         ORDER BY start_date DESC
         LIMIT 1
-    """)
+    """, (CAR_ID,))
 
     # Check geofence for current position
     geofence = None
@@ -311,8 +313,8 @@ async def tesla_status() -> str:
 
     if pos:
         bat = pos.get("battery_level")
-        range_km = pos.get("ideal_battery_range_km")
-        lines.append(f"Battery: {bat}%" + (f" ({_format_distance(range_km)})" if range_km else ""))
+        range_km = BATTERY_RANGE_KM * bat / 100
+        lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
 
         is_charging = (
             charge
@@ -327,12 +329,9 @@ async def tesla_status() -> str:
 
         if pos.get("is_climate_on"):
             inside_t = _format_temp(pos.get("inside_temp"))
-            target_t = _format_temp(pos.get("driver_temp_setting"))
             line = "Climate: ON"
             if inside_t != "N/A":
                 line += f", cabin {inside_t}"
-            if target_t != "N/A":
-                line += f", target {target_t}"
             lines.append(line)
         else:
             inside_t = _format_temp(pos.get("inside_temp"))
@@ -960,37 +959,37 @@ async def tesla_live() -> str:
     """
     # Latest position snapshot
     pos = _query_one(f"""
-        SELECT battery_level, ideal_battery_range_km,
-               is_climate_on, inside_temp, outside_temp, driver_temp_setting,
-               odometer, speed, power,
+        SELECT battery_level,
+               is_climate_on, inside_temp, outside_temp,
+               odometer, speed,
                latitude, longitude, date
         FROM positions
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
         ORDER BY date DESC
         LIMIT 1
-    """)
+    """, (CAR_ID,))
 
     # Latest charging session (to determine charging state)
-    charge = _query_one(f"""
+    charge = _query_one("""
         SELECT start_date, end_date, charge_energy_added,
                start_battery_level, end_battery_level,
                charge_limit_soc
         FROM charging_processes
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
         ORDER BY start_date DESC
         LIMIT 1
-    """)
+    """, (CAR_ID,))
 
     # Latest software version
-    update = _query_one(f"""
+    update = _query_one("""
         SELECT version FROM updates
-        WHERE car_id = {CAR_ID}
+        WHERE car_id = %s
         ORDER BY start_date DESC
         LIMIT 1
-    """)
+    """, (CAR_ID,))
 
     # Vehicle name
-    car = _query_one(f"SELECT name, model FROM cars WHERE id = {CAR_ID} LIMIT 1")
+    car = _query_one("SELECT name, model FROM cars WHERE id = %s LIMIT 1", (CAR_ID,))
 
     if not pos:
         return "No position data found. Is TeslaMate running?"
@@ -1000,7 +999,7 @@ async def tesla_live() -> str:
 
     # Battery
     bat = pos.get("battery_level")
-    range_km = pos.get("ideal_battery_range_km")
+    range_km = BATTERY_RANGE_KM * bat / 100  # estimate from battery level + EPA range
     if USE_METRIC_UNITS:
         lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
     else:
@@ -1027,9 +1026,6 @@ async def tesla_live() -> str:
         f"Climate: {'ON' if pos.get('is_climate_on') else 'Off'}"
         f", inside {inside_t}, outside {outside_t}"
     )
-    if pos.get("is_climate_on"):
-        target_t = _format_temp(pos.get("driver_temp_setting"))
-        lines.append(f"  Target: {target_t}")
 
     # Odometer
     odo_km = pos.get("odometer")
@@ -1203,11 +1199,11 @@ async def tesla_trip_cost(
     dest_lon = float(results[0]["lon"])
     dest_name = results[0].get("display_name", destination).split(",")[0]
 
-    pos = _query_one(f"""
-        SELECT latitude, longitude, battery_level, ideal_battery_range_km
-        FROM positions WHERE car_id = {CAR_ID}
+    pos = _query_one("""
+        SELECT latitude, longitude, battery_level
+        FROM positions WHERE car_id = %s
         ORDER BY date DESC LIMIT 1
-    """)
+    """, (CAR_ID,))
     if not pos:
         return "No current position data."
 
@@ -1240,7 +1236,7 @@ async def tesla_trip_cost(
         cost_round = round(kwh_round * ELECTRICITY_RATE_RMB, 2)
 
         bat = pos.get("battery_level", 0)
-        range_km = round(pos.get("ideal_battery_range_km") or 0)
+        range_km = round(BATTERY_RANGE_KM * bat / 100)
 
         lines = [
             f"**Trip to {dest_name}** ({road_km} km each way, {round_trip_km} km round trip)\n"
@@ -1268,7 +1264,7 @@ async def tesla_trip_cost(
         gas_equiv = round(round_trip / _mpg * _gas, 2)
 
         bat = pos.get("battery_level", 0)
-        range_mi = round((pos.get("ideal_battery_range_km") or 0) * 0.621371)
+        range_mi = round(_km_to_mi(BATTERY_RANGE_KM * bat / 100))
 
         lines = [
             f"**Trip to {dest_name}** ({road_mi} mi each way, {round_trip} mi round trip)\n"
