@@ -471,6 +471,7 @@ async def tesla_charging_history(days: int = 30) -> str:
         SELECT cp.start_date, cp.end_date,
                cp.charge_energy_added, cp.duration_min,
                cp.start_battery_level, cp.end_battery_level,
+               cp.cost,
                a.display_name AS location
         FROM charging_processes cp
         LEFT JOIN positions p ON cp.position_id = p.id
@@ -493,19 +494,24 @@ async def tesla_charging_history(days: int = 30) -> str:
 
     lines = [f"**Charging History** (last {days} days, {len(rows)} sessions)\n"]
     total_kwh = 0.0
+    total_cost = 0.0
     for r in rows:
         kwh = r.get("charge_energy_added") or 0
         total_kwh += kwh
+        cost = r.get("cost") or 0
+        total_cost += cost
         dur = r.get("duration_min") or 0
         start_pct = r.get("start_battery_level", "?")
         end_pct = r.get("end_battery_level", "?")
         loc = r.get("location") or "Unknown"
         date_str = str(r.get("start_date", ""))[:16]
+        cost_str = f" (RMB{cost:.2f})" if cost else ""
         lines.append(
-            f"- {date_str}: {kwh:.1f} kWh, {dur} min, {start_pct}% -> {end_pct}%, {loc}"
+            f"- {date_str}: {kwh:.1f} kWh, {dur} min, {start_pct}% -> {end_pct}%, {loc}{cost_str}"
         )
 
-    lines.append(f"\n**Total:** {total_kwh:.1f} kWh across {len(rows)} sessions")
+    cost_note = f", total RMB{total_cost:.2f}" if total_cost > 0 else ""
+    lines.append(f"\n**Total:** {total_kwh:.1f} kWh across {len(rows)} sessions{cost_note}")
     return "\n".join(lines)
 
 
@@ -1445,7 +1451,8 @@ async def tesla_charging_by_location() -> str:
                COUNT(*) AS sessions,
                COALESCE(SUM(cp.charge_energy_added), 0) AS total_kwh,
                COALESCE(AVG(cp.charge_energy_added), 0) AS avg_kwh,
-               COALESCE(SUM(cp.duration_min), 0) AS total_min
+               COALESCE(SUM(cp.duration_min), 0) AS total_min,
+               COALESCE(SUM(cp.cost), 0) AS total_cost
         FROM charging_processes cp
         JOIN positions p ON cp.position_id = p.id
         LEFT JOIN addresses a ON a.id = (
@@ -1468,7 +1475,8 @@ async def tesla_charging_by_location() -> str:
         loc = r.get("location") or "Unknown"
         sessions = r.get("sessions", 0)
         kwh = r.get("total_kwh", 0)
-        cost_str = _format_cost(kwh)
+        total_cost = r.get("total_cost", 0)
+        cost_str = f"RMB{total_cost:.2f}" if total_cost else "N/A"
         lines.append(f"- **{loc}**: {sessions} sessions, {kwh:.1f} kWh (~{cost_str})")
 
     return "\n".join(lines)
@@ -1604,24 +1612,38 @@ async def tesla_monthly_report(year: int, month: int) -> str:
     prev_km = prev_r.get("total_km") or 0
     prev_kwh = prev_r.get("total_kwh") or 0
 
+    # Charging cost from TeslaMate
+    charge_rows = _query(
+        f"""
+        SELECT COALESCE(SUM(cp.cost), 0) AS total_cost,
+               COALESCE(SUM(cp.charge_energy_added), 0) AS total_kwh
+        FROM charging_processes cp
+        WHERE cp.car_id = %s
+          AND cp.start_date >= %s AND cp.start_date < %s
+          AND cp.end_date IS NOT NULL
+        """,
+        (CAR_ID, start.isoformat(), next_start.isoformat()),
+    )
+    charge_r = charge_rows[0] if charge_rows else {}
+    total_cost = charge_r.get("total_cost") or 0
+
     if USE_METRIC_UNITS:
         lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]
         lines.append(f"Trips: {trips}")
         lines.append(f"Distance: {km:.1f} km")
         lines.append(f"Energy: {kwh:.1f} kWh")
         lines.append(f"Avg efficiency: {_format_efficiency(kwh, km)}")
-        lines.append(f"Est. cost: {_format_cost(kwh)}")
+        lines.append(f"Charging cost: RMB{total_cost:.2f}" if total_cost else "Charging cost: N/A")
         lines.append(f"Time driving: {minutes} min")
     else:
         mi = round(km * 0.621371)
         wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
-        cost = round(kwh * ELECTRICITY_RATE, 2)
         lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]
         lines.append(f"Trips: {trips}")
         lines.append(f"Distance: {mi} mi ({km:.1f} km)")
         lines.append(f"Energy: {kwh:.1f} kWh")
         lines.append(f"Avg efficiency: {wh_mi} Wh/mi")
-        lines.append(f"Est. cost: ${cost}")
+        lines.append(f"Charging cost: ${total_cost:.2f}" if total_cost else "Charging cost: N/A")
         lines.append(f"Time driving: {minutes} min")
 
     if prev_km > 0:
@@ -1757,15 +1779,20 @@ async def tesla_monthly_summary(months: int = 6) -> str:
     """
     rows = _query(
         f"""
-        SELECT date_trunc('month', start_date) AS month,
-               COUNT(*) AS trips,
-               COALESCE(SUM(distance), 0) AS total_km,
-               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+        SELECT date_trunc('month', d.start_date) AS month,
+               COUNT(d.id) AS trips,
+               COALESCE(SUM(d.distance), 0) AS total_km,
+               COALESCE(SUM(GREATEST(d.start_ideal_range_km - d.end_ideal_range_km, 0)
                    * {KWH_PER_KM}), 0) AS total_kwh,
-               COALESCE(SUM(duration_min), 0) AS total_min
-        FROM drives
-        WHERE car_id = {CAR_ID} AND distance > 0
-        GROUP BY date_trunc('month', start_date)
+               COALESCE(SUM(d.duration_min), 0) AS total_min,
+               COALESCE(SUM(cp.cost), 0) AS total_cost
+        FROM drives d
+        LEFT JOIN charging_processes cp
+            ON cp.car_id = d.car_id
+            AND date_trunc('month', cp.start_date) = date_trunc('month', d.start_date)
+            AND cp.end_date IS NOT NULL
+        WHERE d.car_id = {CAR_ID} AND d.distance > 0
+        GROUP BY date_trunc('month', d.start_date)
         ORDER BY month DESC
         LIMIT %s
     """,
@@ -1787,8 +1814,9 @@ async def tesla_monthly_summary(months: int = 6) -> str:
             trips = r.get("trips", 0)
             km = r.get("total_km") or 0
             kwh = r.get("total_kwh") or 0
+            total_cost = r.get("total_cost") or 0
             eff_str = _format_efficiency(kwh, km) if km > 0 else "N/A"
-            cost_str = _format_cost(kwh)
+            cost_str = f"RMB{total_cost:.2f}" if total_cost else "N/A"
             lines.append(
                 f"{month:<12} {trips:>6} {km:>9,} {kwh:>7.1f} {eff_str:>7} {cost_str:>8}"
             )
@@ -1805,10 +1833,11 @@ async def tesla_monthly_summary(months: int = 6) -> str:
             km = r.get("total_km") or 0
             mi = round(km * 0.621371)
             kwh = r.get("total_kwh") or 0
+            total_cost = r.get("total_cost") or 0
             wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
-            cost = round(kwh * ELECTRICITY_RATE, 2)
+            cost_str = f"${total_cost:.2f}" if total_cost else "N/A"
             lines.append(
-                f"{month:<12} {trips:>6} {mi:>9,} {kwh:>7.1f} {wh_mi:>7} ${cost:>6.2f}"
+                f"{month:<12} {trips:>6} {mi:>9,} {kwh:>7.1f} {wh_mi:>7} {cost_str:>8}"
             )
 
     return "\n".join(lines)
