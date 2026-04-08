@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+ENV LANG=C.UTF-8
+ENV PYTHONIOENCODING=utf-8
+
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
