@@ -1,0 +1,26 @@
+# TeslaMate MCP — Docker Compose snippet
+# Add this to your existing teslamate docker-compose.yml
+# TeslaMate must already be running with ENCRYPTION_KEY configured
+
+services:
+  teslamate-mcp:
+    image: ghcr.io/<YOUR-GITHUB-USERNAME>/teslamate-mcp:latest
+    restart: always
+    environment:
+      - ENCRYPTION_KEY=<your-teslamate-encryption-key>
+      - DATABASE_HOST=database
+      - DATABASE_PORT=5432
+      - DATABASE_USER=teslamate
+      - DATABASE_PASS=secret
+      - DATABASE_NAME=teslamate
+      - TESLA_CAR_ID=1
+      - TESLA_BATTERY_KWH=75
+      - TESLA_BATTERY_RANGE_KM=525
+      - TESLA_ELECTRICITY_RATE=0.12
+      - TESLA_GAS_PRICE=3.50
+      - TESLA_GAS_MPG=28
+      # Optional TPMS thresholds
+      # - TESLA_TPMS_MIN_THRESHOLD=2.0
+      # - TESLA_TPMS_MAX_THRESHOLD=2.5
+    depends_on:
+      - database
