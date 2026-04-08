@@ -1485,7 +1485,7 @@ async def tesla_tpms_status() -> str:
             status = f"HIGH (> {TPMS_MAX} bar)"
         soft = vs.get(f"tpms_soft_warning_{pos}")
         if soft:
-            status = "SOFT WARNING"
+            status = status + " + SOFT WARNING"
         pressures[pos] = bar
         lines.append(f"{label}: {psi} PSI ({bar:.2f} bar) — {status}")
 
