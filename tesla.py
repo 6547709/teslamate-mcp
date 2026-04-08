@@ -777,18 +777,26 @@ async def tesla_software_updates() -> str:
 
 @mcp.tool()
 async def tesla_live() -> str:
-    """Live vehicle data from Fleet API — real-time battery, charging, climate, locks, sentry.
+    """Live vehicle data from Tesla Owner API — real-time battery, charging, climate.
 
-    More current than TeslaMate (which polls on intervals). Use this when you need
-    the latest state right now.
+    Uses tokens shared with TeslaMate (decrypted from DB). More current than
+    TeslaMate which polls on intervals.
     """
-    if not VIN:
-        return "TESLA_VIN not set."
+    if not HAS_OWNER_API:
+        return "Owner API not configured. Set ENCRYPTION_KEY and TeslaMate DB env vars."
 
-    data = await _fleet_get(
-        f"/api/1/vehicles/{VIN}/vehicle_data"
-        f"?endpoints=charge_state%3Bclimate_state%3Bvehicle_state%3Bdrive_state"
-    )
+    # Get vehicle list to find vehicle_id
+    vehicles_resp = await _owner_api_get("/api/1/vehicles")
+    vehicles = vehicles_resp.get("response", [])
+    if not vehicles:
+        return "No vehicles found."
+
+    # Find the first vehicle (or filter by CAR_ID - for multi-car support later)
+    vehicle = vehicles[0]
+    vehicle_id = vehicle.get("id")
+
+    # Get live vehicle data
+    data = await _owner_api_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
     r = data.get("response", {})
     cs = r.get("charge_state", {})
     cl = r.get("climate_state", {})
@@ -855,7 +863,6 @@ async def tesla_live() -> str:
             f"(est. {update.get('expected_duration_sec', 0) // 60} min)"
         )
 
-    lines.append(f"\nCommands today: {_command_count}/{DAILY_COMMAND_LIMIT}")
     return "\n".join(lines)
 
 
