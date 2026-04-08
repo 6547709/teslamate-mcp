@@ -55,7 +55,7 @@ Environment variables:
   TESLA_GAS_MPG          -- Comparable gas vehicle MPG (default: 28)
 
   # Units (metric)
-  USE_METRIC_UNITS       -- Set "true" for km, degC, kWh/100km, JPY (default: false/imperial)
+  USE_METRIC_UNITS       -- Set "true" for km, degC, kWh/100km, RMB (default: false/imperial)
 """
 
 from __future__ import annotations
@@ -303,7 +303,7 @@ def _format_efficiency(kwh: float, km: float) -> str:
 def _format_cost(kwh: float) -> str:
     """Format electricity cost based on USE_METRIC_UNITS."""
     if USE_METRIC_UNITS:
-        return f"JPY{round(kwh * ELECTRICITY_RATE_RMB, 2)}"
+        return f"RMB{round(kwh * ELECTRICITY_RATE_RMB, 2)}"
     return f"${round(kwh * ELECTRICITY_RATE, 2)}"
 
 
@@ -1220,7 +1220,7 @@ async def tesla_savings(
         if USE_METRIC_UNITS:
             elec_cost = round(kwh * ELECTRICITY_RATE_RMB, 2)
             lines.append(f"**{label}:** {km:,.1f} km")
-            lines.append(f"  Electricity: {kwh:,.1f} kWh x JPY{ELECTRICITY_RATE_RMB} = JPY{elec_cost:,.2f}")
+            lines.append(f"  Electricity: {kwh:,.1f} kWh x RMB{ELECTRICITY_RATE_RMB} = RMB{elec_cost:,.2f}")
             lines.append("")
         else:
             mi = round(km * 0.621371, 1)
@@ -1321,7 +1321,7 @@ async def tesla_trip_cost(
             f"**Trip to {dest_name}** ({road_km} km each way, {round_trip_km} km round trip)\n"
         ]
         lines.append(f"Estimated: {kwh_round} kWh @ {wh_per_km} Wh/km (your 30-day avg)")
-        lines.append(f"Cost: JPY{cost_round}")
+        lines.append(f"Cost: RMB{cost_round}")
         lines.append(f"Current battery: {bat}% ({_format_distance(range_km)})")
 
         if range_km >= round_trip_km:
