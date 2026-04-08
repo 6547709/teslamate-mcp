@@ -60,8 +60,6 @@ Environment variables:
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import math
 import os
 from datetime import datetime, timedelta
@@ -70,8 +68,9 @@ from decimal import Decimal
 import httpx
 import psycopg2
 import psycopg2.extras
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastmcp import FastMCP
+
+import tesla_auth  # noqa: F401  token 读取与解密
 
 # -- Configuration ------------------------------------------------------------
 
@@ -140,77 +139,36 @@ LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "20")
 
 mcp = FastMCP("tesla")
 
-# -- Owner API Token Decryption -----------------------------------------------
-
-_cached_owner_token: dict | None = None
-
-
-def _decrypt_tokens() -> dict:
-    """Read and decrypt Owner API tokens from TeslaMate PostgreSQL.
-
-    Tokens are stored encrypted in the 'tokens' table using AES-256-GCM.
-    The ENCRYPTION_KEY is hashed with SHA256 to produce the AES key.
-    """
-    global _cached_owner_token
-
-    if _cached_owner_token:
-        return _cached_owner_token
-
-    if not HAS_OWNER_API:
-        raise RuntimeError(
-            "Owner API not configured. "
-            "Set TESLAMATE_DB_HOST, TESLAMATE_DB_PASS, and ENCRYPTION_KEY."
-        )
-
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT access, refresh FROM tokens LIMIT 1")
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError("No tokens found in TeslaMate database.")
-            encrypted_access = row[0]
-            encrypted_refresh = row[1]
-    finally:
-        if 'conn' in locals():
-            conn.close()
-
-    # Derive AES-256 key from ENCRYPTION_KEY
-    key = hashlib.sha256(ENCRYPTION_KEY.encode()).digest()
-    aesgcm = AESGCM(key)
-
-    def decrypt(encrypted_token: str) -> str:
-        if not encrypted_token:
-            return ""
-        # Ciphertext format: | IV (12 bytes) | Ciphertag (16 bytes) | Ciphertext |
-        data = base64.b64decode(encrypted_token)
-        iv = data[:12]
-        ciphertext = data[12:]
-        return aesgcm.decrypt(iv, ciphertext, None).decode()
-
-    _cached_owner_token = {
-        "access": decrypt(encrypted_access),
-        "refresh": decrypt(encrypted_refresh),
-    }
-    return _cached_owner_token
-
+# -- Owner API Token (delegated to tesla_auth) --------------------------------
 
 def _get_access_token() -> str:
-    """Get a valid Owner API access token from TeslaMate database."""
-    tokens = _decrypt_tokens()
-    return tokens.get("access", "")
+    """从 tesla_auth 获取解密后的 access token。"""
+    return tesla_auth.get_decrypted_access_token()
 
 
 async def _owner_api_get(path: str) -> dict:
-    """GET from Tesla Owner API using tokens from TeslaMate DB."""
+    """GET from Tesla Owner API，使用 tesla_auth 中的解密 token。
+
+    若遇到 401 Unauthorized，说明 access token 已过期，
+    自动清除缓存并重试一次（TeslaMate 会在此时自动刷新 token）。
+    """
     if not HAS_OWNER_API:
-        raise RuntimeError("Owner API not configured.")
+        raise RuntimeError("Owner API 未配置。请设置 TESLAMATE_DB_HOST、TESLAMATE_DB_PASS 和 ENCRYPTION_KEY。")
+
     token = _get_access_token()
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             f"{OWNER_API_URL}{path}",
             headers={"Authorization": f"Bearer {token}"},
         )
+        if resp.status_code == 401:
+            # Token 过期，清除缓存并重试
+            tesla_auth.clear_token_cache()
+            token = _get_access_token()
+            resp = await client.get(
+                f"{OWNER_API_URL}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
         resp.raise_for_status()
         return resp.json()
 
