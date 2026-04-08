@@ -1779,21 +1779,31 @@ async def tesla_monthly_summary(months: int = 6) -> str:
     """
     rows = _query(
         f"""
-        SELECT date_trunc('month', d.start_date) AS month,
-               COUNT(d.id) AS trips,
-               COALESCE(SUM(d.distance), 0) AS total_km,
-               COALESCE(SUM(GREATEST(d.start_ideal_range_km - d.end_ideal_range_km, 0)
-                   * {KWH_PER_KM}), 0) AS total_kwh,
-               COALESCE(SUM(d.duration_min), 0) AS total_min,
-               COALESCE(SUM(cp.cost), 0) AS total_cost
-        FROM drives d
-        LEFT JOIN charging_processes cp
-            ON cp.car_id = d.car_id
-            AND date_trunc('month', cp.start_date) = date_trunc('month', d.start_date)
-            AND cp.end_date IS NOT NULL
-        WHERE d.car_id = {CAR_ID} AND d.distance > 0
-        GROUP BY date_trunc('month', d.start_date)
-        ORDER BY month DESC
+        SELECT d.month,
+               d.trips,
+               d.total_km,
+               d.total_kwh,
+               d.total_min,
+               COALESCE(c.total_cost, 0) AS total_cost
+        FROM (
+            SELECT date_trunc('month', start_date) AS month,
+                   COUNT(id) AS trips,
+                   COALESCE(SUM(distance), 0) AS total_km,
+                   COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                       * {KWH_PER_KM}), 0) AS total_kwh,
+                   COALESCE(SUM(duration_min), 0) AS total_min
+            FROM drives
+            WHERE car_id = {CAR_ID} AND distance > 0
+            GROUP BY date_trunc('month', start_date)
+        ) d
+        LEFT JOIN (
+            SELECT date_trunc('month', start_date) AS month,
+                   SUM(cost) AS total_cost
+            FROM charging_processes
+            WHERE car_id = {CAR_ID} AND end_date IS NOT NULL
+            GROUP BY date_trunc('month', start_date)
+        ) c ON d.month = c.month
+        ORDER BY d.month DESC
         LIMIT %s
     """,
         (months,),
