@@ -1,11 +1,11 @@
-"""Tesla MCP Server — TeslaMate analytics + Fleet API commands.
+"""Tesla MCP Server — TeslaMate analytics + Owner API real-time data.
 
-Single-file FastMCP server. Stdio transport. Works with TeslaMate, Fleet API,
+Single-file FastMCP server. Stdio transport. Works with TeslaMate, Owner API,
 or both — tools are available based on which backends you configure.
 
 Two data paths:
   1. TeslaMate Postgres (read-only) — historical telemetry and analytics
-  2. Tesla Fleet API via HTTP proxy (commands + live data)
+  2. Tesla Owner API (read-only live data from TeslaMate DB)
 
 Read tools (TeslaMate):
   tesla_status            — Current vehicle state (battery, range, location, climate)
@@ -27,22 +27,8 @@ Analytics tools (TeslaMate):
   tesla_monthly_summary   — Monthly driving summary
   tesla_vampire_drain     — Battery loss while parked
 
-Live data tool (Fleet API):
-  tesla_live              — Real-time vehicle data from Fleet API
-
-Command tools (Fleet API + HTTP proxy):
-  tesla_climate_on        — Start climate preconditioning
-  tesla_climate_off       — Stop climate
-  tesla_set_temp          — Set cabin temperature
-  tesla_charge_start      — Start charging
-  tesla_charge_stop       — Stop charging
-  tesla_set_charge_limit  — Set charge limit percentage
-  tesla_lock              — Lock doors
-  tesla_unlock            — Unlock doors (requires confirm=True)
-  tesla_honk              — Honk horn
-  tesla_flash             — Flash headlights
-  tesla_trunk             — Open/close trunk or frunk (requires confirm=True)
-  tesla_sentry            — Toggle sentry mode
+Live data tool (Owner API):
+  tesla_live              — Real-time vehicle data from Owner API
 
 Environment variables:
   # TeslaMate Postgres
@@ -52,13 +38,8 @@ Environment variables:
   TESLAMATE_DB_PASS     — Postgres password
   TESLAMATE_DB_NAME     — Postgres database (default: teslamate)
 
-  # Fleet API
-  TESLA_PROXY_URL       — HTTP proxy URL for commands (e.g. https://localhost:4443)
-  TESLA_FLEET_URL       — Fleet API URL (default: NA region)
-  TESLA_VIN             — Vehicle VIN
-  TESLA_TOKEN_FILE      — Path to tokens.json (Fleet API OAuth tokens)
-  TESLA_CLIENT_ID       — Fleet API client ID (for token refresh)
-  TESLA_CLIENT_SECRET   — Fleet API client secret (for token refresh)
+  # Encryption key (TeslaMate's ENCRYPTION_KEY — required for Owner API)
+  ENCRYPTION_KEY        — AES-256 key used to decrypt tokens from DB
 
   # Vehicle config
   TESLA_CAR_ID          — TeslaMate car ID (default: 1)
@@ -69,18 +50,12 @@ Environment variables:
   TESLA_ELECTRICITY_RATE — $/kWh (default: 0.12)
   TESLA_GAS_PRICE        — $/gallon for comparison (default: 3.50)
   TESLA_GAS_MPG          — Comparable gas vehicle MPG (default: 28)
-
-  # TLS
-  TESLA_VERIFY_SSL      — TLS verification for proxy (default: true)
-
-Safety:
-  - Unlock, trunk, and window commands require confirm=True parameter
-  - Rate limit: 40 commands/day (hard cap)
-  - All commands counted for audit trail
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
 import os
@@ -92,6 +67,7 @@ from pathlib import Path
 import httpx
 import psycopg2
 import psycopg2.extras
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastmcp import FastMCP
 
 # -- Configuration ------------------------------------------------------------
@@ -103,15 +79,14 @@ DB_USER = os.environ.get("TESLAMATE_DB_USER", "teslamate")
 DB_PASS = os.environ.get("TESLAMATE_DB_PASS", "")
 DB_NAME = os.environ.get("TESLAMATE_DB_NAME", "teslamate")
 
-# Fleet API (commands + live data)
-PROXY_URL = os.environ.get("TESLA_PROXY_URL", "").rstrip("/")
-FLEET_URL = os.environ.get(
-    "TESLA_FLEET_URL", "https://fleet-api.prd.na.vn.cloud.tesla.com"
-).rstrip("/")
-VIN = os.environ.get("TESLA_VIN", "")
-TOKEN_FILE = os.environ.get("TESLA_TOKEN_FILE", "")
-CLIENT_ID = os.environ.get("TESLA_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("TESLA_CLIENT_SECRET", "")
+# Encryption key (same as TeslaMate's ENCRYPTION_KEY)
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
+if not ENCRYPTION_KEY:
+    raise RuntimeError("ENCRYPTION_KEY environment variable is required")
+
+# Owner API (read from TeslaMate DB — no file, no manual refresh)
+OWNER_API_URL = "https://owner-api.tesla.com"
+HAS_OWNER_API = bool(DB_HOST and DB_PASS and ENCRYPTION_KEY)
 
 # Vehicle-specific
 CAR_ID = int(os.environ.get("TESLA_CAR_ID", "1"))
@@ -119,22 +94,13 @@ BATTERY_KWH = float(os.environ.get("TESLA_BATTERY_KWH", "75"))
 BATTERY_RANGE_KM = float(os.environ.get("TESLA_BATTERY_RANGE_KM", "525"))
 KWH_PER_KM = BATTERY_KWH / BATTERY_RANGE_KM
 
-# Cost defaults (overridable per-call on savings/trip tools)
+# Cost defaults
 ELECTRICITY_RATE = float(os.environ.get("TESLA_ELECTRICITY_RATE", "0.12"))
 GAS_PRICE = float(os.environ.get("TESLA_GAS_PRICE", "3.50"))
 GAS_MPG = int(os.environ.get("TESLA_GAS_MPG", "28"))
 
-# TLS verification (set false for self-signed proxy certs)
-VERIFY_SSL = os.environ.get("TESLA_VERIFY_SSL", "true").lower() not in (
-    "false",
-    "0",
-    "no",
-)
-
 # Backend availability
 HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
-HAS_FLEET_API = bool(VIN and TOKEN_FILE)
-HAS_PROXY = bool(PROXY_URL and VIN and TOKEN_FILE)
 
 mcp = FastMCP("tesla")
 
@@ -165,72 +131,82 @@ def _log_command(cmd: str) -> None:
     _command_count += 1
 
 
-# -- Token management ----------------------------------------------------------
+# -- Owner API Token Decryption -----------------------------------------------
 
-_cached_token: str = ""
-_token_expiry: float = 0
+_cached_owner_token: dict | None = None
+
+
+def _decrypt_tokens() -> dict:
+    """Read and decrypt Owner API tokens from TeslaMate PostgreSQL.
+
+    Tokens are stored encrypted in the 'tokens' table using AES-256-GCM.
+    The ENCRYPTION_KEY is hashed with SHA256 to produce the AES key.
+    """
+    global _cached_owner_token
+
+    if _cached_owner_token:
+        return _cached_owner_token
+
+    if not HAS_OWNER_API:
+        raise RuntimeError(
+            "Owner API not configured. "
+            "Set TESLAMATE_DB_HOST, TESLAMATE_DB_PASS, and ENCRYPTION_KEY."
+        )
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT access, refresh FROM tokens LIMIT 1")
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("No tokens found in TeslaMate database.")
+            encrypted_access = row[0]
+            encrypted_refresh = row[1]
+    finally:
+        conn.close()
+
+    # Derive AES-256 key from ENCRYPTION_KEY
+    key = hashlib.sha256(ENCRYPTION_KEY.encode()).digest()
+    aesgcm = AESGCM(key)
+
+    def decrypt(encrypted_token: str) -> str:
+        if not encrypted_token:
+            return ""
+        # Ciphertext format: | IV (12 bytes) | Ciphertag (16 bytes) | Ciphertext |
+        data = base64.b64decode(encrypted_token)
+        iv = data[:12]
+        ciphertext = data[12:]
+        return aesgcm.decrypt(iv, ciphertext, None).decode()
+
+    _cached_owner_token = {
+        "access": decrypt(encrypted_access),
+        "refresh": decrypt(encrypted_refresh),
+    }
+    return _cached_owner_token
 
 
 def _get_access_token() -> str:
-    """Get a valid Fleet API access token, refreshing if needed."""
-    global _cached_token, _token_expiry
+    """Get a valid Owner API access token from TeslaMate database."""
+    tokens = _decrypt_tokens()
+    return tokens.get("access", "")
 
-    if _cached_token and time.time() < _token_expiry - 300:
-        return _cached_token
 
-    if not TOKEN_FILE:
-        raise RuntimeError(
-            "TESLA_TOKEN_FILE not set. "
-            "Set this to the path of your Fleet API tokens.json file."
+async def _owner_api_get(path: str) -> dict:
+    """GET from Tesla Owner API using tokens from TeslaMate DB."""
+    if not HAS_OWNER_API:
+        raise RuntimeError("Owner API not configured.")
+    token = _get_access_token()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{OWNER_API_URL}{path}",
+            headers={"Authorization": f"Bearer {token}"},
         )
-
-    token_path = Path(TOKEN_FILE)
-    if not token_path.exists():
-        raise RuntimeError(f"Token file not found: {TOKEN_FILE}")
-
-    tokens = json.loads(token_path.read_text())
-    access_token = tokens.get("access_token", "")
-    refresh_token = tokens.get("refresh_token", "")
-    expires_in = tokens.get("expires_in", 0)
-
-    # Check if token is still valid (rough estimate)
-    file_mtime = token_path.stat().st_mtime
-    token_age = time.time() - file_mtime
-    if token_age < expires_in - 600:
-        _cached_token = access_token
-        _token_expiry = file_mtime + expires_in
-        return access_token
-
-    # Refresh the token
-    if not refresh_token or not CLIENT_ID or not CLIENT_SECRET:
-        _cached_token = access_token
-        _token_expiry = time.time() + 300
-        return access_token
-
-    resp = httpx.post(
-        "https://auth.tesla.com/oauth2/v3/token",
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
-        timeout=15.0,
-    )
-    if resp.status_code == 200:
-        new_tokens = resp.json()
-        token_path.write_text(json.dumps(new_tokens))
-        _cached_token = new_tokens["access_token"]
-        _token_expiry = time.time() + new_tokens.get("expires_in", 28800)
-        return _cached_token
-
-    # Refresh failed — use existing token
-    _cached_token = access_token
-    _token_expiry = time.time() + 60
-    return access_token
+        resp.raise_for_status()
+        return resp.json()
 
 
-# -- Fleet API helpers ---------------------------------------------------------
+# -- Fleet API helpers (deprecated) --------------------------------------------
+
 
 
 async def _fleet_get(path: str) -> dict:
