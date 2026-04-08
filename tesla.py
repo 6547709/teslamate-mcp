@@ -62,14 +62,15 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from decimal import Decimal
 
 import time
 import threading
+import atexit
 
 import psycopg2
 import psycopg2.extras
@@ -134,7 +135,7 @@ def _limit_sql(raw_limit: int | None) -> str:
     """Return SQL LIMIT clause; -1 means no limit."""
     if raw_limit is None or raw_limit < 0:
         return ""
-    return f"LIMIT {raw_limit}"
+    return f"LIMIT {int(raw_limit)}"
 
 LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "50"))
 LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "50"))
@@ -207,7 +208,12 @@ def _init_pool():
             dbname=DB_NAME,
             cursor_factory=psycopg2.extras.RealDictCursor,
             options="-c statement_timeout=30000",  # 30s query timeout
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
         )
+        atexit.register(lambda: _pool.closeall() if _pool else None)
 
 
 def _get_conn():
@@ -224,31 +230,37 @@ def _put_conn(conn):
 
 def _query(sql: str, params: tuple = ()) -> list[dict]:
     """Execute a read-only query and return results as list of dicts."""
-    conn = _get_conn()
+    conn = None
     try:
+        conn = _get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
     except Exception:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
         raise
     finally:
-        _put_conn(conn)
+        if conn is not None:
+            _put_conn(conn)
 
 
 def _query_one(sql: str, params: tuple = ()) -> dict | None:
     """Execute a read-only query and return first result (fetchone)."""
-    conn = _get_conn()
+    conn = None
     try:
+        conn = _get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, params)
             row = cur.fetchone()
             return dict(row) if row else None
     except Exception:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
         raise
     finally:
-        _put_conn(conn)
+        if conn is not None:
+            _put_conn(conn)
 
 
 # -- Simple TTL cache for low-frequency data -----------------------------------
@@ -339,7 +351,9 @@ async def tesla_status() -> str:
             cp.start_date AS charge_start, cp.end_date AS charge_end,
             u.version AS sw_version
         FROM (
-            SELECT * FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
+            SELECT battery_level, is_climate_on, inside_temp, outside_temp,
+                   odometer, speed, latitude, longitude, date
+            FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
         ) p
         LEFT JOIN LATERAL (
             SELECT state FROM states WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
@@ -1023,10 +1037,10 @@ async def tesla_live() -> str:
     real-time). Fields like sentry mode, lock status, and media are not
     available in TeslaMate and are omitted.
     """
-    # Car info — cached
+    # Car info — cached (same SQL as tesla_status to share cache key)
     car = _cached_query_one(
         f"car_{CAR_ID}",
-        "SELECT name, model FROM cars WHERE id = %s LIMIT 1",
+        "SELECT id, name, model, efficiency FROM cars WHERE id = %s LIMIT 1",
         (CAR_ID,), ttl=600,
     )
 
@@ -1044,7 +1058,12 @@ async def tesla_live() -> str:
             cp.charge_energy_added,
             u.version AS sw_version
         FROM (
-            SELECT * FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
+            SELECT battery_level, ideal_battery_range_km,
+                   is_climate_on, inside_temp, outside_temp, driver_temp_setting,
+                   odometer, speed, power, latitude, longitude, date,
+                   tpms_pressure_fl, tpms_pressure_fr,
+                   tpms_pressure_rl, tpms_pressure_rr
+            FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
         ) p
         LEFT JOIN LATERAL (
             SELECT start_date, end_date, charge_energy_added
@@ -1063,12 +1082,15 @@ async def tesla_live() -> str:
 
     # Battery
     bat = combined.get("battery_level")
-    range_km = BATTERY_RANGE_KM * bat / 100  # estimate from battery level + EPA range
-    if USE_METRIC_UNITS:
-        lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
+    if bat is not None:
+        range_km = BATTERY_RANGE_KM * bat / 100
+        if USE_METRIC_UNITS:
+            lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
+        else:
+            range_mi = _km_to_mi(range_km)
+            lines.append(f"Battery: {bat}% ({range_mi} mi)")
     else:
-        range_mi = _km_to_mi(range_km)
-        lines.append(f"Battery: {bat}% ({range_mi} mi)")
+        lines.append("Battery: N/A")
 
     # Charging state
     is_charging = (
@@ -1969,7 +1991,6 @@ async def calculate_eco_savings_vs_icev(
     co2_reduced_kg = round(icev_co2_kg - ev_co2_kg, 2)
     tree_equivalents = round(co2_reduced_kg / 18.0, 1)
 
-    import json
     result = {
         "period_days": days,
         "total_distance_km": round(total_km, 1),
@@ -2026,7 +2047,6 @@ async def generate_travel_narrative_context(
     )
 
     if not rows:
-        import json
         return json.dumps({"timeline": [], "message": "No drives found in this time window."}, ensure_ascii=False, indent=2)
 
     timeline = []
@@ -2053,7 +2073,6 @@ async def generate_travel_narrative_context(
             "stay_type": stay_label,
         })
 
-    import json
     result = {
         "period": {"start": start_time, "end": end_time},
         "total_drives": len(timeline),
@@ -2200,7 +2219,6 @@ async def get_vehicle_persona_status(
     else:
         persona = "元气满满 (Full of energy)"
 
-    import json
     result = {
         "period": period_str if period_str else f"last_{days_lookback}_days",
         "activity": {
@@ -2239,7 +2257,6 @@ async def check_driving_achievements(days: int = 30) -> str:
     Args:
         days: Number of days to look back (default: 30)
     """
-    import json
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     unlocked = []
 
@@ -2341,7 +2358,6 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
     Args:
         charge_id: Specific charging session ID. If None, returns the latest.
     """
-    import json
 
     if charge_id is not None:
         row = _query_one(
@@ -2446,7 +2462,6 @@ async def generate_weekend_blindbox(
         months_lookback: How many months to search back (default: 12)
         min_stay_hours: Minimum stay duration in hours (default: 2.0)
     """
-    import json
     import random
 
     cutoff = (_utcnow() - timedelta(days=months_lookback * 30)).isoformat()
