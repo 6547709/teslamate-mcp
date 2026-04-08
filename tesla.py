@@ -1368,6 +1368,78 @@ async def tesla_longest_trips(limit: int = 10) -> str:
 
 
 @mcp.tool()
+async def tesla_monthly_report(year: int, month: int) -> str:
+    """Monthly driving report with stats and comparison to previous month.
+
+    Args:
+        year: Year (e.g., 2026)
+        month: Month (1-12)
+    """
+    start = datetime(year, month, 1)
+    if month == 12:
+        prev_start = datetime(year, 11, 1)
+        next_start = datetime(year + 1, 1, 1)
+    else:
+        prev_start = datetime(year, month - 1, 1)
+        next_start = datetime(year, month + 1, 1)
+
+    # Current month data
+    rows = _query(
+        f"""
+        SELECT COUNT(*) AS trips,
+               COALESCE(SUM(distance), 0) AS total_km,
+               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                   * {KWH_PER_KM}), 0) AS total_kwh,
+               COALESCE(SUM(duration_min), 0) AS total_min
+        FROM drives
+        WHERE car_id = %s AND distance > 0
+          AND start_date >= %s AND start_date < %s
+        """,
+        (CAR_ID, start.isoformat(), next_start.isoformat()),
+    )
+    r = rows[0] if rows else {}
+
+    trips = r.get("trips") or 0
+    km = r.get("total_km") or 0
+    kwh = r.get("total_kwh") or 0
+    minutes = r.get("total_min") or 0
+    mi = round(km * 0.621371)
+    wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
+    cost = round(kwh * ELECTRICITY_RATE, 2)
+
+    # Previous month for comparison
+    prev_rows = _query(
+        f"""
+        SELECT COALESCE(SUM(distance), 0) AS total_km,
+               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                   * {KWH_PER_KM}), 0) AS total_kwh
+        FROM drives
+        WHERE car_id = %s AND distance > 0
+          AND start_date >= %s AND start_date < %s
+        """,
+        (CAR_ID, prev_start.isoformat(), start.isoformat()),
+    )
+    prev_r = prev_rows[0] if prev_rows else {}
+    prev_km = prev_r.get("total_km") or 0
+    prev_kwh = prev_r.get("total_kwh") or 0
+
+    lines = [f"**Monthly Report — {year}-{month:02d}**\n"]
+    lines.append(f"Trips: {trips}")
+    lines.append(f"Distance: {mi} mi ({km:.1f} km)")
+    lines.append(f"Energy: {kwh:.1f} kWh")
+    lines.append(f"Avg efficiency: {wh_mi} Wh/mi")
+    lines.append(f"Est. cost: ${cost}")
+    lines.append(f"Time driving: {minutes} min")
+
+    if prev_km > 0:
+        dist_delta = round((km - prev_km) / prev_km * 100)
+        eff_delta = round((kwh - prev_kwh) / prev_kwh * 100) if prev_kwh > 0 else 0
+        lines.append(f"\nvs prev month: distance {dist_delta:+d}%, energy {eff_delta:+d}%")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def tesla_monthly_summary(months: int = 6) -> str:
     """Monthly driving summary — miles, kWh, cost, efficiency.
 
