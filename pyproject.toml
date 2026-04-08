@@ -1,7 +1,7 @@
 [project]
 name = "mcp-teslamate-fleet"
 version = "0.1.0"
-description = "MCP server for TeslaMate analytics + Fleet API commands"
+description = "MCP server for TeslaMate analytics + Owner API real-time data"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
