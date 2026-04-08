@@ -1,15 +1,18 @@
 """TeslaMate Owner API Token 读取与解密模块。
 
-TeslaMate 使用 Elixir Cloak 库 (AES-256-GCM) 对存放在 `private.tokens` 表
+TeslaMate 使用 Elixir Cloak 库 (AES-256-GCM) 对存放在 `public.tokens` 表
 中的 access/refresh token 进行加密存储。本模块负责：
-  1. 从 private.tokens 表读取加密的 token（bytea 格式）
-  2. 正确派生 32 字节 AES-256 解密密钥
+  1. 从 public.tokens 表读取加密的 token（bytea 格式）
+  2. 正确派生 32 字节 AES-256 解密密钥（SHA256 哈希）
   3. 按 Cloak V1 格式 (version || iv || ciphertext_with_tag) 解密
+
+密钥派生（来自 TeslaMate 源码 vault.ex）：
+  AES_key = SHA256(ENCRYPTION_KEY as UTF-8 bytes)
 
 Cloak V1 二进制格式：
   - 第 0 字节   : 版本号 (固定 b'\x01')
-  - 第 1-16 字节: 12 字节 Nonce (IV)
-  - 第 17 字节起: ciphertext || 16 字节 auth tag (连在一起)
+  - 第 1-12 字节: 12 字节 Nonce (IV)
+  - 第 13 字节起: ciphertext || 16 字节 auth tag (连在一起)
   - AAD (关联数据): b'AES.GCM.V1' (Cloak V1 固定值)
 
 依赖 (已在 pyproject.toml 中声明):
@@ -19,7 +22,7 @@ Cloak V1 二进制格式：
 
 from __future__ import annotations
 
-import base64
+import hashlib
 import os
 import logging
 
@@ -50,17 +53,14 @@ CLOAK_V1_AAD: bytes = b"AES.GCM.V1"
 # ---------------------------------------------------------------------------
 
 def _derive_aes_key(raw_key: str) -> bytes:
-    """从 ENCRYPTION_KEY 派生符合 AES-256 要求的 32 字节密钥。
+    """从 ENCRYPTION_KEY 派生 AES-256 密钥。
 
-    TeslaMate 官方文档中 ENCRYPTION_KEY 通常是 Base64 编码的 32 字节随机串，
-    但也可能直接是原始字符串。本函数按以下顺序尝试：
+    根据 TeslaMate 源码 (vault.ex)，Elixir 端使用：
+        :crypto.hash(:sha256, encryption_key)
+    生成 32 字节 AES-256 密钥。
 
-    1. 尝试 base64 解码：
-       - 若解码后恰好得到 32 字节 → 直接返回（这是官方推荐格式）
-       - 若不是 32 字节 → 将解码结果截断/补齐到 32 字节
-
-    2. 若 base64 解码失败 → 将原始字符串以 UTF-8 编码，
-       不足 32 字节尾部补 b'\x00'，超出则截断
+    本函数复现完全相同的逻辑：
+        AES_key = SHA256(ENCRYPTION_KEY as UTF-8 bytes)
 
     Args:
         raw_key: 环境变量 TESLA_ENCRYPTION_KEY 的原始值
@@ -68,30 +68,8 @@ def _derive_aes_key(raw_key: str) -> bytes:
     Returns:
         严格 32 字节的 AES-256 密钥
     """
-    key_bytes: bytes
-
-    # 尝试 base64 解码
-    try:
-        decoded = base64.b64decode(raw_key, validate=True)
-        if len(decoded) == 32:
-            key_bytes = decoded
-        elif len(decoded) > 32:
-            key_bytes = decoded[:32]      # 截断
-        else:
-            key_bytes = decoded + b'\x00' * (32 - len(decoded))  # 补齐
-        logger.debug("ENCRYPTION_KEY: base64 解码成功，长度 %d 字节", len(key_bytes))
-        return key_bytes
-    except Exception:
-        # base64 解码失败，按原始字符串处理
-        pass
-
-    # UTF-8 编码，不足补 \x00，超出截断
-    key_bytes = raw_key.encode("utf-8")
-    if len(key_bytes) < 32:
-        key_bytes = key_bytes + b'\x00' * (32 - len(key_bytes))
-    else:
-        key_bytes = key_bytes[:32]
-    logger.debug("ENCRYPTION_KEY: 使用 UTF-8 原始字符串处理，长度 %d 字节", len(key_bytes))
+    key_bytes = hashlib.sha256(raw_key.encode("utf-8")).digest()
+    logger.debug("ENCRYPTION_KEY: SHA256 哈希后得到 %d 字节 AES 密钥", len(key_bytes))
     return key_bytes
 
 
@@ -123,13 +101,14 @@ def _decrypt_cloak_v1(key: bytes, data: bytes) -> bytes:
     加密结果拼接为: version || iv || ciphertext || auth_tag，
     其中 auth_tag 固定 16 字节，位于密文尾部。
 
-    本函数严格按照以下格式进行切片：
-      - data[0:1]   → version（必须为 b'\x01'）
-      - data[1:17]  → nonce (12 字节 IV)
-      - data[17:]   → ciphertext || auth_tag（连在一起，共 n+16 字节）
+    二进制布局（Cloak.Vault 文档注释）：
+      +--------+--------+--------+--------+
+      | version |   IV (12B)  | ciphertext+tag |
+      +--------+--------+--------+--------+
+      |  1B   |    12B        |    n+16B       |
 
-    Python cryptography 的 AESGCM.decrypt() 可以直接接收 ciphertext+tag 的
-    合并字节串，调用时将 associated_data 设为 b'AES.GCM.V1' 即可。
+    Python AESGCM.decrypt() 直接接收 ciphertext+tag 合并字节串，
+    并将 associated_data 设为 b'AES.GCM.V1'。
 
     Args:
         key:  32 字节 AES-256 密钥
@@ -149,8 +128,8 @@ def _decrypt_cloak_v1(key: bytes, data: bytes) -> bytes:
     if version != b'\x01':
         raise ValueError(f"未知的 Cloak 版本号: {version!r}，仅支持 V1 (b'\\x01')")
 
-    iv = data[1:17]                        # 12 字节 Nonce
-    ciphertext_with_tag = data[17:]         # ciphertext || 16 字节 auth tag
+    iv = data[1:13]                          # 12 字节 Nonce
+    ciphertext_with_tag = data[13:]           # ciphertext || 16 字节 auth tag
 
     aesgcm = AESGCM(key)
     plaintext = aesgcm.decrypt(
@@ -170,13 +149,11 @@ _cached_refresh_token: str | None = None
 
 
 def get_decrypted_access_token() -> str:
-    """从 private.tokens 表读取并解密 access token。
+    """从 public.tokens 表读取并解密 access token。
 
-    这是本模块的对外入口函数。它会：
-      1. 检查缓存（避免频繁查库）
-      2. 连接 TeslaMate 数据库查询 private.tokens 表
-      3. 按 Cloak V1 格式解密 access token
-      4. 缓存结果并返回
+    TeslaMate 的 Ecto Migration 将加密后的 token 字段 rename 为
+    'access' 和 'refresh'，存放在 public schema 的 tokens 表中。
+    这是本模块的对外入口函数。
 
     Returns:
         解密后的 access token 字符串（Bearer Token）
@@ -202,35 +179,35 @@ def get_decrypted_access_token() -> str:
             "请设置与 TeslaMate 相同的加密密钥。"
         )
 
-    # 派生 AES-256 密钥
+    # 派生 AES-256 密钥：SHA256(ENCRYPTION_KEY)，与 TeslaMate Elixir 端一致
     key = _derive_aes_key(ENCRYPTION_KEY)
 
-    # 连接数据库读取 private.tokens 表
+    # 连接数据库读取 public.tokens 表（注意是 public.tokens，不是 private.tokens）
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            # TeslaMate 将 token 存放在 private schema 的 tokens 表中
-            # inserted_at 用于获取最新一条
             cur.execute(
                 """
                 SELECT access, refresh
-                FROM private.tokens
+                FROM tokens
                 ORDER BY inserted_at DESC
                 LIMIT 1
                 """
             )
             row = cur.fetchone()
             if not row:
-                raise RuntimeError("在 private.tokens 表中未找到任何 token 记录。")
-            encrypted_access: bytes = row["access"]
-            encrypted_refresh: bytes = row["refresh"]
+                raise RuntimeError("在 tokens 表中未找到任何 token 记录。")
+            encrypted_access = row["access"]
+            encrypted_refresh = row["refresh"]
     finally:
         conn.close()
 
     # 解密 access token
     if encrypted_access:
         try:
-            _cached_access_token = _decrypt_cloak_v1(key, bytes(encrypted_access)).decode("utf-8")
+            _cached_access_token = _decrypt_cloak_v1(
+                key, bytes(encrypted_access)
+            ).decode("utf-8")
         except Exception as e:
             raise RuntimeError(f"access token 解密失败: {e}") from e
     else:
@@ -239,7 +216,9 @@ def get_decrypted_access_token() -> str:
     # 解密 refresh token（备用）
     if encrypted_refresh:
         try:
-            _cached_refresh_token = _decrypt_cloak_v1(key, bytes(encrypted_refresh)).decode("utf-8")
+            _cached_refresh_token = _decrypt_cloak_v1(
+                key, bytes(encrypted_refresh)
+            ).decode("utf-8")
         except Exception as e:
             logger.warning("refresh token 解密失败（不影响主流程）: %s", e)
             _cached_refresh_token = ""
@@ -263,6 +242,5 @@ def get_decrypted_refresh_token() -> str:
     """获取解密后的 refresh token。"""
     global _cached_refresh_token
     if not _cached_refresh_token:
-        # 触发完整加载
         get_decrypted_access_token()
     return _cached_refresh_token or ""
