@@ -55,12 +55,17 @@ CLOAK_V1_AAD: bytes = b"AES.GCM.V1"
 def _derive_aes_key(raw_key: str) -> bytes:
     """从 ENCRYPTION_KEY 派生 AES-256 密钥。
 
-    根据 TeslaMate 源码 (vault.ex)，Elixir 端使用：
-        :crypto.hash(:sha256, encryption_key)
-    生成 32 字节 AES-256 密钥。
+    TeslaMate 的 vault.ex 源码：
+        setup_vault(key) ->
+          default_cipher(:crypto.hash(:sha256, key))
+          即：AES_key = SHA256(key)
 
-    本函数复现完全相同的逻辑：
-        AES_key = SHA256(ENCRYPTION_KEY as UTF-8 bytes)
+    其中 key 是从环境变量或文件读取的原始字符串：
+      - 如果是 TeslaMate 自动生成的密钥：是 48 字节随机数的 Base64 编码
+        (无 padding，64 字符)，需要先 base64_decode 再 SHA256
+      - 如果是用户自定义明文字符串：直接 SHA256
+
+    本函数复现完全相同的派生逻辑。
 
     Args:
         raw_key: 环境变量 TESLA_ENCRYPTION_KEY 的原始值
@@ -68,8 +73,27 @@ def _derive_aes_key(raw_key: str) -> bytes:
     Returns:
         严格 32 字节的 AES-256 密钥
     """
+    import base64 as b64
+
+    try:
+        decoded = b64.b64decode(raw_key, validate=True)
+        if len(decoded) == 48:
+            # TeslaMate 生成的 48 字节随机密钥：base64_decode → SHA256
+            key_bytes = hashlib.sha256(decoded).digest()
+            logger.debug(
+                "ENCRYPTION_KEY: TeslaMate 生成格式 (48B随机数 base64编码)，"
+                "SHA256 后得到 %d 字节 AES 密钥", len(key_bytes)
+            )
+            return key_bytes
+    except Exception:
+        pass
+
+    # 用户自定义明文字符串：直接 SHA256
     key_bytes = hashlib.sha256(raw_key.encode("utf-8")).digest()
-    logger.debug("ENCRYPTION_KEY: SHA256 哈希后得到 %d 字节 AES 密钥", len(key_bytes))
+    logger.debug(
+        "ENCRYPTION_KEY: 自定义明文字符串，直接 SHA256 后得到 %d 字节 AES 密钥",
+        len(key_bytes)
+    )
     return key_bytes
 
 
