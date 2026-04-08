@@ -10,47 +10,72 @@
 
 ## 功能特性
 
-**23+ 工具**，分为四类：
+**30 个工具**，分为六大类 — 全部只读查询 TeslaMate PostgreSQL：
 
-| 分类 | 工具 | 数据来源 |
-|------|------|---------|
-| **状态** | `tesla_status`、`tesla_drives`、`tesla_charging_history`、`tesla_battery_health`、`tesla_efficiency`、`tesla_location_history`、`tesla_state_history`、`tesla_software_updates` | TeslaMate 数据库 |
-| **分析** | `tesla_savings`、`tesla_trip_cost`、`tesla_efficiency_by_temp`、`tesla_charging_by_location`、`tesla_top_destinations`、`tesla_longest_trips`、`tesla_monthly_summary`、`tesla_vampire_drain`、`calculate_eco_savings_vs_icev` | TeslaMate 数据库 |
-| **增强** | `tesla_driving_score`、`tesla_trips_by_category`、`tesla_trip_categories`、`tesla_monthly_report`、`tesla_tpms_status`、`tesla_tpms_history`、`generate_travel_narrative_context`、`get_vehicle_persona_status` | TeslaMate 数据库 |
-| **实时** | `tesla_live`（GPS、电池、温度、充电状态） | TeslaMate 数据库 |
+### 🚗 车辆状态
 
-### 新增工具说明
-
-#### `calculate_eco_savings_vs_icev` — 节能减排计算器
-对比特斯拉与燃油车在同一行驶里程下的成本和碳排放差异。
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `days` | `30` | 回溯天数 |
-| `icev_mpg` | `8.0` | 燃油车百公里油耗（L/100km） |
-| `gas_price` | `8.0` | 汽油单价（元/升） |
-| `electricity_price` | `0.5` | 充电单价（元/度） |
-
-返回 JSON：ICEV 基准油耗/成本/碳排、EV 实际碳排、节省金额、减少碳排放量、种树当量。
-
-#### `generate_travel_narrative_context` — 行车游记时间线生成器
-为 LLM 生成行车游记或 Vlog 脚本提供结构化的行程上下文。
-
-| 参数 | 说明 |
+| 工具 | 说明 |
 |------|------|
-| `start_time` | ISO8601 开始时间 |
-| `end_time` | ISO8601 结束时间 |
+| `tesla_status` | 当前车辆状态 — 电量、续航、位置、空调、里程 |
+| `tesla_live` | 实时轮询状态（GPS、电池、温度、TPMS、充电） |
+| `tesla_tpms_status` | 胎压监测，异常报警 |
+| `tesla_tpms_history` | 近期胎压历史记录 |
 
-返回时间线 JSON 数组，每段包含起终点名称、里程、时长、气温、到达后停留时长及停留类型（重要停留/短停/无停留）。
+### 📊 行程与驾驶
 
-#### `get_vehicle_persona_status` — 车辆"性格"状态面板
-为 LLM 扮演"有性格的数字车辆"提供活跃度、疲劳度、极限行为和健康度指标。
+| 工具 | 说明 |
+|------|------|
+| `tesla_drives` | 最近 N 天行程列表 |
+| `tesla_driving_score` | 驾驶评分（加速/刹车/速度习惯） |
+| `tesla_trips_by_category` | 按类别筛选行程（通勤/购物/休闲/长途/其他） |
+| `tesla_trip_categories` | 各类别行程数量统计 |
+| `tesla_longest_trips` | 最长行程排名 |
+| `tesla_top_destinations` | 最常访问目的地 |
+| `tesla_location_history` | 位置历史 — 各地点停留时长 |
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `days_lookback` | `7` | 回溯天数 |
+### 🔋 电池与充电
 
-返回 JSON：活跃度（总里程、静置占比）、疲劳度（单次最长连续行驶）、极限行为（最高车速）、健康度（吸血鬼耗电估算）、中文性格标签（元气满满/疲惫不堪/闲得发慌/悠闲自得）。
+| 工具 | 说明 |
+|------|------|
+| `tesla_charging_history` | 充电历史记录 |
+| `tesla_charging_by_location` | 各充电地点的充电模式（支持日期过滤） |
+| `tesla_battery_health` | 电池衰减趋势（100% 电量续航变化） |
+| `tesla_vampire_drain` | 驻车掉电分析（过夜电池损耗） |
+
+### ⚡ 能耗分析
+
+| 工具 | 说明 |
+|------|------|
+| `tesla_efficiency` | 能耗趋势（Wh/km 每周平均） |
+| `tesla_efficiency_by_temp` | 不同温度下的能耗曲线 |
+| `tesla_monthly_report` | 月度驾驶报告（含上月对比） |
+| `tesla_monthly_summary` | 月度汇总表（里程/kWh/费用/能耗） |
+
+### 💰 省钱 & 环保
+
+| 工具 | 说明 |
+|------|------|
+| `tesla_savings` | 油费节省 scorecard |
+| `tesla_trip_cost` | 估算到某目的地的电费（kWh/费用/续航检查） |
+| `calculate_eco_savings_vs_icev` | 相比燃油车的节省 + CO₂ 减排 + 种树当量 |
+
+### 🏆 成就 & 趣味
+
+| 工具 | 说明 |
+|------|------|
+| `check_driving_achievements` | 检测驾驶成就（极限续航幸存者/午夜幽灵/冰雪勇士） |
+| `generate_travel_narrative_context` | 旅行叙事时间线（用于写游记/Vlog 脚本） |
+| `generate_weekend_blindbox` | 周末盲盒目的地推荐（去过一次的独特记忆） |
+| `generate_monthly_driving_report` | 精美 Markdown 月报（含 Emoji） |
+| `get_vehicle_persona_status` | 车辆人设状态（活跃度/疲劳度/极端情况/健康度） |
+| `get_charging_vintage_data` | 单次充电详细物理参数 |
+
+### 🔧 系统与历史
+
+| 工具 | 说明 |
+|------|------|
+| `tesla_state_history` | 车辆状态转换历史（在线/睡眠/离线） |
+| `tesla_software_updates` | 固件版本历史 |
 
 ---
 
@@ -208,17 +233,17 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `TESLA_LIMIT_DRIVES` | `50` | `tesla_drives` 最大返回条数 |
-| `TESLA_LIMIT_CHARGING` | `50` | `tesla_charging_history` 最大返回条数 |
-| `TESLA_LIMIT_TRIP_CATEGORIES` | `100` | `tesla_trip_categories` 分析的行程数 |
-| `TESLA_LIMIT_BATTERY_HEALTH` | `24` | `tesla_battery_health` 月度快照数量 |
+| `TESLA_LIMIT_DRIVES` | `500` | `tesla_drives` 最大返回条数 |
+| `TESLA_LIMIT_CHARGING` | `500` | `tesla_charging_history` 最大返回条数 |
+| `TESLA_LIMIT_TRIP_CATEGORIES` | `500` | `tesla_trip_categories` 分析的行程数 |
+| `TESLA_LIMIT_BATTERY_HEALTH` | `60` | `tesla_battery_health` 月度快照数量 |
 | `TESLA_LIMIT_BATTERY_SAMPLES` | `20` | `tesla_battery_health` 回退采样数 |
-| `TESLA_LIMIT_LOCATION_HISTORY` | `20` | `tesla_location_history` 位置聚类数量 |
-| `TESLA_LIMIT_STATE_HISTORY` | `100` | `tesla_state_history` 状态转换数量 |
+| `TESLA_LIMIT_LOCATION_HISTORY` | `50` | `tesla_location_history` 位置聚类数量 |
+| `TESLA_LIMIT_STATE_HISTORY` | `500` | `tesla_state_history` 状态转换数量 |
 | `TESLA_LIMIT_SOFTWARE_UPDATES` | `20` | `tesla_software_updates` 软件更新数量 |
-| `TESLA_LIMIT_CHARGING_BY_LOCATION` | `15` | `tesla_charging_by_location` 充电地点数量 |
-| `TESLA_LIMIT_TPMS_HISTORY` | `20` | `tesla_tpms_history` 胎压历史记录数 |
-| `TESLA_LIMIT_VAMPIRE_DRAIN` | `20` | `tesla_vampire_drain` 吸血鬼耗电事件数 |
+| `TESLA_LIMIT_CHARGING_BY_LOCATION` | `50` | `tesla_charging_by_location` 充电地点数量 |
+| `TESLA_LIMIT_TPMS_HISTORY` | `30` | `tesla_tpms_history` 胎压历史记录数 |
+| `TESLA_LIMIT_VAMPIRE_DRAIN` | `50` | `tesla_vampire_drain` 吸血鬼耗电事件数 |
 
 ---
 

@@ -10,47 +10,72 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ## Features
 
-**23+ tools** across four categories:
+**30 tools** across six categories — all read-only from TeslaMate PostgreSQL:
 
-| Category | Tools | Data Source |
-|----------|-------|-------------|
-| **Status** | `tesla_status`, `tesla_drives`, `tesla_charging_history`, `tesla_battery_health`, `tesla_efficiency`, `tesla_location_history`, `tesla_state_history`, `tesla_software_updates` | TeslaMate DB |
-| **Analytics** | `tesla_savings`, `tesla_trip_cost`, `tesla_efficiency_by_temp`, `tesla_charging_by_location`, `tesla_top_destinations`, `tesla_longest_trips`, `tesla_monthly_summary`, `tesla_vampire_drain`, `calculate_eco_savings_vs_icev` | TeslaMate DB |
-| **Enhanced** | `tesla_driving_score`, `tesla_trips_by_category`, `tesla_trip_categories`, `tesla_monthly_report`, `tesla_tpms_status`, `tesla_tpms_history`, `generate_travel_narrative_context`, `get_vehicle_persona_status` | TeslaMate DB |
-| **Live** | `tesla_live` (GPS, battery, climate, charging) | TeslaMate DB |
+### 🚗 Vehicle Status
 
-### New Tools
+| Tool | Description |
+|------|-------------|
+| `tesla_status` | Current state — battery, range, location, climate, odometer |
+| `tesla_live` | Latest polled state (GPS, battery, climate, TPMS, charging) |
+| `tesla_tpms_status` | Current tyre pressures with anomaly warnings |
+| `tesla_tpms_history` | Recent TPMS pressure history |
 
-#### `calculate_eco_savings_vs_icev` — Eco Savings Calculator
-Compare Tesla's electricity costs vs a hypothetical ICEV (internal combustion engine vehicle) over the same distance.
+### 📊 Trips & Driving
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| `days` | `30` | Lookback days |
-| `icev_mpg` | `8.0` | ICEV fuel consumption (L/100km) |
-| `gas_price` | `8.0` | Gas price per litre (RMB) |
-| `electricity_price` | `0.5` | Electricity price per kWh (RMB) |
+| Tool | Description |
+|------|-------------|
+| `tesla_drives` | Recent drives with distance, duration, efficiency |
+| `tesla_driving_score` | Driving score (acceleration, braking, speed habits) |
+| `tesla_trips_by_category` | Filter trips by category (commute / shopping / leisure / long_trip / other) |
+| `tesla_trip_categories` | Trip count breakdown by category |
+| `tesla_longest_trips` | Top drives ranked by distance |
+| `tesla_top_destinations` | Most visited locations |
+| `tesla_location_history` | Where the car has been — time at each location |
 
-Returns JSON: ICE baseline (fuel/cost/CO2), EV actual CO2, money saved, CO2 reduced, tree equivalents.
+### 🔋 Battery & Charging
 
-#### `generate_travel_narrative_context` — Travel Narrative Timeline Generator
-Extracts structured drive and stop data for LLM-powered travel blogging or Vlog scripting.
+| Tool | Description |
+|------|-------------|
+| `tesla_charging_history` | Charging sessions over N days |
+| `tesla_charging_by_location` | Charging patterns by location (supports date filter) |
+| `tesla_battery_health` | Battery degradation trend (range at 100% over time) |
+| `tesla_vampire_drain` | Battery loss while parked (overnight drain analysis) |
 
-| Param | Description |
-|-------|-------------|
-| `start_time` | ISO8601 start time |
-| `end_time` | ISO8601 end time |
+### ⚡ Energy & Efficiency
 
-Returns a timeline JSON array with from/to names, distance, duration, temperature, stay duration after arrival, and stay type (important_stop / short_stop / none).
+| Tool | Description |
+|------|-------------|
+| `tesla_efficiency` | Energy consumption trends (Wh/km weekly averages) |
+| `tesla_efficiency_by_temp` | Efficiency curve by outside temperature |
+| `tesla_monthly_report` | Monthly driving report with comparison to previous month |
+| `tesla_monthly_summary` | Monthly summary table (distance / kWh / cost / efficiency) |
 
-#### `get_vehicle_persona_status` — Vehicle Persona Status Panel
-Provides activity, fatigue, extreme behaviour, and health metrics for an LLM to roleplay a "vehicle with personality".
+### 💰 Savings & Eco
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| `days_lookback` | `7` | Lookback days |
+| Tool | Description |
+|------|-------------|
+| `tesla_savings` | Gas savings scorecard — how much you've saved vs a gas car |
+| `tesla_trip_cost` | Estimate trip cost to a destination (kWh, cost, range check) |
+| `calculate_eco_savings_vs_icev` | EV vs ICEV cost/CO₂ comparison with tree equivalents |
 
-Returns JSON: activity (total km, idle %), fatigue (longest continuous drive), extremes (max speed), health (vampire drain estimate), and Chinese persona label (元气满满 / 疲惫不堪 / 闲得发慌 / 悠闲自得).
+### 🏆 Achievements & Fun
+
+| Tool | Description |
+|------|-------------|
+| `check_driving_achievements` | Detect achievements (极限续航幸存者 / 午夜幽灵 / 冰雪勇士) |
+| `generate_travel_narrative_context` | Travel timeline for LLM-powered blogging / Vlog scripts |
+| `generate_weekend_blindbox` | Weekend "memory blindbox" — rare one-time destination recommendation |
+| `generate_monthly_driving_report` | Polished Markdown monthly report with Emoji |
+| `get_vehicle_persona_status` | Vehicle persona metrics (activity / fatigue / extremes / health) |
+| `get_charging_vintage_data` | Single charge session detailed parameters |
+
+### 🔧 System & History
+
+| Tool | Description |
+|------|-------------|
+| `tesla_state_history` | Vehicle state transitions (online / asleep / offline) |
+| `tesla_software_updates` | Firmware version history |
 
 ---
 
@@ -211,17 +236,17 @@ Set to `-1` for unlimited results.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TESLA_LIMIT_DRIVES` | `50` | Max drives returned by `tesla_drives` |
-| `TESLA_LIMIT_CHARGING` | `50` | Max charging sessions by `tesla_charging_history` |
-| `TESLA_LIMIT_TRIP_CATEGORIES` | `100` | Drives analyzed by `tesla_trip_categories` |
-| `TESLA_LIMIT_BATTERY_HEALTH` | `24` | Monthly snapshots in `tesla_battery_health` |
+| `TESLA_LIMIT_DRIVES` | `500` | Max drives returned by `tesla_drives` |
+| `TESLA_LIMIT_CHARGING` | `500` | Max charging sessions by `tesla_charging_history` |
+| `TESLA_LIMIT_TRIP_CATEGORIES` | `500` | Drives analyzed by `tesla_trip_categories` |
+| `TESLA_LIMIT_BATTERY_HEALTH` | `60` | Monthly snapshots in `tesla_battery_health` |
 | `TESLA_LIMIT_BATTERY_SAMPLES` | `20` | Fallback sample limit for `tesla_battery_health` |
-| `TESLA_LIMIT_LOCATION_HISTORY` | `20` | Location clusters in `tesla_location_history` |
-| `TESLA_LIMIT_STATE_HISTORY` | `100` | State transitions in `tesla_state_history` |
+| `TESLA_LIMIT_LOCATION_HISTORY` | `50` | Location clusters in `tesla_location_history` |
+| `TESLA_LIMIT_STATE_HISTORY` | `500` | State transitions in `tesla_state_history` |
 | `TESLA_LIMIT_SOFTWARE_UPDATES` | `20` | Software updates returned by `tesla_software_updates` |
-| `TESLA_LIMIT_CHARGING_BY_LOCATION` | `15` | Locations in `tesla_charging_by_location` |
-| `TESLA_LIMIT_TPMS_HISTORY` | `20` | TPMS records in `tesla_tpms_history` |
-| `TESLA_LIMIT_VAMPIRE_DRAIN` | `20` | Drain events in `tesla_vampire_drain` |
+| `TESLA_LIMIT_CHARGING_BY_LOCATION` | `50` | Locations in `tesla_charging_by_location` |
+| `TESLA_LIMIT_TPMS_HISTORY` | `30` | TPMS records in `tesla_tpms_history` |
+| `TESLA_LIMIT_VAMPIRE_DRAIN` | `50` | Drain events in `tesla_vampire_drain` |
 
 ---
 
