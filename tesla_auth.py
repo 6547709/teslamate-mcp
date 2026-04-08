@@ -213,14 +213,14 @@ def get_decrypted_access_token() -> str:
             cur.execute(
                 """
                 SELECT access, refresh
-                FROM tokens
+                FROM private.tokens
                 ORDER BY inserted_at DESC
                 LIMIT 1
                 """
             )
             row = cur.fetchone()
             if not row:
-                raise RuntimeError("在 tokens 表中未找到任何 token 记录。")
+                raise RuntimeError("在 private.tokens 表中未找到任何 token 记录。")
             encrypted_access = row["access"]
             encrypted_refresh = row["refresh"]
     finally:
