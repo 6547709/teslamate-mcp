@@ -210,61 +210,13 @@ async def _owner_api_get(path: str) -> dict:
 
 
 async def _fleet_get(path: str) -> dict:
-    """GET from Fleet API (direct, for data reads)."""
-    if not HAS_FLEET_API:
-        raise RuntimeError(
-            "Fleet API not configured. "
-            "Set TESLA_VIN and TESLA_TOKEN_FILE environment variables."
-        )
-    token = _get_access_token()
-    async with httpx.AsyncClient(timeout=15.0, verify=VERIFY_SSL) as client:
-        resp = await client.get(
-            f"{FLEET_URL}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        resp.raise_for_status()
-        return resp.json()
+    """Deprecated: Fleet API is no longer supported. Use Owner API."""
+    raise RuntimeError("Fleet API has been removed. Use Owner API via _owner_api_get().")
 
 
 async def _fleet_command(command: str, body: dict | None = None) -> dict:
-    """Send a vehicle command through the HTTP proxy (signed)."""
-    if not HAS_PROXY:
-        return {
-            "error": (
-                "Fleet API proxy not configured. "
-                "Set TESLA_PROXY_URL, TESLA_VIN, and TESLA_TOKEN_FILE."
-            )
-        }
-    if not VIN:
-        return {"error": "TESLA_VIN not set."}
-
-    limit_err = _check_rate_limit()
-    if limit_err:
-        return {"result": False, "reason": limit_err}
-
-    token = _get_access_token()
-    url = f"{PROXY_URL}/api/1/vehicles/{VIN}/command/{command}"
-    try:
-        async with httpx.AsyncClient(timeout=30.0, verify=VERIFY_SSL) as client:
-            resp = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=body or {},
-            )
-            try:
-                result = resp.json()
-            except Exception:
-                return {
-                    "error": f"Non-JSON response ({resp.status_code}): "
-                    f"{resp.text[:200]}"
-                }
-            _log_command(command)
-            return result
-    except Exception as e:
-        return {"error": f"Command failed: {e}"}
+    """Deprecated: Vehicle commands are no longer supported."""
+    return {"error": "Vehicle commands have been removed from this MCP server."}
 
 
 # -- DB helper -----------------------------------------------------------------
@@ -822,7 +774,7 @@ async def tesla_software_updates() -> str:
     return "\n".join(lines)
 
 
-# -- Fleet API Live Data -------------------------------------------------------
+# -- Owner API Live Data -------------------------------------------------------
 
 
 @mcp.tool()
