@@ -1128,15 +1128,12 @@ async def tesla_live() -> str:
         if bar:
             warn = " ⚠" if vs.get(f"tpms_soft_warning_{pos}") else ""
             if USE_METRIC_UNITS:
-                tires.append(f"{label}:{bar:.2f}{warn}")
+                tires.append(f"{label}:{bar:.2f} bar{warn}")
             else:
                 psi = round(bar * 14.5038, 1)
-                tires.append(f"{label}:{psi}{warn}")
+                tires.append(f"{label}:{psi} psi{warn}")
     if tires:
-        if USE_METRIC_UNITS:
-            lines.append(f"Tires: {', '.join(tires)} bar")
-        else:
-            lines.append(f"Tires: {', '.join(tires)} PSI")
+        lines.append(f"Tires: {', '.join(tires)}")
 
     media = vs.get("media_info", {})
     title = media.get("now_playing_title", "")
@@ -1646,6 +1643,10 @@ async def tesla_tpms_status() -> str:
             lines.append(f"{label}: N/A")
             continue
         psi = round(bar * 14.5038, 1)
+        if USE_METRIC_UNITS:
+            display = f"{bar:.2f} bar"
+        else:
+            display = f"{psi} psi"
         status = "OK"
         if bar < TPMS_MIN:
             status = f"LOW (< {TPMS_MIN} bar)"
@@ -1655,7 +1656,7 @@ async def tesla_tpms_status() -> str:
         if soft:
             status = status + " + SOFT WARNING"
         pressures[pos] = bar
-        lines.append(f"{label}: {psi} PSI ({bar:.2f} bar) — {status}")
+        lines.append(f"{label}: {display} — {status}")
 
     # Check consistency
     if len(pressures) >= 3:
@@ -1664,8 +1665,14 @@ async def tesla_tpms_status() -> str:
         for pos, bar in pressures.items():
             if abs(bar - avg) > TPMS_WARN_DELTA:
                 label = dict(positions).get(pos, pos)
-                lines.append(f"  ⚠ {label} deviates {abs(bar-avg):.2f} bar from average")
-        lines.append(f"Average: {round(avg*14.5038,1)} PSI ({round(avg,2)} bar)")
+                if USE_METRIC_UNITS:
+                    lines.append(f"  ⚠ {label} deviates {abs(bar-avg):.2f} bar from average")
+                else:
+                    lines.append(f"  ⚠ {label} deviates {abs(bar-avg)*14.5038:.1f} psi from average")
+        if USE_METRIC_UNITS:
+            lines.append(f"Average: {round(avg,2)} bar")
+        else:
+            lines.append(f"Average: {round(avg*14.5038,1)} psi")
 
     return "\n".join(lines)
 
@@ -1698,6 +1705,7 @@ async def tesla_tpms_history(days: int = 30) -> str:
     if not rows:
         return f"No TPMS data in the last {days} days."
 
+    unit_label = "bar" if USE_METRIC_UNITS else "psi"
     lines = [f"**TPMS History** (last {days} days, {len(rows)} records)\n"]
     for r in rows:
         date = str(r.get("date", ""))[:16]
@@ -1705,11 +1713,17 @@ async def tesla_tpms_history(days: int = 30) -> str:
         fr = r.get("tpms_pressure_fr")
         rl = r.get("tpms_pressure_rl")
         rr = r.get("tpms_pressure_rr")
-        fl_s = f"{round(fl*14.5038,1)}" if fl else "—"
-        fr_s = f"{round(fr*14.5038,1)}" if fr else "—"
-        rl_s = f"{round(rl*14.5038,1)}" if rl else "—"
-        rr_s = f"{round(rr*14.5038,1)}" if rr else "—"
-        lines.append(f"{date}: FL={fl_s} FR={fr_s} RL={rl_s} RR={rr_s} PSI")
+        if USE_METRIC_UNITS:
+            fl_s = f"{fl:.2f}" if fl else "—"
+            fr_s = f"{fr:.2f}" if fr else "—"
+            rl_s = f"{rl:.2f}" if rl else "—"
+            rr_s = f"{rr:.2f}" if rr else "—"
+        else:
+            fl_s = f"{round(fl*14.5038,1)}" if fl else "—"
+            fr_s = f"{round(fr*14.5038,1)}" if fr else "—"
+            rl_s = f"{round(rl*14.5038,1)}" if rl else "—"
+            rr_s = f"{round(rr*14.5038,1)}" if rr else "—"
+        lines.append(f"{date}: FL={fl_s} FR={fr_s} RL={rl_s} RR={rr_s} {unit_label}")
     return "\n".join(lines)
 
 
