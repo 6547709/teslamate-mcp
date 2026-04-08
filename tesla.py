@@ -794,6 +794,8 @@ async def tesla_live() -> str:
     # Find the first vehicle (or filter by CAR_ID - for multi-car support later)
     vehicle = vehicles[0]
     vehicle_id = vehicle.get("id")
+    if not vehicle_id:
+        return "Could not determine vehicle ID from API response."
 
     # Get live vehicle data
     data = await _owner_api_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
