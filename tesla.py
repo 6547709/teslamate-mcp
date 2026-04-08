@@ -2217,6 +2217,441 @@ async def get_vehicle_persona_status(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+# -- Achievements & Reports ------------------------------------------------------
+
+
+@mcp.tool()
+async def check_driving_achievements(days: int = 30) -> str:
+    """Scan recent drives and charging sessions to check for driving achievements.
+
+    Detects three achievements:
+      1. [极限续航幸存者] -- started a charge with <= 5% battery
+      2. [午夜幽灵] -- drove at least 3 times between 00:00 and 04:00
+      3. [冰雪勇士] -- drove > 20 km when outside temp was below 0 degC
+
+    Args:
+        days: Number of days to look back (default: 30)
+    """
+    import json
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    unlocked = []
+
+    # Achievement 1:极限续航幸存者 -- start_battery_level <= 5
+    low_battery_rows = _query(
+        f"""
+        SELECT start_date, start_battery_level, charge_energy_added,
+               end_battery_level, duration_min
+        FROM charging_processes
+        WHERE car_id = {CAR_ID} AND start_date >= %s
+          AND start_battery_level IS NOT NULL
+          AND start_battery_level <= 5
+        ORDER BY start_date DESC
+        """,
+        (cutoff,),
+    )
+    for r in low_battery_rows:
+        unlocked.append({
+            "achievement": "极限续航幸存者",
+            "triggered_at": str(r["start_date"])[:19],
+            "start_battery_pct": r["start_battery_level"],
+            "charge_energy_kwh": round(r["charge_energy_added"] or 0, 1),
+            "end_battery_pct": r["end_battery_level"],
+            "duration_min": r["duration_min"] or 0,
+            "evidence": (
+                f"在电量仅剩 {r['start_battery_level']}% 时开始充电，"
+                f"充入 {r['charge_energy_added'] or 0:.1f} kWh"
+            ),
+        })
+
+    # Achievement 2:午夜幽灵 -- 3+ drives between 00:00 and 04:00
+    midnight_drives = _query(
+        f"""
+        SELECT start_date, distance, duration_min,
+               outside_temp_avg, end_address_id
+        FROM drives
+        WHERE car_id = {CAR_ID} AND start_date >= %s
+          AND EXTRACT(HOUR FROM start_date) >= 0
+          AND EXTRACT(HOUR FROM start_date) < 4
+        ORDER BY start_date DESC
+        """,
+        (cutoff,),
+    )
+    if len(midnight_drives) >= 3:
+        earliest = midnight_drives[-1]
+        unlocked.append({
+            "achievement": "午夜幽灵",
+            "triggered_at": f"过去 {days} 天内共 {len(midnight_drives)} 次",
+            "first_midnight_drive": str(earliest["start_date"])[:19],
+            "total_midnight_drives": len(midnight_drives),
+            "evidence": (
+                f"在凌晨 00:00~04:00 时段内共出行 {len(midnight_drives)} 次，"
+                "是昼伏夜出的神秘驾驶员"
+            ),
+        })
+
+    # Achievement 3:冰雪勇士 -- outside_temp_avg < 0 AND distance > 20
+    cold_drives = _query(
+        f"""
+        SELECT start_date, distance, outside_temp_avg,
+               duration_min, start_ideal_range_km, end_ideal_range_km
+        FROM drives
+        WHERE car_id = {CAR_ID} AND start_date >= %s
+          AND outside_temp_avg IS NOT NULL
+          AND outside_temp_avg < 0
+          AND distance > 20
+        ORDER BY start_date DESC
+        """,
+        (cutoff,),
+    )
+    for r in cold_drives:
+        unlocked.append({
+            "achievement": "冰雪勇士",
+            "triggered_at": str(r["start_date"])[:19],
+            "temperature_c": round(r["outside_temp_avg"], 1),
+            "distance_km": round(r["distance"], 1),
+            "duration_min": r["duration_min"] or 0,
+            "evidence": (
+                f"在气温仅 {r['outside_temp_avg']}°C 的严寒中行驶了 "
+                f"{r['distance']:.1f} km，堪称勇士"
+            ),
+        })
+
+    result = {
+        "period_days": days,
+        "total_achievements_checked": 3,
+        "unlocked": unlocked,
+        "unlocked_count": len(unlocked),
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_charging_vintage_data(charge_id: int | None = None) -> str:
+    """Get detailed physical parameters for a single charging session.
+
+    Intended for LLM to roleplay a 'vintage data sommelier'.
+
+    Args:
+        charge_id: Specific charging session ID. If None, returns the latest.
+    """
+    import json
+
+    if charge_id is not None:
+        row = _query_one(
+            f"""
+            SELECT cp.start_date, cp.end_date, cp.duration_min,
+                   cp.start_battery_level, cp.end_battery_level,
+                   cp.outside_temp_avg, cp.charge_energy_added,
+                   cp.cost,
+                   sa.display_name AS location
+            FROM charging_processes cp
+            LEFT JOIN positions p ON cp.position_id = p.id
+            LEFT JOIN addresses sa ON sa.id = (
+                SELECT a2.id FROM addresses a2
+                WHERE ABS(a2.latitude - p.latitude) < 0.005
+                  AND ABS(a2.longitude - p.longitude) < 0.005
+                LIMIT 1
+            )
+            WHERE cp.car_id = {CAR_ID} AND cp.id = %s
+            """,
+            (charge_id,),
+        )
+    else:
+        row = _query_one(
+            f"""
+            SELECT cp.id, cp.start_date, cp.end_date, cp.duration_min,
+                   cp.start_battery_level, cp.end_battery_level,
+                   cp.outside_temp_avg, cp.charge_energy_added,
+                   cp.cost,
+                   sa.display_name AS location
+            FROM charging_processes cp
+            LEFT JOIN positions p ON cp.position_id = p.id
+            LEFT JOIN addresses sa ON sa.id = (
+                SELECT a2.id FROM addresses a2
+                WHERE ABS(a2.latitude - p.latitude) < 0.005
+                  AND ABS(a2.longitude - p.longitude) < 0.005
+                LIMIT 1
+            )
+            WHERE cp.car_id = {CAR_ID} AND cp.end_date IS NOT NULL
+            ORDER BY cp.start_date DESC
+            LIMIT 1
+            """
+        )
+
+    if not row:
+        return json.dumps({"error": "未找到对应的充电记录"}, ensure_ascii=False)
+
+    # Temperature condition label
+    temp = row.get("outside_temp_avg")
+    if temp is not None:
+        if temp < 0:
+            temp_label = "冰点以下 (freezing)"
+        elif temp < 10:
+            temp_label = "偏凉 (cool)"
+        elif temp < 25:
+            temp_label = "舒适 (comfortable)"
+        else:
+            temp_label = "高温 (hot)"
+    else:
+        temp_label = "未知 (unknown)"
+
+    # Start/end SOC labels
+    start_soc = row.get("start_battery_level")
+    end_soc = row.get("end_battery_level")
+    start_soc_label = f"{start_soc}% (严重不足)" if start_soc is not None and start_soc <= 10 else (
+        f"{start_soc}%" if start_soc is not None else "未知"
+    )
+    end_soc_label = f"{end_soc}%" if end_soc is not None else "未知"
+
+    result = {
+        "charge_id": row.get("id"),
+        "time_window": f"{str(row.get('start_date') or '')[:19]} → {str(row.get('end_date') or '')[:19]}",
+        "temperature_condition": temp_label,
+        "outside_temp_c": round(temp, 1) if temp is not None else None,
+        "starting_soc": start_soc_label,
+        "ending_soc": end_soc_label,
+        "charge_energy_added_kwh": round(row.get("charge_energy_added") or 0, 1),
+        "duration_min": row.get("duration_min") or 0,
+        "location": row.get("location") or "未知地点",
+        "cost_RMB": round(row.get("cost") or 0, 2),
+        "metadata": "精准充电数据，供 LLM 品鉴师品鉴使用",
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def generate_weekend_blindbox(
+    months_lookback: int = 12,
+    min_stay_hours: float = 2.0,
+) -> str:
+    """Discover rare one-time destinations as a weekend 'memory blindbox'.
+
+    Finds places visited only once in the lookback period, where the car
+    stayed for at least min_stay_hours -- good candidates for a surprise
+    'where was I?' weekend trip recommendation.
+
+    Args:
+        months_lookback: How many months to search back (default: 12)
+        min_stay_hours: Minimum stay duration in hours (default: 2.0)
+    """
+    import json
+    import random
+
+    cutoff = (datetime.now() - timedelta(days=months_lookback * 30)).isoformat()
+    min_stay_min = int(min_stay_hours * 60)
+
+    # Window-function query: LEAD to compute stay gap, COUNT to compute visit frequency
+    rows = _query(
+        f"""
+        WITH ranked AS (
+            SELECT
+                d.id,
+                d.start_date,
+                d.end_date,
+                d.distance,
+                d.outside_temp_avg,
+                d.end_address_id,
+                ea.display_name AS address,
+                ea.name AS address_name,
+                LEAD(d.start_date) OVER (ORDER BY d.start_date) AS next_start,
+                COUNT(*) OVER (PARTITION BY d.end_address_id) AS visit_count
+            FROM drives d
+            LEFT JOIN addresses ea ON d.end_address_id = ea.id
+            WHERE d.car_id = {CAR_ID}
+              AND d.start_date >= %s
+              AND d.end_date IS NOT NULL
+        )
+        SELECT
+            id, start_date, end_date, distance, outside_temp_avg,
+            address, address_name,
+            EXTRACT(EPOCH FROM (next_start - end_date)) / 60 AS stay_min,
+            visit_count
+        FROM ranked
+        WHERE visit_count = 1
+          AND next_start IS NOT NULL
+          AND EXTRACT(EPOCH FROM (next_start - end_date)) / 60 >= %s
+        ORDER BY start_date DESC
+        """,
+        (cutoff, min_stay_min),
+    )
+
+    # Exclude common place names
+    exclude_keywords = ["家", "home", "公司", "office", "公司地址"]
+    filtered = [
+        r for r in rows
+        if r.get("address")
+        and not any(kw.lower() in (r.get("address") or "").lower()
+                    or kw.lower() in (r.get("address_name") or "").lower()
+                    for kw in exclude_keywords)
+    ]
+
+    if not filtered:
+        return json.dumps({
+            "blindbox": None,
+            "message": f"在近 {months_lookback} 个月内没有找到符合条件的'记忆盲盒'目的地",
+        }, ensure_ascii=False, indent=2)
+
+    chosen = random.choice(filtered)
+
+    stay_min = chosen.get("stay_min") or 0
+    stay_h = int(stay_min // 60)
+    stay_m = int(stay_min % 60)
+    stay_label = f"{stay_h}h {stay_m}m" if stay_h > 0 else f"{stay_m}m"
+
+    result = {
+        "date": str(chosen["start_date"])[:10],
+        "location": chosen["address"] or chosen["address_name"] or "未知地点",
+        "stay_duration": stay_label,
+        "stay_duration_min": round(stay_min),
+        "distance_that_day_km": round(chosen["distance"] or 0, 1),
+        "weather_temp_c": round(chosen["outside_temp_avg"], 1) if chosen.get("outside_temp_avg") is not None else None,
+        "metadata": "Found a rare memory for your blindbox! 这是一段尘封的独特记忆，等你周末去重新发现。",
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def generate_monthly_driving_report(
+    target_month: str | None = None,
+    electricity_price: float = 0.5,
+) -> str:
+    """Generate a polished Markdown monthly driving report with Emoji.
+
+    Args:
+        target_month: Month in 'YYYY-MM' format. Defaults to previous month.
+        electricity_price: RMB/kWh fallback when cost is not recorded (default: 0.5)
+    """
+    if target_month is None:
+        today = datetime.now()
+        first_of_month = datetime(today.year, today.month, 1)
+        last_month = first_of_month - timedelta(days=1)
+        target_month = last_month.strftime("%Y-%m")
+
+    year, month = map(int, target_month.split("-"))
+    start = datetime(year, month, 1)
+    if month == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, month + 1, 1)
+
+    start_iso = start.isoformat()
+    end_iso = end.isoformat()
+
+    # -- Drive stats
+    drive_rows = _query(
+        f"""
+        SELECT
+            COUNT(id) AS trip_count,
+            COALESCE(SUM(distance), 0) AS total_km,
+            COALESCE(SUM(duration_min), 0) AS total_min,
+            COALESCE(MAX(distance), 0) AS max_single_km,
+            COALESCE(MAX(speed_max), 0) AS max_speed_kmh
+        FROM drives
+        WHERE car_id = {CAR_ID} AND start_date >= %s AND start_date < %s
+        """,
+        (start_iso, end_iso),
+    )
+    drive_r = drive_rows[0] if drive_rows else {}
+    trip_count = drive_r.get("trip_count") or 0
+    total_km = drive_r.get("total_km") or 0.0
+    total_min = drive_r.get("total_min") or 0
+    max_single_km = drive_r.get("max_single_km") or 0.0
+    max_speed_kmh = drive_r.get("max_speed_kmh") or 0.0
+
+    # -- Charge stats
+    charge_rows = _query(
+        f"""
+        SELECT
+            COUNT(id) AS charge_count,
+            COALESCE(SUM(charge_energy_added), 0) AS total_kwh,
+            COALESCE(SUM(cost), 0) AS total_cost
+        FROM charging_processes
+        WHERE car_id = {CAR_ID} AND start_date >= %s AND start_date < %s
+          AND end_date IS NOT NULL
+        """,
+        (start_iso, end_iso),
+    )
+    charge_r = charge_rows[0] if charge_rows else {}
+    charge_count = charge_r.get("charge_count") or 0
+    total_kwh = charge_r.get("total_kwh") or 0.0
+    total_cost = charge_r.get("total_cost") or 0.0
+
+    if total_cost == 0 and total_kwh > 0:
+        total_cost = round(total_kwh * electricity_price, 2)
+
+    # -- Vampire drain in the month (for penalty)
+    vampire_rows = _query(
+        f"""
+        WITH ordered AS (
+            SELECT date, battery_level,
+                   LAG(battery_level) OVER (ORDER BY date) AS prev_level,
+                   LAG(date) OVER (ORDER BY date) AS prev_date
+            FROM positions
+            WHERE car_id = {CAR_ID} AND date >= %s AND date < %s
+              AND battery_level IS NOT NULL
+            ORDER BY date
+        )
+        SELECT prev_level - battery_level AS drain,
+               EXTRACT(EPOCH FROM (date - prev_date)) / 3600 AS hours_gap
+        FROM ordered
+        WHERE prev_level IS NOT NULL
+          AND prev_level - battery_level > 0
+          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
+          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
+        """,
+        (start_iso, end_iso),
+    )
+    vampire_penalty = 0
+    if vampire_rows:
+        total_drain = sum(r.get("drain", 0) for r in vampire_rows)
+        if total_drain > 15:
+            vampire_penalty = 2
+
+    # -- Efficiency and score
+    avg_eff_wh_km = round(total_kwh * 1000 / total_km, 1) if total_km > 0 else 0
+    cost_per_km = round(total_cost / total_km, 3) if total_km > 0 else 0
+    eff_penalty = max(0, int((avg_eff_wh_km - 150) / 10))
+    speed_penalty = 2 if max_speed_kmh > 130 else 0
+    score = max(0, min(100, 100 - eff_penalty - speed_penalty - vampire_penalty))
+
+    # -- Fun comments
+    if score >= 95:
+        comment = "温柔如水的黄金右脚，堪称完美司机"
+    elif score >= 85:
+        comment = "省电小能手，继续保持哦"
+    elif score >= 70:
+        comment = "日常通勤表现良好，偶尔小飙一下"
+    elif score >= 50:
+        comment = "驾驶习惯偏激烈，建议佛系一点"
+    else:
+        comment = "随时准备起飞的火箭领航员，已脱离地球引力"
+
+    total_hours = round(total_min / 60, 1)
+
+    lines = [
+        f"# 📊 特斯拉月度运行报告 | {target_month}",
+        "",
+        "**🚗 行驶轨迹**",
+        f"- 累计行驶：[{total_km:.0f}] km",
+        f"- 驾驶时长：[{total_hours:.1f}] 小时",
+        f"- 单次最远：[{max_single_km:.0f}] km",
+        "",
+        "**⚡ 补能与消耗**",
+        f"- 充电次数：[{charge_count}] 次",
+        f"- 累计充入：[{total_kwh:.1f}] kWh",
+        f"- 预估电费：¥[{total_cost:.2f}] (每公里仅需 ¥[{cost_per_km:.3f}])",
+        f"- 平均能耗：[{avg_eff_wh_km:.0f}] Wh/km",
+        "",
+        "**🏆 驾驶档案**",
+        f"- 综合评分：[{score}]/100",
+        f"- 极客点评：{comment}",
+        "---",
+        "*Generated by TeslaMate MCP*",
+    ]
+
+    return "\n".join(lines)
+
+
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
