@@ -8,7 +8,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir -e .
 
-COPY tesla.py ./
+COPY tesla.py tesla_auth.py ./
 
 EXPOSE 8080
 

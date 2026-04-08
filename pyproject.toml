@@ -17,7 +17,7 @@ mcp-teslamate-fleet = "tesla:mcp.run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-include = ["tesla.py"]
+include = ["tesla.py", "tesla_auth.py"]
 
 [build-system]
 requires = ["hatchling"]
