@@ -47,9 +47,13 @@ Environment variables:
   TESLA_BATTERY_RANGE_KM — EPA range at 100% in km (default: 525)
 
   # Cost defaults (overridable per-tool-call)
-  TESLA_ELECTRICITY_RATE — $/kWh (default: 0.12)
+  TESLA_ELECTRICITY_RATE_USD — $/kWh (default: 0.12)
+  TESLA_ELECTRICITY_RATE_RMB — Electricity cost in RMB/kWh (default: 0.6)
   TESLA_GAS_PRICE        — $/gallon for comparison (default: 3.50)
   TESLA_GAS_MPG          — Comparable gas vehicle MPG (default: 28)
+
+  # Units (metric)
+  USE_METRIC_UNITS       — Set "true" for km, °C, kWh/100km, ¥ (default: false/imperial)
 """
 
 from __future__ import annotations
@@ -92,9 +96,13 @@ BATTERY_RANGE_KM = float(os.environ.get("TESLA_BATTERY_RANGE_KM", "525"))
 KWH_PER_KM = BATTERY_KWH / BATTERY_RANGE_KM
 
 # Cost defaults
-ELECTRICITY_RATE = float(os.environ.get("TESLA_ELECTRICITY_RATE", "0.12"))
+ELECTRICITY_RATE_RMB = float(os.environ.get("TESLA_ELECTRICITY_RATE_RMB", "0.6"))  # RMB/kWh
+ELECTRICITY_RATE = float(os.environ.get("TESLA_ELECTRICITY_RATE_USD", "0.12"))    # USD/kWh (fallback)
 GAS_PRICE = float(os.environ.get("TESLA_GAS_PRICE", "3.50"))
 GAS_MPG = int(os.environ.get("TESLA_GAS_MPG", "28"))
+
+# Units: true = metric (km, °C, kWh/100km), false = imperial (mi, °F, Wh/mi)
+USE_METRIC_UNITS = os.environ.get("USE_METRIC_UNITS", "false").lower() in ("true", "1", "yes")
 
 # TPMS thresholds (bar)
 TPMS_MIN = float(os.environ.get("TESLA_TPMS_MIN_THRESHOLD", "2.0"))
@@ -243,6 +251,41 @@ def _c_to_f(c: float | None) -> int | None:
     return round(c * 9 / 5 + 32) if c is not None else None
 
 
+def _format_distance(km: float) -> str:
+    """Format distance based on USE_METRIC_UNITS."""
+    if USE_METRIC_UNITS:
+        return f"{round(km, 1)} km"
+    return f"{_km_to_mi(km)} mi"
+
+
+def _format_temp(c: float | None) -> str:
+    """Format temperature based on USE_METRIC_UNITS."""
+    if c is None:
+        return "N/A"
+    if USE_METRIC_UNITS:
+        return f"{round(c)}°C"
+    return f"{_c_to_f(c)}°F"
+
+
+def _format_efficiency(kwh: float, km: float) -> str:
+    """Format energy efficiency based on USE_METRIC_UNITS."""
+    if km <= 0:
+        return "N/A"
+    if USE_METRIC_UNITS:
+        wh_per_km = kwh * 1000 / km
+        return f"{round(wh_per_km, 1)} Wh/km"
+    mi = km * 0.621371
+    wh_per_mi = kwh * 1000 / mi
+    return f"{round(wh_per_mi)} Wh/mi"
+
+
+def _format_cost(kwh: float) -> str:
+    """Format electricity cost based on USE_METRIC_UNITS."""
+    if USE_METRIC_UNITS:
+        return f"¥{round(kwh * ELECTRICITY_RATE_RMB, 2)}"
+    return f"${round(kwh * ELECTRICITY_RATE, 2)}"
+
+
 # -- TeslaMate Read Tools ------------------------------------------------------
 
 
@@ -331,8 +374,8 @@ async def tesla_status() -> str:
 
     if pos:
         bat = pos.get("battery_level")
-        range_mi = _km_to_mi(pos.get("ideal_battery_range_km"))
-        lines.append(f"Battery: {bat}%" + (f" ({range_mi} mi)" if range_mi else ""))
+        range_km = pos.get("ideal_battery_range_km")
+        lines.append(f"Battery: {bat}%" + (f" ({_format_distance(range_km)})" if range_km else ""))
 
         is_charging = (
             charge
@@ -346,27 +389,27 @@ async def tesla_status() -> str:
             lines.append("Charging: Not charging")
 
         if pos.get("is_climate_on"):
-            inside_f = _c_to_f(pos.get("inside_temp"))
-            target_f = _c_to_f(pos.get("driver_temp_setting"))
+            inside_t = _format_temp(pos.get("inside_temp"))
+            target_t = _format_temp(pos.get("driver_temp_setting"))
             line = "Climate: ON"
-            if inside_f is not None:
-                line += f", cabin {inside_f}°F"
-            if target_f is not None:
-                line += f", target {target_f}°F"
+            if inside_t != "N/A":
+                line += f", cabin {inside_t}"
+            if target_t != "N/A":
+                line += f", target {target_t}"
             lines.append(line)
         else:
-            inside_f = _c_to_f(pos.get("inside_temp"))
-            outside_f = _c_to_f(pos.get("outside_temp"))
+            inside_t = _format_temp(pos.get("inside_temp"))
+            outside_t = _format_temp(pos.get("outside_temp"))
             parts = ["Climate: Off"]
-            if inside_f is not None:
-                parts.append(f"cabin {inside_f}°F")
-            if outside_f is not None:
-                parts.append(f"outside {outside_f}°F")
+            if inside_t != "N/A":
+                parts.append(f"cabin {inside_t}")
+            if outside_t != "N/A":
+                parts.append(f"outside {outside_t}")
             lines.append(", ".join(parts))
 
-        odo_mi = _km_to_mi(pos.get("odometer"))
-        if odo_mi:
-            lines.append(f"Odometer: {round(odo_mi):,} mi")
+        odo_km = pos.get("odometer")
+        if odo_km:
+            lines.append(f"Odometer: {_format_distance(odo_km)}")
 
         if state:
             vehicle_state = state.get("state", "unknown")
@@ -480,7 +523,6 @@ async def tesla_drives(days: int = 30) -> str:
     for r in rows:
         dist_km = r.get("distance") or 0
         total_km += dist_km
-        dist_mi = _km_to_mi(dist_km) or 0
         dur = r.get("duration_min") or 0
         total_min += dur
         start = r.get("start_location") or "?"
@@ -491,20 +533,15 @@ async def tesla_drives(days: int = 30) -> str:
         kwh = max(0, (range_start - range_end) * KWH_PER_KM)
         total_kwh += kwh
 
-        eff_str = ""
-        if dist_km > 0 and kwh > 0:
-            wh_per_mi = round(kwh * 1000 / (dist_km * 0.621371))
-            eff_str = f", {wh_per_mi} Wh/mi"
+        eff_str = _format_efficiency(kwh, dist_km) if dist_km > 0 and kwh > 0 else ""
 
-        lines.append(f"- {date_str}: {dist_mi} mi, {dur} min, {start} → {end}{eff_str}")
+        lines.append(f"- {date_str}: {_format_distance(dist_km)}, {dur} min, {start} → {end}{eff_str}")
 
-    total_mi = _km_to_mi(total_km) or 0
     avg_eff = ""
     if total_km > 0 and total_kwh > 0:
-        avg_wh_per_mi = round(total_kwh * 1000 / (total_km * 0.621371))
-        avg_eff = f", avg {avg_wh_per_mi} Wh/mi"
+        avg_eff = f", avg {_format_efficiency(total_kwh, total_km)}"
     lines.append(
-        f"\n**Total:** {total_mi} mi, {total_kwh:.1f} kWh, "
+        f"\n**Total:** {_format_distance(total_km)}, {total_kwh:.1f} kWh, "
         f"{total_min} min across {len(rows)} trips{avg_eff}"
     )
     return "\n".join(lines)
@@ -696,11 +733,11 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20) ->
     lines = [f"**{category.upper()} Trips** ({len(classified)} results)\n"]
     for r in classified:
         date = str(r.get("start_date", ""))[:16]
-        dist_mi = _km_to_mi(r.get("distance") or 0)
+        dist_km = r.get("distance") or 0
         dur = r.get("duration_min") or 0
         start = r.get("start_location") or "?"
         end = r.get("end_location") or "?"
-        lines.append(f"- {date}: {dist_mi} mi, {dur} min, {start} → {end}")
+        lines.append(f"- {date}: {_format_distance(dist_km)}, {dur} min, {start} → {end}")
     return "\n".join(lines)
 
 
@@ -772,21 +809,21 @@ async def tesla_battery_health() -> str:
 
         lines = ["**Battery Health** (snapshots at ~100% charge)\n"]
         for r in rows:
-            range_mi = _km_to_mi(r.get("ideal_battery_range_km"))
+            range_km = r.get("ideal_battery_range_km")
             date_str = str(r.get("date", ""))[:10]
-            lines.append(f"- {date_str}: {range_mi} mi ideal range at 100%")
+            lines.append(f"- {date_str}: {_format_distance(range_km)} ideal range at 100%")
         return "\n".join(lines)
 
     lines = ["**Battery Health** (monthly averages at 100% charge)\n"]
     for r in rows:
-        range_mi = _km_to_mi(r.get("avg_ideal_km"))
+        range_km = r.get("avg_ideal_km")
         month = str(r.get("month", ""))[:7]
         samples = r.get("samples", 0)
-        lines.append(f"- {month}: {range_mi} mi ideal range ({samples} samples)")
+        lines.append(f"- {month}: {_format_distance(range_km)} ideal range ({samples} samples)")
 
     if len(rows) >= 2:
-        newest = _km_to_mi(rows[0].get("avg_ideal_km")) or 0
-        oldest = _km_to_mi(rows[-1].get("avg_ideal_km")) or 0
+        newest = rows[0].get("avg_ideal_km") or 0
+        oldest = rows[-1].get("avg_ideal_km") or 0
         if oldest > 0:
             deg_pct = round((1 - newest / oldest) * 100, 1)
             lines.append(f"\n**Degradation:** {deg_pct}% over {len(rows)} months")
@@ -824,20 +861,16 @@ async def tesla_efficiency(days: int = 90) -> str:
     lines = [f"**Efficiency** (last {days} days, weekly)\n"]
     for r in rows:
         km = r.get("total_km") or 0
-        mi = _km_to_mi(km) or 0
         kwh = r.get("total_kwh") or 0
         trips = r.get("trips", 0)
         week = str(r.get("week", ""))[:10]
         temp = r.get("avg_temp")
-        temp_str = f", avg {_c_to_f(temp)}°F" if temp is not None else ""
+        temp_str = f", avg {_format_temp(temp)}" if temp is not None else ""
 
-        eff_str = ""
-        if km > 0 and kwh > 0:
-            wh_per_mi = round(kwh * 1000 / (km * 0.621371))
-            eff_str = f", {wh_per_mi} Wh/mi"
+        eff_str = _format_efficiency(kwh, km) if km > 0 and kwh > 0 else ""
 
         lines.append(
-            f"- {week}: {mi} mi, {kwh:.1f} kWh, {trips} trips{eff_str}{temp_str}"
+            f"- {week}: {_format_distance(km)}, {kwh:.1f} kWh, {trips} trips{eff_str}{temp_str}"
         )
 
     return "\n".join(lines)
@@ -1004,9 +1037,15 @@ async def tesla_live() -> str:
 
     vehicle_name = vs.get("vehicle_name") or "Tesla"
     lines = [f"**{vehicle_name}** (live)\n"]
-    lines.append(
-        f"Battery: {cs.get('battery_level')}% ({cs.get('battery_range', 0):.0f} mi)"
-    )
+
+    # Battery range - API returns miles
+    bat_range = cs.get('battery_range', 0)
+    if USE_METRIC_UNITS:
+        bat_range_km = round(bat_range * 1.60934)
+        lines.append(f"Battery: {cs.get('battery_level')}% ({bat_range_km} km)")
+    else:
+        lines.append(f"Battery: {cs.get('battery_level')}% ({bat_range:.0f} mi)")
+
     lines.append(
         f"Charging: {cs.get('charging_state')} (limit {cs.get('charge_limit_soc')}%)"
     )
@@ -1014,25 +1053,41 @@ async def tesla_live() -> str:
         rate = cs.get("charge_rate", 0)
         added = cs.get("charge_energy_added", 0)
         mins = cs.get("minutes_to_full_charge", 0)
-        lines.append(f"  Rate: {rate} mph, {added:.1f} kWh added, {mins} min to full")
+        if USE_METRIC_UNITS:
+            rate_kmh = round(rate * 1.60934)
+            lines.append(f"  Rate: {rate_kmh} km/h, {added:.1f} kWh added, {mins} min to full")
+        else:
+            lines.append(f"  Rate: {rate} mph, {added:.1f} kWh added, {mins} min to full")
 
-    inside_f = _c_to_f(cl.get("inside_temp"))
-    outside_f = _c_to_f(cl.get("outside_temp"))
+    inside_t = _format_temp(cl.get("inside_temp"))
+    outside_t = _format_temp(cl.get("outside_temp"))
     lines.append(
         f"Climate: {'ON' if cl.get('is_climate_on') else 'Off'}"
-        f", inside {inside_f}°F, outside {outside_f}°F"
+        f", inside {inside_t}, outside {outside_t}"
     )
     if cl.get("is_climate_on"):
-        target_f = _c_to_f(cl.get("driver_temp_setting"))
-        lines.append(f"  Target: {target_f}°F")
+        target_t = _format_temp(cl.get("driver_temp_setting"))
+        lines.append(f"  Target: {target_t}")
 
     lines.append(f"Locked: {'Yes' if vs.get('locked') else 'No'}")
     lines.append(f"Sentry: {'On' if vs.get('sentry_mode') else 'Off'}")
     lines.append(f"Software: {vs.get('car_version', '?')}")
-    lines.append(f"Odometer: {vs.get('odometer', 0):.0f} mi")
+
+    # Odometer - API returns miles
+    odo = vs.get('odometer', 0)
+    if USE_METRIC_UNITS:
+        odo_km = round(odo * 1.60934)
+        lines.append(f"Odometer: {odo_km:,} km")
+    else:
+        lines.append(f"Odometer: {odo:,.0f} mi")
 
     if ds.get("speed"):
-        lines.append(f"Driving: {ds['speed']} mph")
+        speed = ds['speed']
+        if USE_METRIC_UNITS:
+            speed_kmh = round(speed * 1.60934)
+            lines.append(f"Driving: {speed_kmh} km/h")
+        else:
+            lines.append(f"Driving: {speed} mph")
     else:
         lines.append("Driving: Parked")
 
@@ -1040,11 +1095,17 @@ async def tesla_live() -> str:
     for pos, label in [("fl", "FL"), ("fr", "FR"), ("rl", "RL"), ("rr", "RR")]:
         bar = vs.get(f"tpms_pressure_{pos}")
         if bar:
-            psi = round(bar * 14.5038, 1)
             warn = " ⚠" if vs.get(f"tpms_soft_warning_{pos}") else ""
-            tires.append(f"{label}:{psi}{warn}")
+            if USE_METRIC_UNITS:
+                tires.append(f"{label}:{bar:.2f}{warn}")
+            else:
+                psi = round(bar * 14.5038, 1)
+                tires.append(f"{label}:{psi}{warn}")
     if tires:
-        lines.append(f"Tires: {', '.join(tires)} PSI")
+        if USE_METRIC_UNITS:
+            lines.append(f"Tires: {', '.join(tires)} bar")
+        else:
+            lines.append(f"Tires: {', '.join(tires)} PSI")
 
     media = vs.get("media_info", {})
     title = media.get("now_playing_title", "")
@@ -1104,26 +1165,34 @@ async def tesla_savings(
     for label, data in [("This Month", monthly), ("Lifetime", lifetime)]:
         if not data or not data.get("total_km"):
             continue
-        mi = round(data["total_km"] * 0.621371, 1)
+        km = data["total_km"]
         kwh = data["total_kwh"] or 0
-        elec_cost = round(kwh * ELECTRICITY_RATE, 2)
-        gas_cost = round(mi / _mpg * _gas, 2)
-        saved = round(gas_cost - elec_cost, 2)
-        cost_per_mi = round(elec_cost / mi * 100, 1) if mi > 0 else 0
 
-        lines.append(f"**{label}:** {mi:,.1f} mi")
-        lines.append(
-            f"  Electricity: {kwh:,.1f} kWh × ${ELECTRICITY_RATE} = ${elec_cost:,.2f}"
-        )
-        lines.append(
-            f"  Gas equivalent: {mi:,.1f} mi ÷ {_mpg} MPG × "
-            f"${_gas}/gal = ${gas_cost:,.2f}"
-        )
-        lines.append(
-            f"  **Saved: ${saved:,.2f}** ({cost_per_mi}¢/mi electric vs "
-            f"{round(_gas / _mpg * 100, 1)}¢/mi gas)"
-        )
-        lines.append("")
+        if USE_METRIC_UNITS:
+            elec_cost = round(kwh * ELECTRICITY_RATE_RMB, 2)
+            lines.append(f"**{label}:** {km:,.1f} km")
+            lines.append(f"  Electricity: {kwh:,.1f} kWh × ¥{ELECTRICITY_RATE_RMB} = ¥{elec_cost:,.2f}")
+            lines.append("")
+        else:
+            mi = round(km * 0.621371, 1)
+            elec_cost = round(kwh * ELECTRICITY_RATE, 2)
+            gas_cost = round(mi / _mpg * _gas, 2)
+            saved = round(gas_cost - elec_cost, 2)
+            cost_per_mi = round(elec_cost / mi * 100, 1) if mi > 0 else 0
+
+            lines.append(f"**{label}:** {mi:,.1f} mi")
+            lines.append(
+                f"  Electricity: {kwh:,.1f} kWh × ${ELECTRICITY_RATE} = ${elec_cost:,.2f}"
+            )
+            lines.append(
+                f"  Gas equivalent: {mi:,.1f} mi ÷ {_mpg} MPG × "
+                f"${_gas}/gal = ${gas_cost:,.2f}"
+            )
+            lines.append(
+                f"  **Saved: ${saved:,.2f}** ({cost_per_mi}¢/mi electric vs "
+                f"{round(_gas / _mpg * 100, 1)}¢/mi gas)"
+            )
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -1186,33 +1255,63 @@ async def tesla_trip_cost(
         FROM drives WHERE car_id = {CAR_ID}
           AND start_date >= NOW() - INTERVAL '30 days' AND distance > 0
     """)
-    wh_per_mi = 300  # default
-    if eff and eff["km"] > 0:
-        wh_per_mi = round(eff["kwh"] * 1000 / (eff["km"] * 0.621371))
 
-    kwh_round = round(round_trip * wh_per_mi / 1000, 1)
-    cost_round = round(kwh_round * ELECTRICITY_RATE, 2)
-    gas_equiv = round(round_trip / _mpg * _gas, 2)
+    if USE_METRIC_UNITS:
+        wh_per_km = 180  # default Wh/km
+        if eff and eff["km"] > 0:
+            wh_per_km = round(eff["kwh"] * 1000 / eff["km"])
+        road_km = round(straight_mi * 1.60934 * 1.3, 1)
+        round_trip_km = round(road_km * 2, 1)
+        kwh_round = round(round_trip_km * wh_per_km / 1000, 1)
+        cost_round = round(kwh_round * ELECTRICITY_RATE_RMB, 2)
 
-    bat = pos.get("battery_level", 0)
-    range_mi = round((pos.get("ideal_battery_range_km") or 0) * 0.621371)
+        bat = pos.get("battery_level", 0)
+        range_km = round(pos.get("ideal_battery_range_km") or 0)
 
-    lines = [
-        f"**Trip to {dest_name}** ({road_mi} mi each way, {round_trip} mi round trip)\n"
-    ]
-    lines.append(f"Estimated: {kwh_round} kWh @ {wh_per_mi} Wh/mi (your 30-day avg)")
-    lines.append(f"Cost: ${cost_round} (gas equivalent: ${gas_equiv})")
-    lines.append(f"Current battery: {bat}% ({range_mi} mi)")
+        lines = [
+            f"**Trip to {dest_name}** ({road_km} km each way, {round_trip_km} km round trip)\n"
+        ]
+        lines.append(f"Estimated: {kwh_round} kWh @ {wh_per_km} Wh/km (your 30-day avg)")
+        lines.append(f"Cost: ¥{cost_round}")
+        lines.append(f"Current battery: {bat}% ({_format_distance(range_km)})")
 
-    if range_mi >= round_trip:
-        lines.append("Range: Sufficient for round trip")
-    elif range_mi >= road_mi:
-        lines.append("Range: Sufficient one-way, charge at destination for return")
+        if range_km >= round_trip_km:
+            lines.append("Range: Sufficient for round trip")
+        elif range_km >= road_km:
+            lines.append("Range: Sufficient one-way, charge at destination for return")
+        else:
+            pct_needed = min(95, round(round_trip_km / range_km * bat)) if range_km > 0 else 95
+            lines.append(
+                f"Range: NOT sufficient — charge to {pct_needed}%+ before departure"
+            )
     else:
-        pct_needed = min(95, round(round_trip / range_mi * bat)) if range_mi > 0 else 95
-        lines.append(
-            f"Range: NOT sufficient — charge to {pct_needed}%+ before departure"
-        )
+        wh_per_mi = 300  # default
+        if eff and eff["km"] > 0:
+            wh_per_mi = round(eff["kwh"] * 1000 / (eff["km"] * 0.621371))
+
+        kwh_round = round(round_trip * wh_per_mi / 1000, 1)
+        cost_round = round(kwh_round * ELECTRICITY_RATE, 2)
+        gas_equiv = round(round_trip / _mpg * _gas, 2)
+
+        bat = pos.get("battery_level", 0)
+        range_mi = round((pos.get("ideal_battery_range_km") or 0) * 0.621371)
+
+        lines = [
+            f"**Trip to {dest_name}** ({road_mi} mi each way, {round_trip} mi round trip)\n"
+        ]
+        lines.append(f"Estimated: {kwh_round} kWh @ {wh_per_mi} Wh/mi (your 30-day avg)")
+        lines.append(f"Cost: ${cost_round} (gas equivalent: ${gas_equiv})")
+        lines.append(f"Current battery: {bat}% ({range_mi} mi)")
+
+        if range_mi >= round_trip:
+            lines.append("Range: Sufficient for round trip")
+        elif range_mi >= road_mi:
+            lines.append("Range: Sufficient one-way, charge at destination for return")
+        else:
+            pct_needed = min(95, round(round_trip / range_mi * bat)) if range_mi > 0 else 95
+            lines.append(
+                f"Range: NOT sufficient — charge to {pct_needed}%+ before departure"
+            )
 
     return "\n".join(lines)
 
@@ -1250,17 +1349,41 @@ async def tesla_efficiency_by_temp() -> str:
     if not rows:
         return "Not enough driving data with temperature readings."
 
-    lines = ["**Efficiency by Temperature**\n"]
-    lines.append(f"{'Temp Range':<15} {'Trips':>6} {'Wh/mi':>8} {'Miles':>10}")
-    lines.append("-" * 45)
-    for r in rows:
-        km = r.get("total_km") or 0
-        kwh = r.get("total_kwh") or 0
-        mi = km * 0.621371
-        wh_mi = round(kwh * 1000 / mi) if mi > 0 else 0
-        lines.append(
-            f"{r['temp_range']:<15} {r['trips']:>6} {wh_mi:>7} {round(mi):>9,}"
-        )
+    if USE_METRIC_UNITS:
+        # Temperature bins in Celsius
+        temp_bins = {
+            'Below 32°F': 'Below 0°C',
+            '32-40°F': '0-4°C',
+            '40-50°F': '4-10°C',
+            '50-60°F': '10-16°C',
+            '60-70°F': '16-21°C',
+            '70-80°F': '21-27°C',
+            '80-90°F': '27-32°C',
+            'Above 90°F': 'Above 32°C',
+        }
+        lines = ["**Efficiency by Temperature**\n"]
+        lines.append(f"{'Temp Range':<15} {'Trips':>6} {'Wh/km':>8} {'km':>10}")
+        lines.append("-" * 45)
+        for r in rows:
+            km = r.get("total_km") or 0
+            kwh = r.get("total_kwh") or 0
+            wh_per_km = round(kwh * 1000 / km) if km > 0 else 0
+            temp_range = temp_bins.get(r['temp_range'], r['temp_range'])
+            lines.append(
+                f"{temp_range:<15} {r['trips']:>6} {wh_per_km:>7} {round(km):>9,}"
+            )
+    else:
+        lines = ["**Efficiency by Temperature**\n"]
+        lines.append(f"{'Temp Range':<15} {'Trips':>6} {'Wh/mi':>8} {'Miles':>10}")
+        lines.append("-" * 45)
+        for r in rows:
+            km = r.get("total_km") or 0
+            kwh = r.get("total_kwh") or 0
+            mi = km * 0.621371
+            wh_mi = round(kwh * 1000 / mi) if mi > 0 else 0
+            lines.append(
+                f"{r['temp_range']:<15} {r['trips']:>6} {wh_mi:>7} {round(mi):>9,}"
+            )
 
     return "\n".join(lines)
 
@@ -1296,8 +1419,8 @@ async def tesla_charging_by_location() -> str:
         loc = r.get("location") or "Unknown"
         sessions = r.get("sessions", 0)
         kwh = r.get("total_kwh", 0)
-        cost = round(kwh * ELECTRICITY_RATE, 2)
-        lines.append(f"- **{loc}**: {sessions} sessions, {kwh:.1f} kWh (~${cost})")
+        cost_str = _format_cost(kwh)
+        lines.append(f"- **{loc}**: {sessions} sessions, {kwh:.1f} kWh (~{cost_str})")
 
     return "\n".join(lines)
 
@@ -1331,8 +1454,8 @@ async def tesla_top_destinations(limit: int = 15) -> str:
     for i, r in enumerate(rows, 1):
         dest = r.get("destination") or "Unknown"
         visits = r.get("visits", 0)
-        mi = round((r.get("total_km") or 0) * 0.621371)
-        lines.append(f"{i}. {dest} — {visits} visits ({mi:,} mi total)")
+        km = r.get("total_km") or 0
+        lines.append(f"{i}. {dest} — {visits} visits ({_format_distance(km)} total)")
 
     return "\n".join(lines)
 
@@ -1366,13 +1489,13 @@ async def tesla_longest_trips(limit: int = 10) -> str:
 
     lines = ["**Longest Trips**\n"]
     for i, r in enumerate(rows, 1):
-        mi = round((r.get("distance") or 0) * 0.621371, 1)
+        dist_km = r.get("distance") or 0
         dur = r.get("duration_min") or 0
         start = r.get("start_loc") or "?"
         end = r.get("end_loc") or "?"
         date = str(r.get("start_date", ""))[:10]
         kwh = r.get("consumption_kwh") or 0
-        lines.append(f"{i}. {mi} mi — {start} → {end} ({date}, {dur}min, {kwh:.1f}kWh)")
+        lines.append(f"{i}. {_format_distance(dist_km)} — {start} → {end} ({date}, {dur}min, {kwh:.1f}kWh)")
 
     return "\n".join(lines)
 
@@ -1415,9 +1538,6 @@ async def tesla_monthly_report(year: int, month: int) -> str:
     km = r.get("total_km") or 0
     kwh = r.get("total_kwh") or 0
     minutes = r.get("total_min") or 0
-    mi = round(km * 0.621371)
-    wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
-    cost = round(kwh * ELECTRICITY_RATE, 2)
 
     # Previous month for comparison
     prev_rows = _query(
@@ -1435,13 +1555,25 @@ async def tesla_monthly_report(year: int, month: int) -> str:
     prev_km = prev_r.get("total_km") or 0
     prev_kwh = prev_r.get("total_kwh") or 0
 
-    lines = [f"**Monthly Report — {year}-{month:02d}**\n"]
-    lines.append(f"Trips: {trips}")
-    lines.append(f"Distance: {mi} mi ({km:.1f} km)")
-    lines.append(f"Energy: {kwh:.1f} kWh")
-    lines.append(f"Avg efficiency: {wh_mi} Wh/mi")
-    lines.append(f"Est. cost: ${cost}")
-    lines.append(f"Time driving: {minutes} min")
+    if USE_METRIC_UNITS:
+        lines = [f"**Monthly Report — {year}-{month:02d}**\n"]
+        lines.append(f"Trips: {trips}")
+        lines.append(f"Distance: {km:.1f} km")
+        lines.append(f"Energy: {kwh:.1f} kWh")
+        lines.append(f"Avg efficiency: {_format_efficiency(kwh, km)}")
+        lines.append(f"Est. cost: {_format_cost(kwh)}")
+        lines.append(f"Time driving: {minutes} min")
+    else:
+        mi = round(km * 0.621371)
+        wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
+        cost = round(kwh * ELECTRICITY_RATE, 2)
+        lines = [f"**Monthly Report — {year}-{month:02d}**\n"]
+        lines.append(f"Trips: {trips}")
+        lines.append(f"Distance: {mi} mi ({km:.1f} km)")
+        lines.append(f"Energy: {kwh:.1f} kWh")
+        lines.append(f"Avg efficiency: {wh_mi} Wh/mi")
+        lines.append(f"Est. cost: ${cost}")
+        lines.append(f"Time driving: {minutes} min")
 
     if prev_km > 0:
         dist_delta = round((km - prev_km) / prev_km * 100)
@@ -1577,23 +1709,41 @@ async def tesla_monthly_summary(months: int = 6) -> str:
     if not rows:
         return "No driving data yet."
 
-    lines = ["**Monthly Summary**\n"]
-    lines.append(
-        f"{'Month':<12} {'Trips':>6} {'Miles':>10} {'kWh':>8} {'Wh/mi':>7} {'Cost':>8}"
-    )
-    lines.append("-" * 57)
-
-    for r in rows:
-        month = str(r.get("month", ""))[:7]
-        trips = r.get("trips", 0)
-        km = r.get("total_km") or 0
-        mi = round(km * 0.621371)
-        kwh = r.get("total_kwh") or 0
-        wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
-        cost = round(kwh * ELECTRICITY_RATE, 2)
+    if USE_METRIC_UNITS:
+        lines = ["**Monthly Summary**\n"]
         lines.append(
-            f"{month:<12} {trips:>6} {mi:>9,} {kwh:>7.1f} {wh_mi:>7} ${cost:>6.2f}"
+            f"{'Month':<12} {'Trips':>6} {'km':>10} {'kWh':>8} {'Wh/km':>7} {'Cost':>8}"
         )
+        lines.append("-" * 57)
+
+        for r in rows:
+            month = str(r.get("month", ""))[:7]
+            trips = r.get("trips", 0)
+            km = r.get("total_km") or 0
+            kwh = r.get("total_kwh") or 0
+            eff_str = _format_efficiency(kwh, km) if km > 0 else "N/A"
+            cost_str = _format_cost(kwh)
+            lines.append(
+                f"{month:<12} {trips:>6} {km:>9,} {kwh:>7.1f} {eff_str:>7} {cost_str:>8}"
+            )
+    else:
+        lines = ["**Monthly Summary**\n"]
+        lines.append(
+            f"{'Month':<12} {'Trips':>6} {'Miles':>10} {'kWh':>8} {'Wh/mi':>7} {'Cost':>8}"
+        )
+        lines.append("-" * 57)
+
+        for r in rows:
+            month = str(r.get("month", ""))[:7]
+            trips = r.get("trips", 0)
+            km = r.get("total_km") or 0
+            mi = round(km * 0.621371)
+            kwh = r.get("total_kwh") or 0
+            wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
+            cost = round(kwh * ELECTRICITY_RATE, 2)
+            lines.append(
+                f"{month:<12} {trips:>6} {mi:>9,} {kwh:>7.1f} {wh_mi:>7} ${cost:>6.2f}"
+            )
 
     return "\n".join(lines)
 
