@@ -137,17 +137,17 @@ def _limit_sql(raw_limit: int | None) -> str:
         return ""
     return f"LIMIT {int(raw_limit)}"
 
-LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "200"))
-LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "200"))
-LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "200"))
-LIMIT_BATTERY_HEALTH     = int(os.environ.get("TESLA_LIMIT_BATTERY_HEALTH", "36"))
+LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "500"))
+LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "500"))
+LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "500"))
+LIMIT_BATTERY_HEALTH     = int(os.environ.get("TESLA_LIMIT_BATTERY_HEALTH", "60"))
 LIMIT_BATTERY_SAMPLES    = int(os.environ.get("TESLA_LIMIT_BATTERY_SAMPLES", "20"))
-LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "30"))
-LIMIT_STATE_HISTORY      = int(os.environ.get("TESLA_LIMIT_STATE_HISTORY", "200"))
+LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "50"))
+LIMIT_STATE_HISTORY      = int(os.environ.get("TESLA_LIMIT_STATE_HISTORY", "500"))
 LIMIT_SOFTWARE_UPDATES   = int(os.environ.get("TESLA_LIMIT_SOFTWARE_UPDATES", "20"))
-LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "30"))
+LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "50"))
 LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "30"))
-LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "30"))
+LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "50"))
 
 mcp = FastMCP("tesla")
 
@@ -280,7 +280,9 @@ def _cached_query_one(key: str, sql: str, params: tuple = (), ttl: int = 300) ->
 
 def _km_to_mi(km: float | None) -> float | None:
     """Convert km to miles, handling None."""
-    return round(km * 0.621371, 1) if km else None
+    if km is None:
+        return None
+    return round(km * 0.621371, 1)
 
 
 def _c_to_f(c: float | None) -> int | None:
@@ -737,7 +739,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20) ->
         WHERE d.car_id = %s AND d.distance > 0
         ORDER BY d.start_date DESC LIMIT %s
         """,
-        (CAR_ID, limit * 3),
+        (CAR_ID, limit * 5),
     )
 
     classified = []
@@ -1912,20 +1914,17 @@ async def tesla_vampire_drain(days: int = 14) -> str:
 
     lines = [f"**Vampire Drain** (last {days} days)\n"]
     total_drain = 0
+    total_hours = 0
     for r in rows:
         drain = r.get("drain", 0)
         total_drain += drain
         hours = r.get("hours_parked", 0)
+        total_hours += hours
         rate = round(drain / hours, 2) if hours > 0 else 0
         date = _format_dt(r.get("prev_date"))[:10]
         lines.append(f"- {date}: -{drain}% over {hours:.0f}h ({rate}%/hr)")
 
-    avg_rate = round(
-        total_drain
-        / len(rows)
-        / (sum(r.get("hours_parked", 8) for r in rows) / len(rows)),
-        2,
-    )
+    avg_rate = round(total_drain / total_hours, 2) if total_hours > 0 else 0
     lines.append(f"\nAverage drain rate: {avg_rate}%/hr")
     if avg_rate > 1.0:
         lines.append(
@@ -2138,36 +2137,27 @@ async def get_vehicle_persona_status(
 
     cutoff = start.isoformat()
 
-    # -- Active: total distance
-    drive_rows = _query(
+    # -- Active: total distance + longest drive (single query)
+    drive_r = _query_one(
         """
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                MAX(duration_min) AS max_single_drive_min,
                MAX(speed_max) AS max_speed_kmh,
-               COUNT(*) AS trip_count
+               COUNT(*) AS trip_count,
+               (SELECT distance FROM drives
+                WHERE car_id = %s AND start_date >= %s
+                ORDER BY duration_min DESC LIMIT 1) AS longest_drive_km
         FROM drives
         WHERE car_id = %s AND start_date >= %s
         """,
-        (CAR_ID, cutoff,),
+        (CAR_ID, cutoff, CAR_ID, cutoff,),
     )
-    drive_r = drive_rows[0] if drive_rows else {}
+    drive_r = drive_r or {}
     total_km = drive_r.get("total_km") or 0.0
     max_single_drive_min = drive_r.get("max_single_drive_min") or 0
     max_speed_kmh = drive_r.get("max_speed_kmh") or 0.0
     trip_count = drive_r.get("trip_count") or 0
-
-    # Longest single drive: find the drive record with max duration
-    longest_drive_row = _query_one(
-        """
-        SELECT distance, duration_min
-        FROM drives
-        WHERE car_id = %s AND start_date >= %s
-        ORDER BY duration_min DESC
-        LIMIT 1
-        """,
-        (CAR_ID, cutoff,),
-    )
-    longest_drive_km = longest_drive_row.get("distance") or 0 if longest_drive_row else 0
+    longest_drive_km = drive_r.get("longest_drive_km") or 0
 
     # -- Idle time: states not 'driving'
     state_rows = _query(
