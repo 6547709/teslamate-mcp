@@ -101,33 +101,6 @@ HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
 
 mcp = FastMCP("tesla")
 
-# -- Rate limiting -------------------------------------------------------------
-
-_command_count: int = 0
-_command_day: str = ""
-DAILY_COMMAND_LIMIT = 40
-
-
-def _check_rate_limit() -> str | None:
-    """Check daily command rate limit. Returns error message or None if OK."""
-    global _command_count, _command_day
-    today = datetime.now().strftime("%Y-%m-%d")
-    if today != _command_day:
-        _command_day = today
-        _command_count = 0
-    if _command_count >= DAILY_COMMAND_LIMIT:
-        return (
-            f"Daily command limit reached ({DAILY_COMMAND_LIMIT}). Resets at midnight."
-        )
-    return None
-
-
-def _log_command(cmd: str) -> None:
-    """Increment command counter."""
-    global _command_count
-    _command_count += 1
-
-
 # -- Owner API Token Decryption -----------------------------------------------
 
 _cached_owner_token: dict | None = None
@@ -201,20 +174,6 @@ async def _owner_api_get(path: str) -> dict:
         )
         resp.raise_for_status()
         return resp.json()
-
-
-# -- Fleet API helpers (deprecated) --------------------------------------------
-
-
-
-async def _fleet_get(path: str) -> dict:
-    """Deprecated: Fleet API is no longer supported. Use Owner API."""
-    raise RuntimeError("Fleet API has been removed. Use Owner API via _owner_api_get().")
-
-
-async def _fleet_command(command: str, body: dict | None = None) -> dict:
-    """Deprecated: Vehicle commands are no longer supported."""
-    return {"error": "Vehicle commands have been removed from this MCP server."}
 
 
 # -- DB helper -----------------------------------------------------------------
@@ -866,141 +825,6 @@ async def tesla_live() -> str:
         )
 
     return "\n".join(lines)
-
-
-# -- Removed Command Tools (Fleet API was discontinued) ----------------------
-
-
-def _cmd_result(result: dict | None, success_msg: str) -> str:
-    """Parse a Fleet API command response into a user-friendly message."""
-    if not result:
-        return "Failed: no response from proxy"
-    if result.get("error"):
-        return f"Failed: {result['error']}"
-    resp = result.get("response", {})
-    if resp and resp.get("result"):
-        return success_msg
-    return f"Failed: {resp.get('reason', 'unknown')}"
-
-
-@mcp.tool()
-async def tesla_climate_on() -> str:
-    """Start climate preconditioning — heats or cools cabin to target temp."""
-    result = await _fleet_command("auto_conditioning_start")
-    return _cmd_result(result, "Climate started. Cabin will reach target temperature.")
-
-
-@mcp.tool()
-async def tesla_climate_off() -> str:
-    """Stop climate preconditioning."""
-    result = await _fleet_command("auto_conditioning_stop")
-    return _cmd_result(result, "Climate stopped.")
-
-
-@mcp.tool()
-async def tesla_set_temp(temp_f: int = 70) -> str:
-    """Set cabin temperature target (Fahrenheit). Both driver and passenger.
-
-    Args:
-        temp_f: Target temperature in Fahrenheit (60-85 reasonable range)
-    """
-    temp_c = round((temp_f - 32) * 5 / 9, 1)
-    result = await _fleet_command(
-        "set_temps",
-        {
-            "driver_temp": temp_c,
-            "passenger_temp": temp_c,
-        },
-    )
-    return _cmd_result(result, f"Temperature set to {temp_f}°F ({temp_c}°C).")
-
-
-@mcp.tool()
-async def tesla_charge_start() -> str:
-    """Start charging (vehicle must be plugged in)."""
-    result = await _fleet_command("charge_start")
-    return _cmd_result(result, "Charging started.")
-
-
-@mcp.tool()
-async def tesla_charge_stop() -> str:
-    """Stop charging."""
-    result = await _fleet_command("charge_stop")
-    return _cmd_result(result, "Charging stopped.")
-
-
-@mcp.tool()
-async def tesla_set_charge_limit(percent: int = 80) -> str:
-    """Set charge limit percentage (50-100).
-
-    Args:
-        percent: Charge limit as percentage. 80% is recommended for daily use.
-    """
-    if percent < 50 or percent > 100:
-        return "Charge limit must be between 50 and 100."
-    result = await _fleet_command("set_charge_limit", {"percent": percent})
-    return _cmd_result(result, f"Charge limit set to {percent}%.")
-
-
-@mcp.tool()
-async def tesla_lock() -> str:
-    """Lock all doors."""
-    result = await _fleet_command("door_lock")
-    return _cmd_result(result, "Doors locked.")
-
-
-@mcp.tool()
-async def tesla_unlock(confirm: bool = False) -> str:
-    """Unlock all doors. Requires confirm=True for safety.
-
-    Args:
-        confirm: Must be True to execute. Prevents accidental unlocks.
-    """
-    if not confirm:
-        return "Unlock requires confirm=True. This will physically unlock the car."
-    result = await _fleet_command("door_unlock")
-    return _cmd_result(result, "Doors unlocked.")
-
-
-@mcp.tool()
-async def tesla_honk() -> str:
-    """Honk the horn."""
-    result = await _fleet_command("honk_horn")
-    return _cmd_result(result, "Horn honked.")
-
-
-@mcp.tool()
-async def tesla_flash() -> str:
-    """Flash the headlights."""
-    result = await _fleet_command("flash_lights")
-    return _cmd_result(result, "Lights flashed.")
-
-
-@mcp.tool()
-async def tesla_trunk(which: str = "rear", confirm: bool = False) -> str:
-    """Open or close the trunk or frunk. Requires confirm=True.
-
-    Args:
-        which: "rear" for trunk, "front" for frunk
-        confirm: Must be True to execute.
-    """
-    if not confirm:
-        return f"Trunk ({which}) requires confirm=True."
-    if which not in ("rear", "front"):
-        return "which must be 'rear' or 'front'"
-    result = await _fleet_command("actuate_trunk", {"which_trunk": which})
-    return _cmd_result(result, f"{'Trunk' if which == 'rear' else 'Frunk'} actuated.")
-
-
-@mcp.tool()
-async def tesla_sentry(on: bool = True) -> str:
-    """Toggle sentry mode on or off.
-
-    Args:
-        on: True to enable, False to disable sentry mode.
-    """
-    result = await _fleet_command("set_sentry_mode", {"on": on})
-    return _cmd_result(result, f"Sentry mode {'enabled' if on else 'disabled'}.")
 
 
 # -- Analytics Tools -----------------------------------------------------------
