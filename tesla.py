@@ -861,7 +861,7 @@ async def tesla_live() -> str:
     return "\n".join(lines)
 
 
-# -- Fleet API Command Tools ---------------------------------------------------
+# -- Removed Command Tools (Fleet API was discontinued) ----------------------
 
 
 def _cmd_result(result: dict | None, success_msg: str) -> str:
