@@ -77,14 +77,21 @@ import atexit
 # -- Version (set at build time via --build-arg VERSION=tag, fallback to dev) ---
 VERSION = os.environ.get("VERSION", "dev")
 
+# -- Debug mode: set MCP_DEBUG=true to enable verbose logging -----------------
+MCP_DEBUG = os.environ.get("MCP_DEBUG", "false").lower() in ("true", "1", "yes")
+
 # -- Logging setup with timestamps --------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if MCP_DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
 _log = logging.getLogger("teslamate-mcp")
+
+# Silence noisy libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 import psycopg2
 import psycopg2.extras
@@ -387,6 +394,7 @@ async def tesla_status() -> str:
 
     Returns the latest position snapshot and vehicle info from TeslaMate.
     """
+    _log.info(f"[TOOL] tesla_status called")
     # Car info rarely changes — cache for 10 minutes
     car = _cached_query_one(
         f"car_{CAR_ID}",
@@ -517,6 +525,7 @@ async def tesla_charging_history(days: int = 30) -> str:
     Args:
         days: Number of days to look back (default: 30, max: ~10 years)
     """
+    _log.info(f"[TOOL] tesla_charging_history called")
     if days <= 0 or days > 3650:
         return "❌ days must be between 1 and 3650"
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
@@ -583,6 +592,7 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         start_date: Filter drives from this date (YYYY-MM-DD), overrides days param
         end_date: Filter drives until this date (YYYY-MM-DD), defaults to today
     """
+    _log.info(f"[TOOL] tesla_drives called")
     # Validate date parameters
     try:
         start_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
@@ -666,6 +676,7 @@ async def tesla_driving_score(
         year: Year for monthly/yearly period (e.g. 2024)
         month: Month (1-12) for monthly period
     """
+    _log.info(f"[TOOL] tesla_driving_score called")
     # Validate parameters
     if period not in ("recent_n", "monthly", "yearly"):
         return "❌ period must be 'recent_n', 'monthly', or 'yearly'"
@@ -812,6 +823,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         start_date: Filter drives from this date (YYYY-MM-DD)
         end_date: Filter drives until this date (YYYY-MM-DD)
     """
+    _log.info(f"[TOOL] tesla_trips_by_category called")
     # Validate date parameters
     try:
         if start_date:
@@ -875,6 +887,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
 @mcp.tool()
 async def tesla_trip_categories() -> str:
     """Show count of trips by category for recent drives."""
+    _log.info(f"[TOOL] tesla_trip_categories called")
     rows = _query(
         f"""
         SELECT d.distance,
@@ -914,6 +927,7 @@ async def tesla_battery_health() -> str:
 
     Shows monthly snapshots of ideal range when battery is at 100%.
     """
+    _log.info(f"[TOOL] tesla_battery_health called")
     rows = _query(f"""
         SELECT date_trunc('month', date) AS month,
                AVG(ideal_battery_range_km) AS avg_ideal_km,
@@ -970,6 +984,7 @@ async def tesla_efficiency(days: int = 90) -> str:
 
     Shows weekly average efficiency from driving data.
     """
+    _log.info(f"[TOOL] tesla_efficiency called")
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         """
@@ -1015,6 +1030,7 @@ async def tesla_location_history(days: int = 7) -> str:
 
     Groups positions by proximity and shows time at each cluster.
     """
+    _log.info(f"[TOOL] tesla_location_history called")
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
 
     rows = _query(
@@ -1064,6 +1080,7 @@ async def tesla_state_history(days: int = 7) -> str:
 
     Shows when the car was awake vs sleeping, useful for vampire drain analysis.
     """
+    _log.info(f"[TOOL] tesla_state_history called")
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
@@ -1110,6 +1127,7 @@ async def tesla_state_history(days: int = 7) -> str:
 @mcp.tool()
 async def tesla_software_updates() -> str:
     """Firmware version history -- all recorded software versions and install dates."""
+    _log.info(f"[TOOL] tesla_software_updates called")
     rows = _query(f"""
         SELECT version, start_date, end_date
         FROM updates
@@ -1146,6 +1164,7 @@ async def tesla_live() -> str:
     real-time). Fields like sentry mode, lock status, and media are not
     available in TeslaMate and are omitted.
     """
+    _log.info(f"[TOOL] tesla_live called")
     # Car info — cached (same SQL as tesla_status to share cache key)
     car = _cached_query_one(
         f"car_{CAR_ID}",
@@ -1294,6 +1313,7 @@ async def tesla_savings(
         gas_price: Gas price per gallon (default from TESLA_GAS_PRICE env, or $3.50)
         mpg_equivalent: Comparable gas vehicle MPG (default from TESLA_GAS_MPG env, or 28)
     """
+    _log.info(f"[TOOL] tesla_savings called")
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
@@ -1366,6 +1386,7 @@ async def tesla_trip_cost(
         gas_price: Gas price per gallon (default from TESLA_GAS_PRICE env)
         mpg_equivalent: Comparable gas vehicle MPG (default from TESLA_GAS_MPG env)
     """
+    _log.info(f"[TOOL] tesla_trip_cost called with destination={destination[:30]}...")
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
@@ -1476,6 +1497,7 @@ async def tesla_efficiency_by_temp() -> str:
 
     Shows how outside temperature affects energy consumption.
     """
+    _log.info(f"[TOOL] tesla_efficiency_by_temp called")
     rows = _query("""
         SELECT
             CASE
@@ -1549,6 +1571,7 @@ async def tesla_charging_by_location(days: int = 0) -> str:
     Args:
         days: Number of days to look back (default: 0 = all time)
     """
+    _log.info(f"[TOOL] tesla_charging_by_location called")
     date_filter = ""
     params = [CAR_ID]
     if days > 0:
@@ -1610,6 +1633,7 @@ async def tesla_top_destinations(limit: int = 15) -> str:
     Args:
         limit: Number of destinations to show (default: 15, max: 100)
     """
+    _log.info(f"[TOOL] tesla_top_destinations called")
     if limit <= 0 or limit > 100:
         return "❌ limit must be between 1 and 100"
     rows = _query(
@@ -1647,6 +1671,7 @@ async def tesla_longest_trips(limit: int = 10) -> str:
     Args:
         limit: Number of trips to show (default: 10, max: 100)
     """
+    _log.info(f"[TOOL] tesla_longest_trips called")
     if limit <= 0 or limit > 100:
         return "❌ limit must be between 1 and 100"
     rows = _query(
@@ -1690,6 +1715,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
         year: Year (e.g., 2026)
         month: Month (1-12)
     """
+    _log.info(f"[TOOL] tesla_monthly_report called")
     # Validate parameters
     if month < 1 or month > 12:
         return "❌ month must be between 1 and 12"
@@ -1793,6 +1819,7 @@ async def tesla_tpms_status() -> str:
     Warns if any tyre is below TESLA_TPMS_MIN_THRESHOLD or above
     TESLA_TPMS_MAX_THRESHOLD, or differs from the average by > 0.15 bar.
     """
+    _log.info(f"[TOOL] tesla_tpms_status called")
     pos = _query_one("""
         SELECT date,
                tpms_pressure_fl, tpms_pressure_fr,
@@ -1864,6 +1891,7 @@ async def tesla_tpms_history(days: int = 30) -> str:
     Args:
         days: Number of days to look back (default: 30)
     """
+    _log.info(f"[TOOL] tesla_tpms_history called")
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
@@ -1911,6 +1939,7 @@ async def tesla_monthly_summary(months: int = 6) -> str:
     Args:
         months: Number of months to show (default: 6, max: 120)
     """
+    _log.info(f"[TOOL] tesla_monthly_summary called")
     if months <= 0 or months > 120:
         return "❌ months must be between 1 and 120"
     rows = _query(
@@ -1999,6 +2028,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
     Args:
         days: Number of days to analyze (default: 14)
     """
+    _log.info(f"[TOOL] tesla_vampire_drain called")
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
@@ -2075,6 +2105,7 @@ async def calculate_eco_savings_vs_icev(
         gas_price: Gas price per litre in RMB (default: 8.0)
         electricity_price: Electricity cost per kWh in RMB (default: 0.5)
     """
+    _log.info(f"[TOOL] calculate_eco_savings_vs_icev called")
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
 
     # Total driving distance from drives table
@@ -2159,6 +2190,7 @@ async def generate_travel_narrative_context(
         start_time: ISO8601 start time (e.g. "2026-03-01T00:00:00" or "2026-03-01")
         end_time: ISO8601 end time (e.g. "2026-03-03T23:59:59" or "2026-03-03")
     """
+    _log.info(f"[TOOL] generate_travel_narrative_context called")
     # Validate ISO8601 format
     try:
         if "T" in start_time:
@@ -2244,6 +2276,7 @@ async def get_vehicle_persona_status(
         year: Specific year to analyze (e.g. 2025). Use with month for single month.
         month: Specific month to analyze (1-12). Requires year to be set.
     """
+    _log.info(f"[TOOL] get_vehicle_persona_status called")
     # Validate parameters
     if month is not None and (month < 1 or month > 12):
         return "❌ month must be between 1 and 12"
@@ -2403,6 +2436,7 @@ async def check_driving_achievements(days: int = 30) -> str:
     Args:
         days: Number of days to look back (default: 30)
     """
+    _log.info(f"[TOOL] check_driving_achievements called")
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     unlocked = []
 
@@ -2504,6 +2538,7 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
     Args:
         charge_id: Specific charging session ID. If None, returns the latest.
     """
+    _log.info(f"[TOOL] get_charging_vintage_data called")
 
     if charge_id is not None:
         row = _query_one(
@@ -2608,6 +2643,7 @@ async def generate_weekend_blindbox(
         months_lookback: How many months to search back (default: 12)
         min_stay_hours: Minimum stay duration in hours (default: 2.0)
     """
+    _log.info(f"[TOOL] generate_weekend_blindbox called")
     import random
 
     cutoff = (_utcnow() - timedelta(days=months_lookback * 30)).isoformat()
@@ -2695,6 +2731,7 @@ async def generate_monthly_driving_report(
                      Example: "2026-03" for March 2026.
         electricity_price: RMB/kWh fallback when cost is not recorded (default: 0.5)
     """
+    _log.info(f"[TOOL] generate_monthly_driving_report called with target_month={target_month}")
     if target_month is None:
         today = _utcnow()
         first_of_month = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
@@ -2846,9 +2883,22 @@ if __name__ == "__main__":
     _log.info(f"TeslaMate MCP Server {VERSION} starting...")
     _log.info(f"Database: {DB_HOST}:{DB_PORT}/{DB_NAME} (Car ID: {CAR_ID})")
     _log.info(f"Transport: {MCP_TRANSPORT} | Units: {'metric' if USE_METRIC_UNITS else 'imperial'}")
+    if MCP_DEBUG:
+        _log.info("Debug mode: MCP_DEBUG=true - verbose logging enabled")
 
     if MCP_TRANSPORT == "streamable-http":
         _log.info(f"HTTP server listening on {HTTP_HOST}:{HTTP_PORT}")
+        # Configure uvicorn access log with timestamps
+        import uvicorn
+        access_logger = logging.getLogger("uvicorn.access")
+        access_logger.handlers.clear()
+        access_handler = logging.StreamHandler(sys.stdout)
+        access_handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s %(client_addr)s - \"%(method)s %(path)s\" %(status_code)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        access_logger.addHandler(access_handler)
+        access_logger.setLevel(logging.DEBUG if MCP_DEBUG else logging.INFO)
         mcp.run(transport="streamable-http", host=HTTP_HOST, port=HTTP_PORT)
     else:
         mcp.run()
