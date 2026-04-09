@@ -63,14 +63,28 @@ Environment variables:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import time
 import threading
 import atexit
+
+# -- Version (set at build time via --build-arg VERSION=tag, fallback to dev) ---
+VERSION = os.environ.get("VERSION", "dev")
+
+# -- Logging setup with timestamps --------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+_log = logging.getLogger("teslamate-mcp")
 
 import psycopg2
 import psycopg2.extras
@@ -159,6 +173,26 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_date(date_str: str | None, default: datetime | None = None) -> datetime | None:
+    """Parse YYYY-MM-DD date string to UTC datetime. Returns None if invalid.
+
+    Args:
+        date_str: Date string in YYYY-MM-DD format
+        default: Default datetime if date_str is None
+    Raises:
+        ValueError: If date_str is provided but invalid
+    """
+    if date_str is None:
+        return default
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError(
+            f"Invalid date format: '{date_str}'. Expected YYYY-MM-DD (e.g., '2024-01-01')."
+        )
+
+
 def _format_dt(dt: datetime | None) -> str:
     """Convert a UTC datetime to user timezone string, or 'N/A' if None."""
     if dt is None:
@@ -198,6 +232,7 @@ def _init_pool():
                 "Set TESLAMATE_DB_HOST and TESLAMATE_DB_PASS environment variables. "
                 "See README for setup instructions."
             )
+        _log.info(f"Creating connection pool to {DB_HOST}:{DB_PORT}/{DB_NAME}...")
         _pool = psycopg2.pool.ThreadedConnectionPool(
             minconn=2,
             maxconn=8,
@@ -213,6 +248,7 @@ def _init_pool():
             keepalives_interval=10,
             keepalives_count=3,
         )
+        _log.info("Connection pool created successfully")
         atexit.register(lambda: _pool.closeall() if _pool else None)
 
 
@@ -236,7 +272,8 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
-    except Exception:
+    except Exception as e:
+        _log.error(f"Query failed: {e} | SQL: {sql[:200]}... | Params: {params}")
         if conn is not None:
             conn.rollback()
         raise
@@ -254,7 +291,8 @@ def _query_one(sql: str, params: tuple = ()) -> dict | None:
             cur.execute(sql, params)
             row = cur.fetchone()
             return dict(row) if row else None
-    except Exception:
+    except Exception as e:
+        _log.error(f"Query failed: {e} | SQL: {sql[:200]}... | Params: {params}")
         if conn is not None:
             conn.rollback()
         raise
@@ -460,7 +498,12 @@ async def tesla_charging_history(days: int = 30) -> str:
     """Charging sessions over the last N days.
 
     Shows energy added, duration, battery range, and location for each session.
+
+    Args:
+        days: Number of days to look back (default: 30, max: ~10 years)
     """
+    if days <= 0 or days > 3650:
+        return "❌ days must be between 1 and 3650"
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     rows = _query(
         f"""
@@ -525,16 +568,12 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         start_date: Filter drives from this date (YYYY-MM-DD), overrides days param
         end_date: Filter drives until this date (YYYY-MM-DD), defaults to today
     """
-    # Build date filter
-    if end_date:
-        end_dt = f"{end_date}T23:59:59+00:00"
-    else:
-        end_dt = _utcnow().isoformat()
-
-    if start_date:
-        start_dt = f"{start_date}T00:00:00+00:00"
-    else:
-        start_dt = (_utcnow() - timedelta(days=days)).isoformat()
+    # Validate date parameters
+    try:
+        start_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        end_dt = _parse_date(end_date, _utcnow())
+    except ValueError as e:
+        return f"❌ {e}"
 
     rows = _query(
         f"""
@@ -551,7 +590,7 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         ORDER BY d.start_date DESC
         {_limit_sql(LIMIT_DRIVES)}
     """,
-        (CAR_ID, start_dt, end_dt,),
+        (CAR_ID, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None,),
     )
 
     date_range = f"{start_date}" if start_date else f"last {days} days"
@@ -605,9 +644,14 @@ async def tesla_driving_score(
     Args:
         period: "recent_n" (default), "monthly", or "yearly"
         n: Number of recent drives to score (default: 10, used when period="recent_n")
-        year: Year for monthly/yearly period
+        year: Year for monthly/yearly period (e.g. 2024)
         month: Month (1-12) for monthly period
     """
+    # Validate parameters
+    if period not in ("recent_n", "monthly", "yearly"):
+        return "❌ period must be 'recent_n', 'monthly', or 'yearly'"
+    if month is not None and (month < 1 or month > 12):
+        return "❌ month must be between 1 and 12"
     # Build date filter
     if period == "recent_n":
         rows = _query(
@@ -749,18 +793,18 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         start_date: Filter drives from this date (YYYY-MM-DD)
         end_date: Filter drives until this date (YYYY-MM-DD)
     """
-    # Build date filter
-    if end_date:
-        end_dt = f"{end_date}T23:59:59+00:00"
-    else:
-        end_dt = _utcnow().isoformat()
+    # Validate date parameters
+    try:
+        if start_date:
+            start_dt = _parse_date(start_date)
+        elif days:
+            start_dt = _utcnow() - timedelta(days=days)
+        else:
+            start_dt = datetime(2000, 1, 1, tzinfo=timezone.utc)  # All time by default
 
-    if start_date:
-        start_dt = f"{start_date}T00:00:00+00:00"
-    elif days:
-        start_dt = (_utcnow() - timedelta(days=days)).isoformat()
-    else:
-        start_dt = "2000-01-01T00:00:00+00:00"  # All time by default
+        end_dt = _parse_date(end_date, _utcnow())
+    except ValueError as e:
+        return f"❌ {e}"
 
     date_range = f"{start_date or ('last ' + str(days) + ' days' if days else 'all time')} to {end_date or 'today'}"
 
@@ -775,7 +819,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         WHERE d.car_id = %s AND d.distance > 0 AND d.start_date >= %s AND d.start_date <= %s
         ORDER BY d.start_date DESC LIMIT %s
         """,
-        (CAR_ID, start_dt, end_dt, limit * 5),
+        (CAR_ID, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None, limit * 5),
     )
 
     classified = []
@@ -1541,8 +1585,10 @@ async def tesla_top_destinations(limit: int = 15) -> str:
     """Most visited locations ranked by number of visits.
 
     Args:
-        limit: Number of destinations to show (default: 15)
+        limit: Number of destinations to show (default: 15, max: 100)
     """
+    if limit <= 0 or limit > 100:
+        return "❌ limit must be between 1 and 100"
     rows = _query(
         """
         SELECT ea.display_name AS destination,
@@ -1576,8 +1622,10 @@ async def tesla_longest_trips(limit: int = 10) -> str:
     """Top drives ranked by distance -- your epic road trips.
 
     Args:
-        limit: Number of trips to show (default: 10)
+        limit: Number of trips to show (default: 10, max: 100)
     """
+    if limit <= 0 or limit > 100:
+        return "❌ limit must be between 1 and 100"
     rows = _query(
         """
         SELECT d.start_date, d.distance, d.duration_min,
@@ -1619,6 +1667,12 @@ async def tesla_monthly_report(year: int, month: int) -> str:
         year: Year (e.g., 2026)
         month: Month (1-12)
     """
+    # Validate parameters
+    if month < 1 or month > 12:
+        return "❌ month must be between 1 and 12"
+    if year < 2000 or year > 2100:
+        return "❌ year must be between 2000 and 2100"
+
     start = datetime(year, month, 1)
     if month == 12:
         next_start = datetime(year + 1, 1, 1)
@@ -1832,8 +1886,10 @@ async def tesla_monthly_summary(months: int = 6) -> str:
     """Monthly driving summary -- miles, kWh, cost, efficiency.
 
     Args:
-        months: Number of months to show (default: 6)
+        months: Number of months to show (default: 6, max: 120)
     """
+    if months <= 0 or months > 120:
+        return "❌ months must be between 1 and 120"
     rows = _query(
         """
         SELECT d.month,
@@ -2077,9 +2133,26 @@ async def generate_travel_narrative_context(
     generating travel narratives or Vlog scripts.
 
     Args:
-        start_time: ISO8601 start time (e.g. "2026-03-01T00:00:00")
-        end_time: ISO8601 end time (e.g. "2026-03-03T23:59:59")
+        start_time: ISO8601 start time (e.g. "2026-03-01T00:00:00" or "2026-03-01")
+        end_time: ISO8601 end time (e.g. "2026-03-03T23:59:59" or "2026-03-03")
     """
+    # Validate ISO8601 format
+    try:
+        if "T" in start_time:
+            start_dt = datetime.fromisoformat(start_time)
+        else:
+            start_dt = datetime.strptime(start_time, "%Y-%m-%d")
+    except ValueError:
+        return f"❌ Invalid start_time format: '{start_time}'. Use ISO8601 like '2026-03-01T00:00:00' or '2026-03-01'"
+
+    try:
+        if "T" in end_time:
+            end_dt = datetime.fromisoformat(end_time)
+        else:
+            end_dt = datetime.strptime(end_time, "%Y-%m-%d")
+    except ValueError:
+        return f"❌ Invalid end_time format: '{end_time}'. Use ISO8601 like '2026-03-03T23:59:59' or '2026-03-03'"
+
     rows = _query(
         """
         SELECT d.start_date, d.end_date,
@@ -2148,6 +2221,14 @@ async def get_vehicle_persona_status(
         year: Specific year to analyze (e.g. 2025). Use with month for single month.
         month: Specific month to analyze (1-12). Requires year to be set.
     """
+    # Validate parameters
+    if month is not None and (month < 1 or month > 12):
+        return "❌ month must be between 1 and 12"
+    if year is not None and (year < 2000 or year > 2100):
+        return "❌ year must be between 2000 and 2100"
+    if days_lookback <= 0 or days_lookback > 3650:
+        return "❌ days_lookback must be between 1 and 3650"
+
     # Determine query period
     period_str = None
     if year is not None and month is not None:
@@ -2588,6 +2669,7 @@ async def generate_monthly_driving_report(
 
     Args:
         target_month: Month in 'YYYY-MM' format. Defaults to previous month.
+                     Example: "2026-03" for March 2026.
         electricity_price: RMB/kWh fallback when cost is not recorded (default: 0.5)
     """
     if target_month is None:
@@ -2595,6 +2677,20 @@ async def generate_monthly_driving_report(
         first_of_month = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
         last_month = first_of_month - timedelta(days=1)
         target_month = last_month.strftime("%Y-%m")
+
+    # Validate target_month format
+    if target_month is not None:
+        try:
+            parts = target_month.split("-")
+            if len(parts) != 2:
+                raise ValueError()
+            year, month = int(parts[0]), int(parts[1])
+            if month < 1 or month > 12:
+                return "❌ month must be between 1 and 12"
+            if year < 2000 or year > 2100:
+                return "❌ year must be between 2000 and 2100"
+        except (ValueError, IndexError):
+            return f"❌ Invalid target_month format: '{target_month}'. Use 'YYYY-MM' (e.g., '2026-03')"
 
     year, month = map(int, target_month.split("-"))
     start = datetime(year, month, 1, tzinfo=timezone.utc)
@@ -2724,7 +2820,12 @@ async def generate_monthly_driving_report(
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
+    _log.info(f"TeslaMate MCP Server {VERSION} starting...")
+    _log.info(f"Database: {DB_HOST}:{DB_PORT}/{DB_NAME} (Car ID: {CAR_ID})")
+    _log.info(f"Transport: {MCP_TRANSPORT} | Units: {'metric' if USE_METRIC_UNITS else 'imperial'}")
+
     if MCP_TRANSPORT == "streamable-http":
+        _log.info(f"HTTP server listening on {HTTP_HOST}:{HTTP_PORT}")
         mcp.run(transport="streamable-http", host=HTTP_HOST, port=HTTP_PORT)
     else:
         mcp.run()
