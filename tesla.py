@@ -77,14 +77,33 @@ import atexit
 # -- Version (set at build time via --build-arg VERSION=tag, fallback to dev) ---
 VERSION = os.environ.get("VERSION", "dev")
 
+# -- Debug mode: set MCP_DEBUG=true to enable verbose tool call logging --------
+MCP_DEBUG = os.environ.get("MCP_DEBUG", "false").lower() in ("true", "1", "yes")
+
 # -- Logging setup with timestamps --------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+# Configure root logger to match our format
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG if MCP_DEBUG else logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
-)
+))
+root_logger.handlers.clear()
+root_logger.addHandler(handler)
+
+# Configure FastMCP logging (it uses 'mcp' logger)
+logging.getLogger("mcp").setLevel(logging.DEBUG if MCP_DEBUG else logging.INFO)
+logging.getLogger("mcp.server").setLevel(logging.DEBUG if MCP_DEBUG else logging.INFO)
+
+# Silence noisy libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING if not MCP_DEBUG else logging.DEBUG)
+
 _log = logging.getLogger("teslamate-mcp")
+if MCP_DEBUG:
+    _log.debug("Debug logging enabled - will show tool calls and returns")
 
 import psycopg2
 import psycopg2.extras
@@ -164,6 +183,19 @@ LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "30"))
 LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "50"))
 
 mcp = FastMCP("tesla")
+
+# -- Tool call debug logging ---------------------------------------------------
+# When MCP_DEBUG=true, log all tool calls with arguments and return values
+def _debug_tool_call(tool_name: str, args: dict, result: str | None = None):
+    """Log tool call details at DEBUG level."""
+    if MCP_DEBUG:
+        if result is None:
+            _log.debug(f"[TOOL CALL] {tool_name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
+        else:
+            # Truncate long results for logging
+            result_preview = result[:500] + "..." if len(result) > 500 else result
+            result_preview = result_preview.replace("\n", "\\n")
+            _log.debug(f"[TOOL RETURN] {tool_name} -> {result_preview}")
 
 # -- Timezone helpers ----------------------------------------------------------
 
@@ -2846,6 +2878,8 @@ if __name__ == "__main__":
     _log.info(f"TeslaMate MCP Server {VERSION} starting...")
     _log.info(f"Database: {DB_HOST}:{DB_PORT}/{DB_NAME} (Car ID: {CAR_ID})")
     _log.info(f"Transport: {MCP_TRANSPORT} | Units: {'metric' if USE_METRIC_UNITS else 'imperial'}")
+    if MCP_DEBUG:
+        _log.info("Debug mode: MCP_DEBUG=true - verbose tool logging enabled")
 
     if MCP_TRANSPORT == "streamable-http":
         _log.info(f"HTTP server listening on {HTTP_HOST}:{HTTP_PORT}")
