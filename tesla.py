@@ -515,12 +515,27 @@ async def tesla_charging_history(days: int = 30) -> str:
 
 
 @mcp.tool()
-async def tesla_drives(days: int = 30) -> str:
+async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: str | None = None) -> str:
     """Recent drives -- distance, duration, efficiency, start/end locations.
 
-    Shows the last N days of driving activity with energy consumption.
+    Shows driving activity with energy consumption.
+
+    Args:
+        days: Number of days to look back from today (default: 30, max: 3650/10years)
+        start_date: Filter drives from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter drives until this date (YYYY-MM-DD), defaults to today
     """
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    # Build date filter
+    if end_date:
+        end_dt = f"{end_date}T23:59:59+00:00"
+    else:
+        end_dt = _utcnow().isoformat()
+
+    if start_date:
+        start_dt = f"{start_date}T00:00:00+00:00"
+    else:
+        start_dt = (_utcnow() - timedelta(days=days)).isoformat()
+
     rows = _query(
         f"""
         SELECT d.start_date, d.end_date,
@@ -532,17 +547,20 @@ async def tesla_drives(days: int = 30) -> str:
         FROM drives d
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = %s AND d.start_date >= %s
+        WHERE d.car_id = %s AND d.start_date >= %s AND d.start_date <= %s
         ORDER BY d.start_date DESC
         {_limit_sql(LIMIT_DRIVES)}
     """,
-        (CAR_ID, cutoff,),
+        (CAR_ID, start_dt, end_dt,),
     )
 
+    date_range = f"{start_date}" if start_date else f"last {days} days"
+    if end_date:
+        date_range = f"{start_date or 'start'} to {end_date}"
     if not rows:
-        return f"No drives recorded in the last {days} days."
+        return f"No drives recorded ({date_range})."
 
-    lines = [f"**Drives** (last {days} days, {len(rows)} trips)\n"]
+    lines = [f"**Drives** ({date_range}, {len(rows)} trips)\n"]
     total_km = 0.0
     total_kwh = 0.0
     total_min = 0
@@ -721,13 +739,31 @@ def _classify_trip(start_geofence: str | None, end_geofence: str | None, distanc
 
 
 @mcp.tool()
-async def tesla_trips_by_category(category: str = "commute", limit: int = 20) -> str:
+async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, start_date: str | None = None, end_date: str | None = None) -> str:
     """Get trips filtered by category.
 
     Args:
         category: "commute", "shopping", "leisure", "long_trip", or "other"
         limit: Max trips to return (default: 20)
+        days: Number of days to look back from today (default: all time if days/start_date not set)
+        start_date: Filter drives from this date (YYYY-MM-DD)
+        end_date: Filter drives until this date (YYYY-MM-DD)
     """
+    # Build date filter
+    if end_date:
+        end_dt = f"{end_date}T23:59:59+00:00"
+    else:
+        end_dt = _utcnow().isoformat()
+
+    if start_date:
+        start_dt = f"{start_date}T00:00:00+00:00"
+    elif days:
+        start_dt = (_utcnow() - timedelta(days=days)).isoformat()
+    else:
+        start_dt = "2000-01-01T00:00:00+00:00"  # All time by default
+
+    date_range = f"{start_date or ('last ' + str(days) + ' days' if days else 'all time')} to {end_date or 'today'}"
+
     rows = _query(
         """
         SELECT d.start_date, d.distance, d.duration_min,
@@ -736,10 +772,10 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20) ->
         FROM drives d
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = %s AND d.distance > 0
+        WHERE d.car_id = %s AND d.distance > 0 AND d.start_date >= %s AND d.start_date <= %s
         ORDER BY d.start_date DESC LIMIT %s
         """,
-        (CAR_ID, limit * 5),
+        (CAR_ID, start_dt, end_dt, limit * 5),
     )
 
     classified = []
@@ -756,9 +792,9 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20) ->
             break
 
     if not classified:
-        return f"No {category} trips found."
+        return f"No {category} trips found ({date_range})."
 
-    lines = [f"**{category.upper()} Trips** ({len(classified)} results)\n"]
+    lines = [f"**{category.upper()} Trips** ({len(classified)} results, {date_range})\n"]
     for r in classified:
         date = _format_dt(r.get("start_date"))
         dist_km = r.get("distance") or 0
