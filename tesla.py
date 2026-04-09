@@ -174,7 +174,18 @@ def _utcnow() -> datetime:
 
 
 def _parse_date(date_str: str | None, default: datetime | None = None) -> datetime | None:
-    """Parse YYYY-MM-DD date string to UTC datetime. Returns None if invalid.
+    """Parse YYYY-MM-DD date string to UTC datetime for database queries.
+
+    IMPORTANT: Dates are parsed in USER_TZ (user's timezone), then converted to UTC.
+    This ensures correct boundary handling:
+    - start_date 00:00 in user TZ = start of that day
+    - end_date 00:00 in user TZ + 1 day = exclusive end (start of next day)
+
+    For example, in UTC+8 timezone:
+    - start_date="2026-04-09" → 2026-04-09T00:00+08:00 → 2026-04-08T16:00:00+00:00 UTC
+    - end_date="2026-04-09" → 2026-04-10T00:00+08:00 → 2026-04-09T16:00:00+00:00 UTC
+
+    Query: start_date >= start_utc AND start_date < end_utc (half-open interval)
 
     Args:
         date_str: Date string in YYYY-MM-DD format
@@ -186,7 +197,11 @@ def _parse_date(date_str: str | None, default: datetime | None = None) -> dateti
         return default
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
-        return dt.replace(tzinfo=timezone.utc)
+        # Parse in user's timezone, then convert to UTC for database
+        local_dt = dt.replace(tzinfo=USER_TZ)
+        # Convert to UTC for database query
+        utc_dt = local_dt.astimezone(timezone.utc)
+        return utc_dt
     except ValueError:
         raise ValueError(
             f"Invalid date format: '{date_str}'. Expected YYYY-MM-DD (e.g., '2024-01-01')."
@@ -572,6 +587,10 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
     try:
         start_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         end_dt = _parse_date(end_date, _utcnow())
+        # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
+        # e.g., end_date="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
+        if end_date and end_dt:
+            end_dt = end_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
@@ -586,7 +605,7 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         FROM drives d
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = %s AND d.start_date >= %s AND d.start_date <= %s
+        WHERE d.car_id = %s AND d.start_date >= %s AND d.start_date < %s
         ORDER BY d.start_date DESC
         {_limit_sql(LIMIT_DRIVES)}
     """,
@@ -803,6 +822,10 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
             start_dt = datetime(2000, 1, 1, tzinfo=timezone.utc)  # All time by default
 
         end_dt = _parse_date(end_date, _utcnow())
+        # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
+        # e.g., end_date="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
+        if end_date and end_dt:
+            end_dt = end_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
@@ -816,7 +839,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         FROM drives d
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = %s AND d.distance > 0 AND d.start_date >= %s AND d.start_date <= %s
+        WHERE d.car_id = %s AND d.distance > 0 AND d.start_date >= %s AND d.start_date < %s
         ORDER BY d.start_date DESC LIMIT %s
         """,
         (CAR_ID, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None, limit * 5),
