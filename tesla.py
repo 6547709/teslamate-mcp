@@ -63,6 +63,7 @@ Environment variables:
 from __future__ import annotations
 
 import json
+import functools
 import logging
 import math
 import os
@@ -100,6 +101,14 @@ logging.getLogger("mcp.server").setLevel(logging.DEBUG if MCP_DEBUG else logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING if not MCP_DEBUG else logging.DEBUG)
+# Configure uvicorn access log format with timestamps
+uvicorn_access = logging.getLogger("uvicorn.access")
+if uvicorn_access.handlers:
+    for handler in uvicorn_access.handlers:
+        handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
 
 _log = logging.getLogger("teslamate-mcp")
 if MCP_DEBUG:
@@ -184,18 +193,47 @@ LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "50")
 
 mcp = FastMCP("tesla")
 
-# -- Tool call debug logging ---------------------------------------------------
-# When MCP_DEBUG=true, log all tool calls with arguments and return values
-def _debug_tool_call(tool_name: str, args: dict, result: str | None = None):
-    """Log tool call details at DEBUG level."""
-    if MCP_DEBUG:
-        if result is None:
-            _log.debug(f"[TOOL CALL] {tool_name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
+# -- Tool call logging helper -------------------------------------------------
+def _log_tool_call(tool_name: str, args: dict = None):
+    """Log tool call at INFO level. Shows tool name always, full args only in debug mode."""
+    args_str = ""
+    if args:
+        if MCP_DEBUG:
+            args_str = f"({', '.join(f'{k}={v!r}' for k, v in args.items())})"
         else:
-            # Truncate long results for logging
-            result_preview = result[:500] + "..." if len(result) > 500 else result
+            # Show only first few args in non-debug mode
+            preview = {k: (v[:50] + "..." if isinstance(v, str) and len(v) > 50 else v) for k, v in list(args.items())[:3]}
+            args_str = f"({', '.join(f'{k}={v!r}' for k, v in preview.items())})"
+            if len(args) > 3:
+                args_str += f" ... (+{len(args) - 3} more)"
+    _log.info(f"[TOOL] {tool_name}{args_str}")
+
+def _log_tool_result(tool_name: str, result: str | None = None, error: str | None = None):
+    """Log tool result at INFO level."""
+    if MCP_DEBUG:
+        if error:
+            _log.debug(f"[TOOL ERROR] {tool_name}: {error}")
+        elif result:
+            result_preview = result[:300] + "..." if len(result) > 300 else result
             result_preview = result_preview.replace("\n", "\\n")
             _log.debug(f"[TOOL RETURN] {tool_name} -> {result_preview}")
+
+
+# -- Decorator for tool functions to auto-log calls ----------------------------
+def _logged_tool(func):
+    """Decorator that logs tool name and args on call, result on completion."""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        tool_name = func.__name__
+        _log_tool_call(tool_name, kwargs if kwargs else None)
+        try:
+            result = await func(*args, **kwargs)
+            _log_tool_result(tool_name, result=result)
+            return result
+        except Exception as e:
+            _log_tool_result(tool_name, error=str(e))
+            raise
+    return wrapper
 
 # -- Timezone helpers ----------------------------------------------------------
 
@@ -413,7 +451,7 @@ def _format_cost(kwh: float) -> str:
 # -- TeslaMate Read Tools ------------------------------------------------------
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_status() -> str:
     """Current vehicle state -- battery, range, location, climate, odometer.
 
@@ -540,7 +578,7 @@ async def tesla_status() -> str:
     return "\n".join(lines) if lines else "No vehicle data found. Is TeslaMate running?"
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_charging_history(days: int = 30) -> str:
     """Charging sessions over the last N days.
 
@@ -604,7 +642,7 @@ async def tesla_charging_history(days: int = 30) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: str | None = None) -> str:
     """Recent drives -- distance, duration, efficiency, start/end locations.
 
@@ -683,7 +721,7 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_driving_score(
     period: str = "recent_n",
     n: int = 10,
@@ -833,7 +871,7 @@ def _classify_trip(start_geofence: str | None, end_geofence: str | None, distanc
     return "other"
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, start_date: str | None = None, end_date: str | None = None) -> str:
     """Get trips filtered by category.
 
@@ -904,7 +942,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_trip_categories() -> str:
     """Show count of trips by category for recent drives."""
     rows = _query(
@@ -940,7 +978,7 @@ async def tesla_trip_categories() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_battery_health() -> str:
     """Battery degradation trend -- range at 100% charge over time.
 
@@ -996,7 +1034,7 @@ async def tesla_battery_health() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_efficiency(days: int = 90) -> str:
     """Energy consumption trends -- Wh/mi over time.
 
@@ -1041,7 +1079,7 @@ async def tesla_efficiency(days: int = 90) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_location_history(days: int = 7) -> str:
     """Where the car has been -- top locations by time spent.
 
@@ -1090,7 +1128,7 @@ async def tesla_location_history(days: int = 7) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_state_history(days: int = 7) -> str:
     """Vehicle state transitions -- online, asleep, offline.
 
@@ -1139,7 +1177,7 @@ async def tesla_state_history(days: int = 7) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_software_updates() -> str:
     """Firmware version history -- all recorded software versions and install dates."""
     rows = _query(f"""
@@ -1170,7 +1208,7 @@ async def tesla_software_updates() -> str:
 # -- Live Data (from positions table) -------------------------------------------
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_live() -> str:
     """Latest polled vehicle state from TeslaMate -- battery, climate, location.
 
@@ -1315,7 +1353,7 @@ async def tesla_live() -> str:
 # -- Analytics Tools -----------------------------------------------------------
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_savings(
     gas_price: float = None,
     mpg_equivalent: int = None,
@@ -1383,7 +1421,7 @@ async def tesla_savings(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_trip_cost(
     destination: str,
     gas_price: float = None,
@@ -1502,7 +1540,7 @@ async def tesla_trip_cost(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_efficiency_by_temp() -> str:
     """Efficiency curve by temperature -- Wh/mi at different temps.
 
@@ -1574,7 +1612,7 @@ async def tesla_efficiency_by_temp() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_charging_by_location(days: int = 0) -> str:
     """Charging patterns by location -- where you charge and how much.
 
@@ -1635,7 +1673,7 @@ async def tesla_charging_by_location(days: int = 0) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_top_destinations(limit: int = 15) -> str:
     """Most visited locations ranked by number of visits.
 
@@ -1672,7 +1710,7 @@ async def tesla_top_destinations(limit: int = 15) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_longest_trips(limit: int = 10) -> str:
     """Top drives ranked by distance -- your epic road trips.
 
@@ -1714,7 +1752,7 @@ async def tesla_longest_trips(limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_monthly_report(year: int, month: int) -> str:
     """Monthly driving report with stats and comparison to previous month.
 
@@ -1817,7 +1855,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_tpms_status() -> str:
     """Current TPMS pressures with warnings for anomalies.
 
@@ -1886,7 +1924,7 @@ async def tesla_tpms_status() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_tpms_history(days: int = 30) -> str:
     """Recent TPMS pressure history from TeslaMate.
 
@@ -1936,7 +1974,7 @@ async def tesla_tpms_history(days: int = 30) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_monthly_summary(months: int = 6) -> str:
     """Monthly driving summary -- miles, kWh, cost, efficiency.
 
@@ -2021,7 +2059,7 @@ async def tesla_monthly_summary(months: int = 6) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_logged_tool
 async def tesla_vampire_drain(days: int = 14) -> str:
     """Vampire drain analysis -- battery loss while parked overnight.
 
@@ -2089,7 +2127,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
 # -- Eco & Persona Tools --------------------------------------------------------
 
 
-@mcp.tool()
+@_logged_tool
 async def calculate_eco_savings_vs_icev(
     days: int = 30,
     icev_mpg: float = 8.0,
@@ -2177,7 +2215,7 @@ async def calculate_eco_savings_vs_icev(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@_logged_tool
 async def generate_travel_narrative_context(
     start_time: str,
     end_time: str,
@@ -2260,7 +2298,7 @@ async def generate_travel_narrative_context(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@_logged_tool
 async def get_vehicle_persona_status(
     days_lookback: int = 7,
     year: int = None,
@@ -2423,7 +2461,7 @@ async def get_vehicle_persona_status(
 # -- Achievements & Reports ------------------------------------------------------
 
 
-@mcp.tool()
+@_logged_tool
 async def check_driving_achievements(days: int = 30) -> str:
     """Scan recent drives and charging sessions to check for driving achievements.
 
@@ -2527,7 +2565,7 @@ async def check_driving_achievements(days: int = 30) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@_logged_tool
 async def get_charging_vintage_data(charge_id: int | None = None) -> str:
     """Get detailed physical parameters for a single charging session.
 
@@ -2625,7 +2663,7 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@_logged_tool
 async def generate_weekend_blindbox(
     months_lookback: int = 12,
     min_stay_hours: float = 2.0,
@@ -2715,7 +2753,7 @@ async def generate_weekend_blindbox(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@_logged_tool
 async def generate_monthly_driving_report(
     target_month: str | None = None,
     electricity_price: float = 0.5,
