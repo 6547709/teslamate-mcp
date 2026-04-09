@@ -2886,6 +2886,11 @@ if __name__ == "__main__":
     if MCP_DEBUG:
         _log.info("Debug mode: MCP_DEBUG=true - verbose logging enabled")
 
+    # Initialize database connection pool at startup (fail fast if misconfigured)
+    _log.info("Initializing database connection pool...")
+    _init_pool()
+    _log.info("Database connection pool ready")
+
     if MCP_TRANSPORT == "streamable-http":
         _log.info(f"HTTP server listening on {HTTP_HOST}:{HTTP_PORT}")
         # Configure uvicorn access log with timestamps
