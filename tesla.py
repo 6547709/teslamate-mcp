@@ -3107,6 +3107,94 @@ async def check_daily_quest() -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+async def get_longest_trip_on_single_charge() -> str:
+    """Find the longest distance driven between two consecutive charges.
+
+    Uses window functions on charging_processes to define charge windows,
+    then sums drives within each window to find the record.
+
+    Returns JSON with: record_distance_km, start_time, end_time,
+    start_battery_pct, arrival_battery_pct, battery_consumed_pct,
+    efficiency_comment.
+    """
+    _log.info(f"[TOOL] get_longest_trip_on_single_charge called")
+
+    row = _query_one(
+        """
+        WITH charge_windows AS (
+            SELECT
+                cp.id AS charge_id,
+                cp.end_date AS charge_end,
+                cp.end_battery_level AS start_battery,
+                LEAD(cp.end_date) OVER (ORDER BY cp.start_date) AS next_charge_end,
+                LEAD(cp.start_date) OVER (ORDER BY cp.start_date) AS next_charge_start,
+                LEAD(cp.start_battery_level) OVER (ORDER BY cp.start_date) AS arrival_battery
+            FROM charging_processes cp
+            WHERE cp.car_id = %s AND cp.end_date IS NOT NULL
+        ),
+        window_drives AS (
+            SELECT
+                cw.charge_id,
+                cw.charge_end,
+                cw.next_charge_start,
+                cw.start_battery,
+                cw.arrival_battery,
+                d.distance,
+                d.start_date
+            FROM charge_windows cw
+            JOIN drives d
+                ON d.car_id = %s
+                AND d.start_date >= cw.charge_end
+                AND (cw.next_charge_start IS NULL OR d.start_date < cw.next_charge_start)
+        )
+        SELECT
+            charge_id,
+            charge_end,
+            next_charge_start,
+            start_battery,
+            arrival_battery,
+            SUM(distance) AS total_distance_km,
+            MIN(start_date) AS trip_start
+        FROM window_drives
+        GROUP BY charge_id, charge_end, next_charge_start, start_battery, arrival_battery
+        ORDER BY total_distance_km DESC
+        LIMIT 1
+        """,
+        (CAR_ID, CAR_ID),
+    )
+
+    if not row or not row["total_distance_km"]:
+        return json.dumps({"error": "No complete charge cycles found"}, ensure_ascii=False)
+
+    distance = float(row["total_distance_km"])
+    start_time = _format_dt(row["charge_end"])
+    end_time = _format_dt(row["next_charge_start"]) if row["next_charge_start"] else "至今"
+    start_battery = row["start_battery"]
+    arrival_battery = row["arrival_battery"]
+    battery_consumed = (start_battery or 0) - (arrival_battery or 0) if start_battery and arrival_battery else None
+
+    if distance > 400:
+        comment = f"一次充电狂飙 {distance:.1f}km，简直是续航榨汁机！"
+    elif distance > 300:
+        comment = f"单次 {distance:.1f} km，稳稳的第一梯队！"
+    elif distance > 200:
+        comment = f"跑了 {distance:.1f} km，中上表现，继续保持！"
+    else:
+        comment = f"单次 {distance:.1f} km，还有提升空间哦~"
+
+    result = {
+        "record_distance_km": round(distance, 1),
+        "start_time": start_time,
+        "end_time": end_time,
+        "start_battery_pct": start_battery,
+        "arrival_battery_pct": arrival_battery,
+        "battery_consumed_pct": round(battery_consumed, 1) if battery_consumed else None,
+        "efficiency_comment": comment,
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
