@@ -69,6 +69,9 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 | `generate_monthly_driving_report` | Polished Markdown monthly report with Emoji |
 | `get_vehicle_persona_status` | Vehicle persona metrics (activity / fatigue / extremes / health) |
 | `get_charging_vintage_data` | Single charge session detailed parameters |
+| `get_driver_profile` | Driver rank, milestones, Easter eggs |
+| `check_daily_quest` | Today's random driving challenge |
+| `get_longest_trip_on_single_charge` | Longest distance between two charges |
 
 ### 🔧 System & History
 

@@ -69,6 +69,9 @@
 | `generate_monthly_driving_report` | 精美 Markdown 月报（含 Emoji） |
 | `get_vehicle_persona_status` | 车辆人设状态（活跃度/疲劳度/极端情况/健康度） |
 | `get_charging_vintage_data` | 单次充电详细物理参数 |
+| `get_driver_profile` | 驾驶者档案 — 等级、成就、彩蛋 |
+| `check_daily_quest` | 今日随机驾驶挑战任务 |
+| `get_longest_trip_on_single_charge` | 单次充电最长行驶距离 |
 
 ### 🔧 系统与历史
 
