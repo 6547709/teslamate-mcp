@@ -2482,6 +2482,10 @@ async def check_driving_achievements(days: int = 30) -> str:
         """,
         (CAR_ID, cutoff, TIMEZONE, TIMEZONE),
     )
+    # DEBUG: log ALL matched rows to diagnose false positives
+    _log.warning(f"[MIDNIGHT GHOST] {len(midnight_drives)} drives matched, timezone={TIMEZONE}")
+    for i, r in enumerate(midnight_drives):
+        _log.warning(f"[MIDNIGHT GHOST] [{i}] start_date={r['start_date']} | distance={r['distance']}")
     if len(midnight_drives) >= 3:
         earliest = midnight_drives[-1]
         unlocked.append({
