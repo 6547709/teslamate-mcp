@@ -546,7 +546,7 @@ async def tesla_charging_history(days: int = 30) -> str:
             ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
             LIMIT 1
         ) a ON p.latitude IS NOT NULL
-        WHERE cp.car_id = %s AND cp.start_date >= %s
+        WHERE cp.car_id = %s AND cp.start_date >= %s AND cp.end_date IS NOT NULL
         ORDER BY cp.start_date DESC
         {_limit_sql(LIMIT_CHARGING)}
     """,
