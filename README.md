@@ -215,23 +215,23 @@ All configuration is via environment variables.
 
 **Battery capacity reference (China):**
 
-| Vehicle | Battery (kWh) | Range (km) | Note |
-|---------|--------------|------------|------|
-| **Model 3** | | | |
-| Model 3 Standard Range (2019-2021) | 54 | 468 | NEDC |
-| Model 3 Standard Range (2021-2023) | 55 | 556 | CLTC, LFP |
-| Model 3 Highland (2023+) | 60 | 606 | CLTC |
-| **Model Y** | | | |
-| Model Y Standard Range (2021) | 60 | 525 | NEDC |
-| Model Y Standard Range (2021-2023) | 60 | 545 | CLTC, LFP |
-| Model Y Long Range AWD (2022-2023) | 75 | 660 | CLTC |
-| Model Y Performance AWD (2021-2023) | 75 | 615 | CLTC |
-| Model Y Long Range (2024+) | 75 | 719 | CLTC, RWD |
-| Model Y Highland Long Range AWD (2024+) | 75 | 662 | CLTC |
-| Model Y Highland Performance (2024+) | 75 | 662 | CLTC |
-| **Model S/X ( imported)** | | | |
-| Model S Long Range | 100 | 650 | |
-| Model X Long Range | 100 | 560 | |
+| Year | Model | Version | Battery (kWh) | Range (km) | Note |
+|------|-------|---------|--------------|------------|------|
+| 2014-2016 | Model S | Early imported (60/75/85/90) | 60-90 | 280-440 | Early 18650 NCM |
+| 2016-2018 | Model S/X | 100D series (imported) | 100.0 | 450-510 | Panasonic 18650 NCM |
+| 2019.02 | Model 3 | Imported Performance / Long Range RWD | 75.0 | ~490 | Panasonic 2170 NCM |
+| 2019.05 | Model 3 | Imported Standard Range+ | 52.0 | ~380 | Panasonic 2170 NCM |
+| 2019.12 | Model 3 | China SR (first batch) | 52.5 | ~380 | CATL LFP / NCM |
+| 2020.04 | Model 3 | China Long Range RWD | 75.0 | ~490 | LG NCM |
+| 2021.01 | Model Y | China Long Range / Performance | 76.8/78.4 | 480-505 | LG NCM |
+| 2021.07 | Model Y | China RWD (SR) | 60.0 | ~435 | CATL LFP |
+| 2021.11 | Model 3 | China RWD (60 kWh) | 60.0 | ~439 | CATL LFP |
+| 2022.03 | Model 3 | 2022 Performance (P) | 78.4 | ~507 | LG NCM |
+| 2023.01 | Model S/X | New generation (Plaid/dual motor) | 100.0 | 520-620 | NCM (18650 improved) |
+| 2023.09 | Model 3 | Refresh RWD / Long Range | 60/78.4 | 438-550 | LFP / NCM |
+| 2024.04 | Model 3 | Refresh Performance (P) | 78.4 | ~480 | LG NCM |
+| 2025.01 | Model 3+ | Refresh Long Range RWD | 78.4 | ~620 | NCM (new) |
+| 2025.03 | Model Y L | Long Range 6-seater | 82.0 | ~580 | NCM |
 
 ### TPMS Thresholds (Optional)
 
