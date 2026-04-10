@@ -1102,7 +1102,14 @@ async def tesla_state_history(days: int = 7) -> str:
     for r in rows:
         st = r.get("state", "unknown")
         start = r.get("start_date")
-        end = r.get("end_date") or _utcnow()
+        end = r.get("end_date")
+        if end is None:
+            end = _utcnow()
+        # Ensure both datetimes are timezone-aware before subtraction
+        if start and start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end and end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
         if start:
             dur_h = (end - start).total_seconds() / 3600
             totals[st] = totals.get(st, 0) + dur_h
@@ -1117,7 +1124,12 @@ async def tesla_state_history(days: int = 7) -> str:
         end = r.get("end_date")
         dur = ""
         if end and r.get("start_date"):
-            dur_min = round((end - r["start_date"]).total_seconds() / 60)
+            start_dt = r["start_date"]
+            if start_dt and start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            dur_min = round((end - start_dt).total_seconds() / 60)
             dur = f" ({dur_min} min)"
         lines.append(f"- {start}: {st}{dur}")
 
@@ -1146,7 +1158,12 @@ async def tesla_software_updates() -> str:
         end = r.get("end_date")
         dur = ""
         if end and r.get("start_date"):
-            dur_min = round((end - r["start_date"]).total_seconds() / 60)
+            start_dt = r["start_date"]
+            if start_dt and start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            dur_min = round((end - start_dt).total_seconds() / 60)
             dur = f" ({dur_min} min)"
         lines.append(f"- {start}: {ver}{dur}")
 
@@ -2347,7 +2364,14 @@ async def get_vehicle_persona_status(
     driving_hours = 0.0
     for s in state_rows:
         st = s.get("start_date")
-        en = s.get("end_date") or _utcnow()
+        en = s.get("end_date")
+        if en is None:
+            en = _utcnow()
+        # Ensure both datetimes are timezone-aware before subtraction
+        if st and st.tzinfo is None:
+            st = st.replace(tzinfo=timezone.utc)
+        if en and en.tzinfo is None:
+            en = en.replace(tzinfo=timezone.utc)
         if st:
             hours = (en - st).total_seconds() / 3600.0
             if s.get("state") == "driving":
