@@ -36,6 +36,9 @@ Read tools (TeslaMate):
   get_charging_vintage_data -- Single charge detailed parameters
   generate_weekend_blindbox -- Rare one-time destinations as blindbox recommendation
   generate_monthly_driving_report -- Polished Markdown monthly report
+  get_driver_profile        -- Driver gamification profile (rank, milestones, Easter eggs)
+  check_daily_quest         -- Daily driving quest and progress
+  get_longest_trip_on_single_charge -- Longest continuous distance on single charge
 
 Environment variables:
   # TeslaMate Postgres
@@ -67,6 +70,7 @@ import hashlib
 import logging
 import math
 import os
+import random
 import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -2675,7 +2679,6 @@ async def generate_weekend_blindbox(
         min_stay_hours: Minimum stay duration in hours (default: 2.0)
     """
     _log.info(f"[TOOL] generate_weekend_blindbox called")
-    import random
 
     cutoff = (_utcnow() - timedelta(days=months_lookback * 30)).isoformat()
     min_stay_min = int(min_stay_hours * 60)
@@ -2769,21 +2772,19 @@ async def generate_monthly_driving_report(
         last_month = first_of_month - timedelta(days=1)
         target_month = last_month.strftime("%Y-%m")
 
-    # Validate target_month format
-    if target_month is not None:
-        try:
-            parts = target_month.split("-")
-            if len(parts) != 2:
-                raise ValueError()
-            year, month = int(parts[0]), int(parts[1])
-            if month < 1 or month > 12:
-                return "❌ month must be between 1 and 12"
-            if year < 2000 or year > 2100:
-                return "❌ year must be between 2000 and 2100"
-        except (ValueError, IndexError):
-            return f"❌ Invalid target_month format: '{target_month}'. Use 'YYYY-MM' (e.g., '2026-03')"
+    # Validate target_month format and parse year/month
+    try:
+        parts = target_month.split("-")
+        if len(parts) != 2:
+            raise ValueError()
+        year, month = int(parts[0]), int(parts[1])
+        if month < 1 or month > 12:
+            return "❌ month must be between 1 and 12"
+        if year < 2000 or year > 2100:
+            return "❌ year must be between 2000 and 2100"
+    except (ValueError, IndexError):
+        return f"❌ Invalid target_month format: '{target_month}'. Use 'YYYY-MM' (e.g., '2026-03')"
 
-    year, month = map(int, target_month.split("-"))
     start = datetime(year, month, 1, tzinfo=timezone.utc)
     if month == 12:
         end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
@@ -2794,7 +2795,7 @@ async def generate_monthly_driving_report(
     end_iso = end.isoformat()
 
     # -- Drive stats
-    drive_rows = _query(
+    drive_r = _query_one(
         """
         SELECT
             COUNT(id) AS trip_count,
@@ -2807,7 +2808,7 @@ async def generate_monthly_driving_report(
         """,
         (CAR_ID, start_iso, end_iso),
     )
-    drive_r = drive_rows[0] if drive_rows else {}
+    drive_r = drive_r or {}
     trip_count = drive_r.get("trip_count") or 0
     total_km = drive_r.get("total_km") or 0.0
     total_min = drive_r.get("total_min") or 0
@@ -2815,7 +2816,7 @@ async def generate_monthly_driving_report(
     max_speed_kmh = drive_r.get("max_speed_kmh") or 0.0
 
     # -- Charge stats
-    charge_rows = _query(
+    charge_r = _query_one(
         """
         SELECT
             COUNT(id) AS charge_count,
@@ -2827,7 +2828,7 @@ async def generate_monthly_driving_report(
         """,
         (CAR_ID, start_iso, end_iso),
     )
-    charge_r = charge_rows[0] if charge_rows else {}
+    charge_r = charge_r or {}
     charge_count = charge_r.get("charge_count") or 0
     total_kwh = charge_r.get("total_kwh") or 0.0
     total_cost = charge_r.get("total_cost") or 0.0
@@ -2953,13 +2954,15 @@ async def get_driver_profile() -> str:
     milestones_unlocked = []
 
     # Distance milestones (thresholds are in km)
-    DISTANCE_NODES = [1_000, 5_000, 10_000, 16_000, 30_000]
+    DISTANCE_NODES = [1_000, 5_000, 10_000, 50_000, 100_000, 160_000, 300_000]
     DISTANCE_LABELS = {
-        1_000:  "累计里程突破 1 千公里！",
-        5_000:  "累计里程突破 5 千公里！",
-        10_000: "累计里程突破 1 万公里大关！",
-        16_000: "累计里程突破 16 万公里！质保期已满，真正的硬核模式开启！",
-        30_000: "累计里程突破 30 万公里！传奇级别！",
+        1_000:   "累计里程突破 1 千公里！",
+        5_000:   "累计里程突破 5 千公里！",
+        10_000:  "累计里程突破 1 万公里大关！",
+        50_000:  "累计里程突破 5 万公里！",
+        100_000: "累计里程突破 10 万公里！",
+        160_000: "累计里程突破 16 万公里！质保期已满，真正的硬核模式开启！",
+        300_000: "累计里程突破 30 万公里！传奇级别！",
     }
     for node in DISTANCE_NODES:
         if total_km >= node:
@@ -3114,13 +3117,17 @@ async def check_daily_quest() -> str:
 
 @mcp.tool()
 async def get_longest_trip_on_single_charge() -> str:
-    """Find the longest distance driven between two consecutive charges.
+    """Find the longest continuous driving distance on a single charge.
 
-    Uses window functions on charging_processes to define charge windows,
-    then sums drives within each window to find the record.
+    Defines "continuous driving" as consecutive drives with gaps <= 5 minutes
+    between them (e.g., short stops at traffic lights or rest areas).
+    Gaps > 5 minutes split into separate trip chains.
 
-    Returns JSON with: record_distance_km, start_time, end_time,
-    start_battery_pct, arrival_battery_pct, battery_consumed_pct,
+    Searches across all charge cycles (from one charge end to the next charge start)
+    and finds the longest continuous trip chain.
+
+    Returns JSON with: record_distance_km, drive_count, start_time, end_time,
+    duration_min, start_battery_pct, arrival_battery_pct, battery_consumed_pct,
     efficiency_comment.
     """
     _log.info(f"[TOOL] get_longest_trip_on_single_charge called")
@@ -3128,70 +3135,104 @@ async def get_longest_trip_on_single_charge() -> str:
     row = _query_one(
         """
         WITH charge_windows AS (
+            -- Define charge cycles: from charge_end to next charge_start
             SELECT
                 cp.id AS charge_id,
                 cp.end_date AS charge_end,
                 cp.end_battery_level AS start_battery,
-                LEAD(cp.end_date) OVER (ORDER BY cp.start_date) AS next_charge_end,
                 LEAD(cp.start_date) OVER (ORDER BY cp.start_date) AS next_charge_start,
                 LEAD(cp.start_battery_level) OVER (ORDER BY cp.start_date) AS arrival_battery
             FROM charging_processes cp
             WHERE cp.car_id = %s AND cp.end_date IS NOT NULL
         ),
         window_drives AS (
+            -- Get all drives within each charge window, with gap to previous drive
             SELECT
                 cw.charge_id,
-                cw.charge_end,
-                cw.next_charge_start,
                 cw.start_battery,
                 cw.arrival_battery,
+                d.start_date AS drive_start,
+                d.end_date AS drive_end,
                 d.distance,
-                d.start_date
+                d.duration_min,
+                EXTRACT(EPOCH FROM (
+                    d.start_date - LAG(d.end_date) OVER (PARTITION BY cw.charge_id ORDER BY d.start_date)
+                )) / 60.0 AS gap_min
             FROM charge_windows cw
             JOIN drives d
                 ON d.car_id = %s
                 AND d.start_date >= cw.charge_end
                 AND (cw.next_charge_start IS NULL OR d.start_date < cw.next_charge_start)
+                AND d.distance > 0
+        ),
+        chain_groups AS (
+            -- Assign chain group ID: increment when gap > 5 minutes (or first drive)
+            SELECT *,
+                SUM(CASE WHEN gap_min IS NULL OR gap_min > 5 THEN 1 ELSE 0 END)
+                    OVER (PARTITION BY charge_id ORDER BY drive_start) AS chain_id
+            FROM window_drives
+        ),
+        chain_stats AS (
+            -- Aggregate each continuous chain
+            SELECT
+                charge_id,
+                chain_id,
+                start_battery,
+                arrival_battery,
+                SUM(distance) AS chain_distance_km,
+                COUNT(*) AS drive_count,
+                MIN(drive_start) AS chain_start,
+                MAX(drive_end) AS chain_end,
+                SUM(duration_min) AS chain_duration_min
+            FROM chain_groups
+            GROUP BY charge_id, chain_id, start_battery, arrival_battery
         )
         SELECT
-            charge_id,
-            charge_end,
-            next_charge_start,
+            chain_distance_km,
+            drive_count,
+            chain_start,
+            chain_end,
+            chain_duration_min,
             start_battery,
-            arrival_battery,
-            SUM(distance) AS total_distance_km,
-            MIN(start_date) AS trip_start
-        FROM window_drives
-        GROUP BY charge_id, charge_end, next_charge_start, start_battery, arrival_battery
-        ORDER BY total_distance_km DESC
+            arrival_battery
+        FROM chain_stats
+        ORDER BY chain_distance_km DESC
         LIMIT 1
         """,
         (CAR_ID, CAR_ID),
     )
 
-    if not row or not row["total_distance_km"]:
+    if not row or not row["chain_distance_km"]:
         return json.dumps({"error": "No complete charge cycles found"}, ensure_ascii=False)
 
-    distance = float(row["total_distance_km"])
-    start_time = _format_dt(row["charge_end"])
-    end_time = _format_dt(row["next_charge_start"]) if row["next_charge_start"] else "至今"
+    distance = float(row["chain_distance_km"])
+    drive_count = row["drive_count"]
+    start_time = _format_dt(row["chain_start"])
+    end_time = _format_dt(row["chain_end"])
+    duration_min = row["chain_duration_min"] or 0
     start_battery = row["start_battery"]
     arrival_battery = row["arrival_battery"]
     battery_consumed = (start_battery or 0) - (arrival_battery or 0) if start_battery and arrival_battery else None
 
     if distance > 400:
-        comment = f"一次充电狂飙 {distance:.1f}km，简直是续航榨汁机！"
+        comment = f"一次充电连续狂飙 {distance:.1f}km，续航榨汁机实锤！🚀"
     elif distance > 300:
-        comment = f"单次 {distance:.1f} km，稳稳的第一梯队！"
+        comment = f"单次连续 {distance:.1f} km，稳稳的第一梯队！"
     elif distance > 200:
-        comment = f"跑了 {distance:.1f} km，中上表现，继续保持！"
+        comment = f"连续跑了 {distance:.1f} km，中上表现，继续保持！"
     else:
-        comment = f"单次 {distance:.1f} km，还有提升空间哦~"
+        comment = f"单次连续 {distance:.1f} km，还有提升空间哦~"
+
+    duration_h = int(duration_min // 60)
+    duration_m = int(duration_min % 60)
+    duration_str = f"{duration_h}h {duration_m}m" if duration_h > 0 else f"{duration_m}m"
 
     result = {
         "record_distance_km": round(distance, 1),
+        "drive_count": drive_count,
         "start_time": start_time,
         "end_time": end_time,
+        "duration": duration_str,
         "start_battery_pct": start_battery,
         "arrival_battery_pct": arrival_battery,
         "battery_consumed_pct": round(battery_consumed, 1) if battery_consumed else None,
