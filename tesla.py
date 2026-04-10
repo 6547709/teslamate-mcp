@@ -2908,6 +2908,108 @@ async def generate_monthly_driving_report(
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def get_driver_profile() -> str:
+    """Get driver gamification profile -- rank, milestones, and Easter eggs.
+
+    Returns the user's current driving rank, total stats, unlocked milestones,
+    and hints for the next milestone. Easter egg triggers at 160,000 km.
+
+    Returns JSON with: current_rank, total_distance_km, total_charges,
+    milestones_unlocked (list), next_milestone_hint, and special_160k Easter egg.
+    """
+    _log.info(f"[TOOL] get_driver_profile called")
+
+    # -- Query 1: total distance --
+    drive_row = _query_one(
+        "SELECT COALESCE(SUM(distance), 0) AS total_distance_km FROM drives WHERE car_id = %s",
+        (CAR_ID,),
+    )
+    total_km = float(drive_row["total_distance_km"]) if drive_row else 0.0
+
+    # -- Query 2: total charge count --
+    charge_row = _query_one(
+        "SELECT COUNT(*) AS total_charge_count FROM charging_processes WHERE car_id = %s AND end_date IS NOT NULL",
+        (CAR_ID,),
+    )
+    total_charges = int(charge_row["total_charge_count"]) if charge_row else 0
+
+    # -- Rank system --
+    RANK_BRONZE  = ("🥉 青铜试飞员",      0)
+    RANK_SILVER  = ("🥈 白银巡航者",  10_000)
+    RANK_GOLD    = ("🥇 黄金领航员", 50_000)
+    RANK_KING    = ("👑 王者星舰长",  100_000)
+    RANK_DIAMOND = ("💎 钻石捍卫者",  160_000)
+    RANK_STAR    = ("✨ 星耀传世神",  300_000)
+
+    ranks = [RANK_STAR, RANK_DIAMOND, RANK_KING, RANK_GOLD, RANK_SILVER, RANK_BRONZE]
+    current_rank = RANK_BRONZE[0]
+    for rank_name, threshold in ranks:
+        if total_km >= threshold:
+            current_rank = rank_name
+            break
+
+    # -- Milestone system --
+    milestones_unlocked = []
+
+    # Distance milestones (thresholds are in km)
+    DISTANCE_NODES = [1_000, 5_000, 10_000, 16_000, 30_000]
+    DISTANCE_LABELS = {
+        1_000:  "累计里程突破 1 千公里！",
+        5_000:  "累计里程突破 5 千公里！",
+        10_000: "累计里程突破 1 万公里大关！",
+        16_000: "累计里程突破 16 万公里！质保期已满，真正的硬核模式开启！",
+        30_000: "累计里程突破 30 万公里！传奇级别！",
+    }
+    for node in DISTANCE_NODES:
+        if total_km >= node:
+            label = DISTANCE_LABELS.get(node)
+            if label and label not in milestones_unlocked:
+                milestones_unlocked.append(label)
+
+    # Charge milestones
+    CHARGE_NODES = [50, 100, 500]
+    CHARGE_LABELS = {
+        50:  "您已成为五十氪充电达人！",
+        100: "您已成为百氪充电达人！",
+        500: "您已成为五百氪充电王者！",
+    }
+    for node in CHARGE_NODES:
+        if total_charges >= node:
+            label = CHARGE_LABELS.get(node)
+            if label and label not in milestones_unlocked:
+                milestones_unlocked.append(label)
+
+    # -- Easter egg: 160,000 km --
+    special_160k = None
+    if 160_000 <= total_km < 160_000 * 1.05:
+        special_160k = "🎉 恭喜达成 16 万公里！您已正式脱离特斯拉电池质保新手保护区，真正的硬核生存模式开启！"
+
+    # -- Next milestone hint --
+    next_milestone_hint = None
+    all_distance_nodes = [1_000, 5_000, 10_000, 16_000, 30_000]
+    all_rank_nodes = [10_000, 50_000, 100_000, 160_000, 300_000]
+    all_nodes = sorted(set(all_distance_nodes + all_rank_nodes))
+    for n in all_nodes:
+        if n > total_km:
+            diff = n - total_km
+            next_milestone_hint = f"距离【{n:,}公里】还差 {diff:,.0f} km，继续加油！"
+            break
+
+    # -- Build result --
+    result = {
+        "current_rank": current_rank,
+        "total_distance_km": round(total_km, 1),
+        "total_charges": total_charges,
+        "milestones_unlocked": milestones_unlocked,
+        "next_milestone_hint": next_milestone_hint,
+    }
+    if special_160k:
+        result["special_160k"] = special_160k
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
