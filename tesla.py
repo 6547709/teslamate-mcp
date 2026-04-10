@@ -3010,6 +3010,103 @@ async def get_driver_profile() -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+async def check_daily_quest() -> str:
+    """Check today's daily driving quest and progress.
+
+    Uses a deterministic hash of the current Beijing date to select one quest
+    from the pool each day. Returns status: 未开始/进行中/已完成.
+
+    Quest pool:
+      - eco_driver (黄金右脚): avg energy < 150 Wh/km today
+      - explorer (探索者): max single trip > 50 km today
+      - commuter (勤劳小蜜蜂): trip count >= 2 today
+
+    Returns JSON with: date, quest_name, quest_description, status,
+    current_progress, target.
+    """
+    _log.info(f"[TOOL] check_daily_quest called")
+
+    QUEST_POOL = {
+        "eco_driver": ("黄金右脚", "今日所有行程平均能耗低于 150 Wh/km", "avg_wh_per_km"),
+        "explorer":   ("探索者",   "今日单次行程超过 50 km",               "max_trip_km"),
+        "commuter":   ("勤劳小蜜蜂", "今日行程次数 >= 2 次",                "trip_count"),
+    }
+
+    # Select quest using date hash (Beijing timezone)
+    today_str = _utcnow().astimezone(USER_TZ).strftime("%Y-%m-%d")
+    quest_id = list(QUEST_POOL.keys())[
+        int(hashlib.md5(today_str.encode()).hexdigest(), 16) % len(QUEST_POOL)
+    ]
+    quest_name, quest_desc, quest_key = QUEST_POOL[quest_id]
+
+    # Build UTC datetime range for today in Beijing
+    today_local = datetime.fromisoformat(today_str).replace(tzinfo=USER_TZ)
+    tomorrow_local = today_local + timedelta(days=1)
+    today_utc = today_local.astimezone(timezone.utc)
+    tomorrow_utc = tomorrow_local.astimezone(timezone.utc)
+
+    # Query today's drives
+    rows = _query(
+        """
+        SELECT distance, energy_used
+        FROM drives
+        WHERE car_id = %s
+          AND start_date >= %s
+          AND start_date < %s
+          AND end_date IS NOT NULL
+        """,
+        (CAR_ID, today_utc.isoformat(), tomorrow_utc.isoformat()),
+    )
+
+    trip_count = len(rows)
+    total_distance = sum(float(r["distance"] or 0) for r in rows)
+    total_energy = sum(float(r["energy_used"] or 0) for r in rows)
+
+    # Compute metrics
+    avg_wh_per_km = (total_energy / total_distance * 1000) if total_distance > 0 else None
+    max_trip_km = max((float(r["distance"] or 0) for r in rows), default=0.0)
+
+    # Evaluate quest
+    if trip_count == 0:
+        status = "未开始"
+        progress = "今日暂无行程记录"
+    elif quest_key == "avg_wh_per_km":
+        if avg_wh_per_km is None:
+            status = "未开始"
+            progress = "今日暂无有效能耗数据"
+        elif avg_wh_per_km < 150:
+            status = "已完成"
+            progress = f"目前平均能耗 {avg_wh_per_km:.0f} Wh/km ✅"
+        else:
+            status = "进行中"
+            progress = f"目前平均能耗 {avg_wh_per_km:.0f} Wh/km（目标 < 150）"
+    elif quest_key == "max_trip_km":
+        if max_trip_km > 50:
+            status = "已完成"
+            progress = f"今日最长单次 {max_trip_km:.1f} km ✅"
+        else:
+            status = "进行中"
+            progress = f"今日最长单次 {max_trip_km:.1f} km（目标 > 50 km）"
+    else:  # commuter
+        if trip_count >= 2:
+            status = "已完成"
+            progress = f"今日已完成 {trip_count} 次行程 ✅"
+        else:
+            status = "进行中"
+            progress = f"今日已完成 {trip_count} 次行程（目标 >= 2）"
+
+    result = {
+        "date": today_str,
+        "quest_name": quest_name,
+        "quest_description": quest_desc,
+        "status": status,
+        "current_progress": progress,
+        "target": "150 Wh/km" if quest_key == "avg_wh_per_km" else ("50 km" if quest_key == "max_trip_km" else "2 次行程"),
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
