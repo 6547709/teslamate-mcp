@@ -3049,7 +3049,8 @@ async def check_daily_quest() -> str:
     # Query today's drives
     rows = _query(
         """
-        SELECT distance, energy_used
+        SELECT distance,
+               start_ideal_range_km, end_ideal_range_km
         FROM drives
         WHERE car_id = %s
           AND start_date >= %s
@@ -3061,7 +3062,11 @@ async def check_daily_quest() -> str:
 
     trip_count = len(rows)
     total_distance = sum(float(r["distance"] or 0) for r in rows)
-    total_energy = sum(float(r["energy_used"] or 0) for r in rows)
+    # Energy is calculated from ideal range delta, not a direct column
+    total_energy = sum(
+        max(0, (float(r["start_ideal_range_km"] or 0) - float(r["end_ideal_range_km"] or 0)) * KWH_PER_KM)
+        for r in rows
+    )
 
     # Compute metrics
     avg_wh_per_km = (total_energy / total_distance * 1000) if total_distance > 0 else None
