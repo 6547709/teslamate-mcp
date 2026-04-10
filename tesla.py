@@ -2467,18 +2467,19 @@ async def check_driving_achievements(days: int = 30) -> str:
             ),
         })
 
-    # Achievement 2:午夜幽灵 -- 3+ drives between 00:00 and 04:00
+    # Achievement 2:午夜幽灵 -- 3+ drives between 00:00 and 04:00 (in user's timezone)
+    # Convert UTC start_date to user's timezone before extracting hour
     midnight_drives = _query(
         """
         SELECT start_date, distance, duration_min,
                outside_temp_avg, end_address_id
         FROM drives
         WHERE car_id = %s AND start_date >= %s
-          AND EXTRACT(HOUR FROM start_date) >= 0
-          AND EXTRACT(HOUR FROM start_date) < 4
+          AND EXTRACT(HOUR FROM start_date AT TIME ZONE %s) >= 0
+          AND EXTRACT(HOUR FROM start_date AT TIME ZONE %s) < 4
         ORDER BY start_date DESC
         """,
-        (CAR_ID, cutoff,),
+        (CAR_ID, cutoff, TIMEZONE, TIMEZONE),
     )
     if len(midnight_drives) >= 3:
         earliest = midnight_drives[-1]

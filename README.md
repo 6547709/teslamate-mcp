@@ -213,15 +213,25 @@ All configuration is via environment variables.
 | `TESLA_BATTERY_KWH` | `75` | Usable battery capacity in kWh |
 | `TESLA_BATTERY_RANGE_KM` | `525` | EPA range at 100% in km |
 
-**Battery capacity reference:**
+**Battery capacity reference (China):**
 
-| Vehicle | Battery (kWh) | Range (km) |
-|---------|--------------|------------|
-| Model 3 Standard Range | 54 | 350 |
-| Model 3 Long Range | 75 | 500 |
-| Model Y Long Range | 75 | 525 |
-| Model S Long Range | 100 | 650 |
-| Model X Long Range | 100 | 560 |
+| Vehicle | Battery (kWh) | Range (km) | Note |
+|---------|--------------|------------|------|
+| **Model 3** | | | |
+| Model 3 Standard Range (2019-2021) | 54 | 468 | NEDC |
+| Model 3 Standard Range (2021-2023) | 55 | 556 | CLTC, LFP |
+| Model 3 Highland (2023+) | 60 | 606 | CLTC |
+| **Model Y** | | | |
+| Model Y Standard Range (2021) | 60 | 525 | NEDC |
+| Model Y Standard Range (2021-2023) | 60 | 545 | CLTC, LFP |
+| Model Y Long Range AWD (2022-2023) | 75 | 660 | CLTC |
+| Model Y Performance AWD (2021-2023) | 75 | 615 | CLTC |
+| Model Y Long Range (2024+) | 75 | 719 | CLTC, RWD |
+| Model Y Highland Long Range AWD (2024+) | 75 | 662 | CLTC |
+| Model Y Highland Performance (2024+) | 75 | 662 | CLTC |
+| **Model S/X ( imported)** | | | |
+| Model S Long Range | 100 | 650 | |
+| Model X Long Range | 100 | 560 | |
 
 ### TPMS Thresholds (Optional)
 
