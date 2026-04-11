@@ -662,87 +662,17 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def tesla_driving_score(
-    period: str = "recent_n",
-    n: int = 10,
-    year: int | None = None,
-    month: int | None = None,
-) -> str:
-    """Driving score based on acceleration, braking, and speed habits.
+def _calculate_driving_score(rows: list) -> tuple[float, int, list]:
+    """Calculate driving score from rows of drive data.
 
-    Args:
-        period: "recent_n" (default), "monthly", or "yearly"
-        n: Number of recent drives to score (default: 10, used when period="recent_n")
-        year: Year for monthly/yearly period (e.g. 2024)
-        month: Month (1-12) for monthly period
+    Returns: (safety_score, total_deduct, details)
     """
-    _log.info(f"[TOOL] tesla_driving_score called")
-    # Validate parameters
-    if period not in ("recent_n", "monthly", "yearly"):
-        return "❌ period must be 'recent_n', 'monthly', or 'yearly'"
-    if month is not None and (month < 1 or month > 12):
-        return "❌ month must be between 1 and 12"
-    # Build date filter
-    if period == "recent_n":
-        rows = _query(
-            """
-            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
-                   d.speed_max, d.start_date
-            FROM drives d
-            WHERE d.car_id = %s AND d.distance > 0
-            ORDER BY d.start_date DESC LIMIT %s
-            """,
-            (CAR_ID, n),
-        )
-        label = f"last {len(rows)} drives"
-    elif period == "monthly":
-        if not year or not month:
-            return "year and month are required for monthly period"
-        start = datetime(year, month, 1)
-        if month == 12:
-            end = datetime(year + 1, 1, 1)
-        else:
-            end = datetime(year, month + 1, 1)
-        rows = _query(
-            """
-            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
-                   d.speed_max, d.start_date
-            FROM drives d
-            WHERE d.car_id = %s AND d.distance > 0
-              AND d.start_date >= %s AND d.start_date < %s
-            ORDER BY d.start_date DESC
-            """,
-            (CAR_ID, start.isoformat(), end.isoformat()),
-        )
-        label = f"{year}-{month:02d}"
-    elif period == "yearly":
-        if not year:
-            return "year is required for yearly period"
-        start = datetime(year, 1, 1)
-        end = datetime(year + 1, 1, 1)
-        rows = _query(
-            """
-            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
-                   d.speed_max, d.start_date
-            FROM drives d
-            WHERE d.car_id = %s AND d.distance > 0
-              AND d.start_date >= %s AND d.start_date < %s
-            ORDER BY d.start_date DESC
-            """,
-            (CAR_ID, start.isoformat(), end.isoformat()),
-        )
-        label = str(year)
-    else:
-        return f"Unknown period: {period}. Use recent_n, monthly, or yearly."
-
     if not rows:
-        return f"No drives found for {label}."
+        return 100.0, 0, []
 
-    # Score calculation
-    POWER_ACCEL_THRESHOLD = 50   # kW -- above this = aggressive acceleration
-    POWER_BRAKE_THRESHOLD = -30  # kW -- below this = harsh braking
-    SPEED_THRESHOLD_KMH = 130     # km/h -- above this = speeding
+    POWER_ACCEL_THRESHOLD = 50
+    POWER_BRAKE_THRESHOLD = -30
+    SPEED_THRESHOLD_KMH = 130
 
     total_deduct = 0
     details = []
@@ -771,6 +701,26 @@ async def tesla_driving_score(
     avg_deduct = total_deduct / num_drives
     safety_score = max(0, 100 - avg_deduct * 10)
 
+    return safety_score, total_deduct, details
+
+
+def _query_drives(start_utc: datetime, end_utc: datetime) -> list:
+    """Query drives within date range (UTC)."""
+    return _query(
+        """
+        SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+               d.speed_max, d.start_date
+        FROM drives d
+        WHERE d.car_id = %s AND d.distance > 0
+          AND d.start_date >= %s AND d.start_date < %s
+        ORDER BY d.start_date DESC
+        """,
+        (CAR_ID, start_utc.isoformat(), end_utc.isoformat()),
+    )
+
+
+def _format_driving_score_output(label: str, safety_score: float, avg_deduct: float, total_deduct: int, num_drives: int, details: list) -> str:
+    """Format driving score output in Chinese."""
     lines = [f"**Driving Score -- {label}**\n"]
     lines.append(f"驾驶安全评分: {safety_score:.1f}/100（平均每次驾驶扣{avg_deduct:.1f}分）")
     lines.append(f"总违章积分: {total_deduct}分（{num_drives}次驾驶）")
@@ -778,6 +728,124 @@ async def tesla_driving_score(
         lines.append(f"违规事件: {', '.join(details[:5])}")
     lines.append(f"驾驶次数: {num_drives}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_driving_score(
+    period: str = "recent_n",
+    n: int | None = None,
+    days: int | None = None,
+    year: int | None = None,
+    start_month: int | None = None,
+    end_month: int | None = None,
+    month: int | None = None,
+) -> str:
+    """Driving score based on acceleration, braking, and speed habits.
+
+    Args:
+        period: "recent_n" | "days" | "monthly" | "months"
+        n: Number of recent drives (period="recent_n")
+        days: Number of recent days (period="days")
+        year: Year for monthly/months period (e.g. 2024)
+        start_month: Start month (period="months", 1-12)
+        end_month: End month (period="months", 1-12)
+        month: Month (period="monthly", 1-12)
+    """
+    _log.info(f"[TOOL] tesla_driving_score called with period={period}")
+
+    if period == "recent_n":
+        n = n or 10
+        rows = _query(
+            """
+            SELECT d.distance, d.duration_min, d.power_max, d.power_min,
+                   d.speed_max, d.start_date
+            FROM drives d
+            WHERE d.car_id = %s AND d.distance > 0
+            ORDER BY d.start_date DESC LIMIT %s
+            """,
+            (CAR_ID, n),
+        )
+        if not rows:
+            return f"No drives found for last {n} drives."
+        safety_score, total_deduct, details = _calculate_driving_score(rows)
+        num_drives = len(rows)
+        avg_deduct = total_deduct / num_drives
+        label = f"last {num_drives} drives"
+        return _format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details)
+
+    elif period == "days":
+        days_val = days or 1
+        # Calculate date range in USER_TZ, then convert to UTC
+        today_local = _utcnow().astimezone(USER_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = today_local + timedelta(days=1)
+        start_local = today_local - timedelta(days=days_val - 1)
+
+        end_utc = end_local.astimezone(timezone.utc)
+        start_utc = start_local.astimezone(timezone.utc)
+
+        rows = _query_drives(start_utc, end_utc)
+        if not rows:
+            return f"No drives found for last {days_val} days."
+
+        safety_score, total_deduct, details = _calculate_driving_score(rows)
+        num_drives = len(rows)
+        avg_deduct = total_deduct / num_drives
+        label = f"last {days_val} days"
+        return _format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details)
+
+    elif period == "monthly":
+        if not year or not month:
+            return "year and month are required for monthly period"
+        if month < 1 or month > 12:
+            return "month must be between 1 and 12"
+
+        # Calculate date range in USER_TZ, then convert to UTC
+        start_local = datetime(year, month, 1, tzinfo=USER_TZ)
+        if month == 12:
+            end_local = datetime(year + 1, 1, 1, tzinfo=USER_TZ)
+        else:
+            end_local = datetime(year, month + 1, 1, tzinfo=USER_TZ)
+
+        rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+        if not rows:
+            return f"No drives found for {year}-{month:02d}."
+
+        safety_score, total_deduct, details = _calculate_driving_score(rows)
+        num_drives = len(rows)
+        avg_deduct = total_deduct / num_drives
+        label = f"{year}-{month:02d}"
+        return _format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details)
+
+    elif period == "months":
+        if not year or start_month is None or end_month is None:
+            return "year, start_month, and end_month are required for months period"
+        if start_month < 1 or start_month > 12 or end_month < 1 or end_month > 12:
+            return "month must be between 1 and 12"
+        if start_month > end_month:
+            return "start_month must be <= end_month"
+
+        outputs = []
+        for m in range(start_month, end_month + 1):
+            start_local = datetime(year, m, 1, tzinfo=USER_TZ)
+            if m == 12:
+                end_local = datetime(year + 1, 1, 1, tzinfo=USER_TZ)
+            else:
+                end_local = datetime(year, m + 1, 1, tzinfo=USER_TZ)
+
+            rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+            if rows:
+                safety_score, total_deduct, details = _calculate_driving_score(rows)
+                num_drives = len(rows)
+                avg_deduct = total_deduct / num_drives
+                label = f"{year}-{m:02d}"
+                outputs.append(_format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details))
+            else:
+                outputs.append(f"**Driving Score -- {year}-{m:02d}**\n无驾驶数据")
+
+        return "\n\n".join(outputs)
+
+    else:
+        return "❌ period must be 'recent_n', 'days', 'monthly', or 'months'"
 
 
 # -- Trip Classification Logic -----------------------------------------------
