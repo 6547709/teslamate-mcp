@@ -744,7 +744,7 @@ async def tesla_driving_score(
     POWER_BRAKE_THRESHOLD = -30  # kW -- below this = harsh braking
     SPEED_THRESHOLD_KMH = 130     # km/h -- above this = speeding
 
-    score = 100
+    total_deduct = 0
     details = []
 
     for r in rows:
@@ -754,26 +754,29 @@ async def tesla_driving_score(
 
         if power_max > POWER_ACCEL_THRESHOLD:
             deduct = min(5, round((power_max - POWER_ACCEL_THRESHOLD) / 10))
-            score -= deduct
+            total_deduct += deduct
             details.append(f"hard accel ({power_max:.0f} kW)")
 
         if power_min < POWER_BRAKE_THRESHOLD:
             deduct = min(5, round((abs(power_min) - abs(POWER_BRAKE_THRESHOLD)) / 10))
-            score -= deduct
+            total_deduct += deduct
             details.append(f"hard brake ({power_min:.0f} kW)")
 
         if speed_max > SPEED_THRESHOLD_KMH:
             deduct = min(3, round((speed_max - SPEED_THRESHOLD_KMH) / 20))
-            score -= deduct
+            total_deduct += deduct
             details.append(f"high speed ({speed_max:.0f} km/h)")
 
-    score = max(0, min(100, score))
+    num_drives = len(rows)
+    avg_deduct = total_deduct / num_drives
+    safety_score = max(0, 100 - avg_deduct * 10)
 
     lines = [f"**Driving Score -- {label}**\n"]
-    lines.append(f"Score: {score}/100")
+    lines.append(f"驾驶安全评分: {safety_score:.1f}/100（平均每次驾驶扣{avg_deduct:.1f}分）")
+    lines.append(f"总违章积分: {total_deduct}分（{num_drives}次驾驶）")
     if details:
-        lines.append(f"Events: {', '.join(details[:5])}")
-    lines.append(f"Drives analyzed: {len(rows)}")
+        lines.append(f"违规事件: {', '.join(details[:5])}")
+    lines.append(f"驾驶次数: {num_drives}")
     return "\n".join(lines)
 
 
