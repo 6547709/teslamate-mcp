@@ -558,8 +558,9 @@ async def tesla_charging_history(days: int = 30, date_from: str | None = None, d
                cp.charge_energy_added, cp.duration_min,
                cp.start_battery_level, cp.end_battery_level,
                cp.cost,
-               a.display_name AS location
+               COALESCE(gf.name, a.display_name) AS location
         FROM charging_processes cp
+        LEFT JOIN geofences gf ON cp.geofence_id = gf.id
         LEFT JOIN positions p ON cp.position_id = p.id
         LEFT JOIN LATERAL (
             SELECT a2.display_name
