@@ -446,18 +446,18 @@ async def tesla_status(car_id: int | None = None) -> str:
         FROM (
             SELECT battery_level, is_climate_on, inside_temp, outside_temp,
                    odometer, speed, latitude, longitude, date
-            FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
+            FROM positions WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) p
         LEFT JOIN LATERAL (
-            SELECT state FROM states WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+            SELECT state FROM states WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) s ON true
         LEFT JOIN LATERAL (
             SELECT charge_energy_added, duration_min, start_battery_level,
                    end_battery_level, start_date, end_date
-            FROM charging_processes WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+            FROM charging_processes WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) cp ON true
         LEFT JOIN LATERAL (
-            SELECT version FROM updates WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+            SELECT version FROM updates WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) u ON true
     """, (effective_car_id, effective_car_id, effective_car_id, effective_car_id))
 
@@ -1508,14 +1508,14 @@ async def tesla_live(car_id: int | None = None) -> str:
                    odometer, speed, power, latitude, longitude, date,
                    tpms_pressure_fl, tpms_pressure_fr,
                    tpms_pressure_rl, tpms_pressure_rr
-            FROM positions WHERE car_id = %s ORDER BY date DESC LIMIT 1
+            FROM positions WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) p
         LEFT JOIN LATERAL (
             SELECT start_date, end_date, charge_energy_added
-            FROM charging_processes WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+            FROM charging_processes WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) cp ON true
         LEFT JOIN LATERAL (
-            SELECT version FROM updates WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+            SELECT version FROM updates WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) u ON true
     """, (effective_car_id, effective_car_id, effective_car_id))
 
@@ -1573,7 +1573,7 @@ async def tesla_live(car_id: int | None = None) -> str:
 
     # State from states table
     current_state = _query_one("""
-        SELECT state FROM states WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+        SELECT state FROM states WHERE car_id = %s ORDER BY id DESC LIMIT 1
     """, (effective_car_id,))
 
     state_label = "Unknown"
@@ -1746,7 +1746,7 @@ async def tesla_trip_cost(
     pos = _query_one("""
         SELECT latitude, longitude, battery_level
         FROM positions WHERE car_id = %s
-        ORDER BY date DESC LIMIT 1
+        ORDER BY id DESC LIMIT 1
     """, (effective_car_id,))
     if not pos:
         return "No current position data."
@@ -2183,7 +2183,7 @@ async def tesla_tpms_status(car_id: int | None = None) -> str:
         WHERE car_id = %s
           AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL
                OR tpms_pressure_rl IS NOT NULL OR tpms_pressure_rr IS NOT NULL)
-        ORDER BY date DESC
+        ORDER BY id DESC
         LIMIT 1
     """, (effective_car_id,))
 
