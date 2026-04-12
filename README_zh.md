@@ -10,12 +10,15 @@
 
 ## 功能特性
 
-**30 个工具**，分为六大类 — 全部只读查询 TeslaMate PostgreSQL：
+**31 个工具**，分为六大类 — 多车辆支持，所有工具都支持可选的 `car_id` 参数
+
+**多车辆支持：** 所有工具都支持可选的 `car_id` 参数来查询特定车辆。使用 `tesla_cars()` 列出所有已注册的车辆。
 
 ### 🚗 车辆状态
 
 | 工具 | 说明 |
 |------|------|
+| `tesla_cars` | 列出 TeslaMate 中已注册的所有车辆 |
 | `tesla_status` | 当前车辆状态 — 电量、续航、位置、空调、里程 |
 | `tesla_live` | 实时轮询状态（GPS、电池、温度、TPMS、充电） |
 | `tesla_tpms_status` | 胎压监测，异常报警 |
@@ -25,7 +28,7 @@
 
 | 工具 | 说明 |
 |------|------|
-| `tesla_drives` | 最近 N 天行程列表 |
+| `tesla_drives` | 最近行程列表，支持 date_from/date_to 筛选 |
 | `tesla_driving_score` | 驾驶评分（加速/刹车/速度习惯） |
 | `tesla_trips_by_category` | 按类别筛选行程（通勤/购物/休闲/长途/其他） |
 | `tesla_trip_categories` | 各类别行程数量统计 |
@@ -37,7 +40,8 @@
 
 | 工具 | 说明 |
 |------|------|
-| `tesla_charging_history` | 充电历史记录 |
+| `tesla_charging_history` | 充电历史记录（支持 date_from/date_to） |
+| `tesla_charges` | 详细充电记录（含地点和费用明细） |
 | `tesla_charging_by_location` | 各充电地点的充电模式（支持日期过滤） |
 | `tesla_battery_health` | 电池衰减趋势（100% 电量续航变化） |
 | `tesla_vampire_drain` | 驻车掉电分析（过夜电池损耗） |

@@ -10,12 +10,15 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ## Features
 
-**30 tools** across six categories — all read-only from TeslaMate PostgreSQL:
+**31 tools** across six categories — multi-vehicle support via optional `car_id` parameter
+
+**Multi-vehicle:** All tools accept an optional `car_id` parameter to query a specific vehicle. Use `tesla_cars()` to list all registered vehicles.
 
 ### 🚗 Vehicle Status
 
 | Tool | Description |
 |------|-------------|
+| `tesla_cars` | List all vehicles registered in TeslaMate |
 | `tesla_status` | Current state — battery, range, location, climate, odometer |
 | `tesla_live` | Latest polled state (GPS, battery, climate, TPMS, charging) |
 | `tesla_tpms_status` | Current tyre pressures with anomaly warnings |
@@ -25,7 +28,7 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 | Tool | Description |
 |------|-------------|
-| `tesla_drives` | Recent drives with distance, duration, efficiency |
+| `tesla_drives` | Recent drives with distance, duration, efficiency (supports date_from/date_to) |
 | `tesla_driving_score` | Driving score (acceleration, braking, speed habits) |
 | `tesla_trips_by_category` | Filter trips by category (commute / shopping / leisure / long_trip / other) |
 | `tesla_trip_categories` | Trip count breakdown by category |
@@ -37,7 +40,8 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 | Tool | Description |
 |------|-------------|
-| `tesla_charging_history` | Charging sessions over N days |
+| `tesla_charging_history` | Charging sessions over N days (supports date_from/date_to) |
+| `tesla_charges` | Detailed charging sessions with location and cost breakdown |
 | `tesla_charging_by_location` | Charging patterns by location (supports date filter) |
 | `tesla_battery_health` | Battery degradation trend (range at 100% over time) |
 | `tesla_vampire_drain` | Battery loss while parked (overnight drain analysis) |
