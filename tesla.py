@@ -607,6 +607,99 @@ async def tesla_charging_history(days: int = 30, date_from: str | None = None, d
 
 
 @mcp.tool()
+async def tesla_charges(
+    days: int = 30,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 50,
+) -> str:
+    """Detailed charging sessions with location, energy, cost breakdown.
+
+    Unlike tesla_charging_history which summarizes by process, this returns
+    granular charging session data.
+
+    Args:
+        days: Number of days to look back (default: 30)
+        date_from: Filter from date (YYYY-MM-DD)
+        date_to: Filter until date (YYYY-MM-DD)
+        limit: Maximum sessions to return (default: 50, -1 for all)
+    """
+    _log.info(f"[TOOL] tesla_charges called")
+    if days <= 0 or days > 3650:
+        return "❌ days must be between 1 and 3650"
+
+    try:
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    end_boundary = date_to_dt.isoformat() if date_to_dt else None
+    limit_sql = "" if limit < 0 else f"LIMIT {limit}"
+
+    rows = _query(
+        f"""
+        SELECT
+            cp.id AS session_id,
+            cp.start_date, cp.end_date,
+            cp.charge_energy_added, cp.charge_energy_used,
+            cp.duration_min,
+            cp.start_battery_level, cp.end_battery_level,
+            cp.cost,
+            COALESCE(gf.name, addr.display_name) AS location,
+            addr.city, addr.country
+        FROM charging_processes cp
+        LEFT JOIN geofences gf ON cp.geofence_id = gf.id
+        LEFT JOIN positions p ON cp.position_id = p.id
+        LEFT JOIN LATERAL (
+            SELECT display_name, city, country
+            FROM addresses a2
+            WHERE a2.latitude BETWEEN p.latitude - 0.001 AND p.latitude + 0.001
+              AND a2.longitude BETWEEN p.longitude - 0.001 AND p.longitude + 0.001
+            ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
+            LIMIT 1
+        ) addr ON p.latitude IS NOT NULL
+        WHERE cp.car_id = %s
+          AND cp.start_date >= %s
+          AND (cp.start_date < %s OR %s IS NULL)
+          AND cp.end_date IS NOT NULL
+        ORDER BY cp.start_date DESC
+        {limit_sql}
+    """,
+        (CAR_ID, cutoff, end_boundary, end_boundary),
+    )
+
+    if not rows:
+        return f"No charging sessions found."
+
+    lines = [f"**Charging Sessions** ({len(rows)} sessions)\n"]
+    for r in rows:
+        date_str = _format_dt(r.get("start_date"))
+        end_str = _format_dt(r.get("end_date")) if r.get("end_date") else "In progress"
+        kwh_added = r.get("charge_energy_added") or 0
+        kwh_used = r.get("charge_energy_used") or 0
+        dur = r.get("duration_min") or 0
+        start_pct = r.get("start_battery_level") or "?"
+        end_pct = r.get("end_battery_level") or "?"
+        loc = r.get("location") or "Unknown"
+        city = r.get("city") or ""
+        cost = r.get("cost")
+        cost_str = f", RMB{cost:.2f}" if cost else ""
+
+        lines.append(
+            f"- {date_str} -> {end_str}\n"
+            f"  {kwh_added:.1f} kWh added ({start_pct}% -> {end_pct}%), "
+            f"{dur} min{cost_str}\n"
+            f"  Location: {loc}{f' ({city})' if city else ''}"
+        )
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: str | None = None) -> str:
     """Recent drives -- distance, duration, efficiency, start/end locations.
 
