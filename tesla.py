@@ -1008,14 +1008,62 @@ async def tesla_driving_score(
 # -- Trip Classification Logic -----------------------------------------------
 
 TRIP_THRESHOLD_KM = 100  # drives longer than this = "long_trip"
+COMMUTE_MIN_DIST_KM = 1.0  # minimal distance to be considered a commute
 COMMUTE_PAIRS = [
     ("home", "work"),
     ("work", "home"),
 ]
 
+# Simple in-memory cache for routine locations
+# Key: car_id, Value: (dict of ids, timestamp)
+ROUTINE_CACHE = {}
+ROUTINE_CACHE_TTL = 86400  # 24 hours
 
-def _classify_trip(start_geofence: str | None, end_geofence: str | None, distance_km: float) -> str:
-    """Classify a trip based on geofence names and distance."""
+
+def _get_routine_locations(car_id: int) -> dict:
+    """Identify top 2 most frequent address IDs for a car as routine locations (Home/Work)."""
+    now = time.time()
+    if car_id in ROUTINE_CACHE:
+        ids, ts = ROUTINE_CACHE[car_id]
+        if now - ts < ROUTINE_CACHE_TTL:
+            return ids
+
+    # Find Top 3 most frequent start and end address IDs combined
+    rows = _query(
+        """
+        SELECT addr_id, COUNT(*) as frequency
+        FROM (
+            SELECT start_address_id as addr_id FROM drives WHERE car_id = %s
+            UNION ALL
+            SELECT end_address_id as addr_id FROM drives WHERE car_id = %s
+        ) sub
+        WHERE addr_id IS NOT NULL
+        GROUP BY addr_id
+        ORDER BY frequency DESC
+        LIMIT 3
+        """,
+        (car_id, car_id),
+    )
+
+    ids = {"home_id": None, "work_id": None}
+    if len(rows) >= 1:
+        ids["home_id"] = rows[0]["addr_id"]
+    if len(rows) >= 2:
+        ids["work_id"] = rows[1]["addr_id"]
+
+    ROUTINE_CACHE[car_id] = (ids, now)
+    return ids
+
+
+def _classify_trip(
+    start_geofence: str | None,
+    end_geofence: str | None,
+    distance_km: float,
+    start_addr_id: int | None = None,
+    end_addr_id: int | None = None,
+    routine_ids: dict | None = None,
+) -> str:
+    """Classify a trip based on geofence names, distance, or frequent address IDs."""
     start = (start_geofence or "").lower()
     end = (end_geofence or "").lower()
 
@@ -1023,9 +1071,16 @@ def _classify_trip(start_geofence: str | None, end_geofence: str | None, distanc
     if distance_km > TRIP_THRESHOLD_KM:
         return "long_trip"
 
-    # Commute: home <-> work
+    # 1. Explicit keyword-based commute detection (Priority 1: User defined)
     for home_key, work_key in COMMUTE_PAIRS:
         if (home_key in start and work_key in end) or (home_key in end and work_key in start):
+            return "commute"
+
+    # 2. Heuristic ID-based commute detection (Priority 2: Frequency learned)
+    if routine_ids and start_addr_id and end_addr_id and distance_km >= COMMUTE_MIN_DIST_KM:
+        h_id = routine_ids.get("home_id")
+        w_id = routine_ids.get("work_id")
+        if (start_addr_id == h_id and end_addr_id == w_id) or (start_addr_id == w_id and end_addr_id == h_id):
             return "commute"
 
     # Shopping keywords
@@ -1077,6 +1132,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
     rows = _query(
         """
         SELECT d.start_date, d.distance, d.duration_min,
+               d.start_address_id, d.end_address_id,
                sa.display_name AS start_location,
                ea.display_name AS end_location
         FROM drives d
@@ -1088,6 +1144,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         (effective_car_id, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None, limit * 5),
     )
 
+    routine_ids = _get_routine_locations(effective_car_id)
     classified = []
     for r in rows:
         dist_km = r.get("distance") or 0
@@ -1095,6 +1152,9 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
             r.get("start_location"),
             r.get("end_location"),
             dist_km,
+            start_addr_id=r.get("start_address_id"),
+            end_addr_id=r.get("end_address_id"),
+            routine_ids=routine_ids,
         )
         if cat == category:
             classified.append(r)
@@ -1127,6 +1187,7 @@ async def tesla_trip_categories(car_id: int | None = None) -> str:
     rows = _query(
         f"""
         SELECT d.distance,
+               d.start_address_id, d.end_address_id,
                sa.display_name AS start_location,
                ea.display_name AS end_location
         FROM drives d
@@ -1139,12 +1200,16 @@ async def tesla_trip_categories(car_id: int | None = None) -> str:
         (effective_car_id,),
     )
 
+    routine_ids = _get_routine_locations(effective_car_id)
     counts = {"commute": 0, "shopping": 0, "leisure": 0, "long_trip": 0, "other": 0}
     for r in rows:
         cat = _classify_trip(
             r.get("start_location"),
             r.get("end_location"),
             r.get("distance") or 0,
+            start_addr_id=r.get("start_address_id"),
+            end_addr_id=r.get("end_address_id"),
+            routine_ids=routine_ids,
         )
         counts[cat] += 1
 
