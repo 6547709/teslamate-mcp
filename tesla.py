@@ -388,6 +388,31 @@ def _format_cost(kwh: float) -> str:
 
 # -- TeslaMate Read Tools ------------------------------------------------------
 
+@mcp.tool()
+async def tesla_cars() -> str:
+    """List all vehicles registered in TeslaMate.
+
+    Returns each car's ID, name, model, VIN, and efficiency.
+    Use the car_id with other tools to query a specific vehicle.
+    """
+    _log.info(f"[TOOL] tesla_cars called")
+    rows = _query("SELECT id, name, model, vin, efficiency FROM cars ORDER BY display_priority, id")
+
+    if not rows:
+        return "No vehicles registered in TeslaMate."
+
+    lines = [f"**Vehicles** ({len(rows)} registered)\n"]
+    for car in rows:
+        cid = car.get("id")
+        name = car.get("name") or "Unnamed"
+        model = car.get("model") or ""
+        vin = car.get("vin") or ""
+        eff = car.get("efficiency")
+        eff_str = f", efficiency {eff:.3f}" if eff else ""
+        lines.append(f"- Car {cid}: {name} ({model}), VIN: ...{vin[-6:]}{eff_str}")
+
+    return "\n".join(lines)
+
 
 @mcp.tool()
 async def tesla_status() -> str:
