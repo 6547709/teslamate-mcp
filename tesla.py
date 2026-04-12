@@ -583,25 +583,25 @@ async def tesla_charging_history(days: int = 30) -> str:
 
 
 @mcp.tool()
-async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: str | None = None) -> str:
+async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: str | None = None) -> str:
     """Recent drives -- distance, duration, efficiency, start/end locations.
 
     Shows driving activity with energy consumption.
 
     Args:
         days: Number of days to look back from today (default: 30, max: 3650/10years)
-        start_date: Filter drives from this date (YYYY-MM-DD), overrides days param
-        end_date: Filter drives until this date (YYYY-MM-DD), defaults to today
+        date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_drives called")
     # Validate date parameters
     try:
-        start_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
-        end_dt = _parse_date(end_date, _utcnow())
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
         # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
-        # e.g., end_date="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
-        if end_date and end_dt:
-            end_dt = end_dt + timedelta(days=1)
+        # e.g., date_to="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
@@ -620,12 +620,12 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         ORDER BY d.start_date DESC
         {_limit_sql(LIMIT_DRIVES)}
     """,
-        (CAR_ID, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None,),
+        (CAR_ID, date_from_dt.isoformat() if date_from_dt else None, date_to_dt.isoformat() if date_to_dt else None,),
     )
 
-    date_range = f"{start_date}" if start_date else f"last {days} days"
-    if end_date:
-        date_range = f"{start_date or 'start'} to {end_date}"
+    date_range = f"{date_from}" if date_from else f"last {days} days"
+    if date_to:
+        date_range = f"{date_from or 'start'} to {date_to}"
     if not rows:
         return f"No drives recorded ({date_range})."
 
