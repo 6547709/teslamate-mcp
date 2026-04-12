@@ -492,8 +492,19 @@ async def tesla_status() -> str:
         lines.append(f"Odometer: {_format_distance(odo_km)}")
 
     vehicle_state = combined.get("vehicle_state")
-    if vehicle_state:
-        lines.append(f"State: {vehicle_state}")
+    speed = combined.get("speed")
+    if vehicle_state == "online":
+        if speed is not None and speed > 0:
+            state_display = "Driving"
+        else:
+            state_display = "Parked"
+    elif vehicle_state == "offline":
+        state_display = "Offline"
+    elif vehicle_state == "asleep":
+        state_display = "Asleep"
+    else:
+        state_display = "Unknown"
+    lines.append(f"State: {state_display}")
 
     if geofence and geofence.get("name"):
         lines.append(f"Location: {geofence['name']}")
@@ -1399,6 +1410,22 @@ async def tesla_live() -> str:
             lines.append(f"Driving: {round(speed * 2.237)} mph")
     else:
         lines.append("Driving: Parked")
+
+    # State from states table
+    current_state = _query_one("""
+        SELECT state FROM states WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
+    """, (CAR_ID,))
+
+    state_label = "Unknown"
+    if current_state:
+        s = current_state.get("state")
+        if s == "online":
+            state_label = "Online"
+        elif s == "offline":
+            state_label = "Offline"
+        elif s == "asleep":
+            state_label = "Asleep"
+    lines.append(f"State: {state_label}")
 
     # Location
     lat = combined.get("latitude")
