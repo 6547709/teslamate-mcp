@@ -518,18 +518,29 @@ async def tesla_status() -> str:
 
 
 @mcp.tool()
-async def tesla_charging_history(days: int = 30) -> str:
+async def tesla_charging_history(days: int = 30, date_from: str | None = None, date_to: str | None = None) -> str:
     """Charging sessions over the last N days.
 
     Shows energy added, duration, battery range, and location for each session.
 
     Args:
         days: Number of days to look back (default: 30, max: ~10 years)
+        date_from: Filter charging from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter charging until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_charging_history called")
     if days <= 0 or days > 3650:
         return "❌ days must be between 1 and 3650"
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    try:
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    end_boundary = date_to_dt.isoformat() if date_to_dt else None
     rows = _query(
         f"""
         SELECT cp.start_date, cp.end_date,
@@ -547,17 +558,18 @@ async def tesla_charging_history(days: int = 30) -> str:
             ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
             LIMIT 1
         ) a ON p.latitude IS NOT NULL
-        WHERE cp.car_id = %s AND cp.start_date >= %s AND cp.end_date IS NOT NULL
+        WHERE cp.car_id = %s AND cp.start_date >= %s AND (cp.start_date < %s OR %s IS NULL) AND cp.end_date IS NOT NULL
         ORDER BY cp.start_date DESC
         {_limit_sql(LIMIT_CHARGING)}
     """,
-        (CAR_ID, cutoff,),
+        (CAR_ID, cutoff, end_boundary, end_boundary),
     )
 
+    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
     if not rows:
-        return f"No charging sessions in the last {days} days."
+        return f"No charging sessions ({date_range})."
 
-    lines = [f"**Charging History** (last {days} days, {len(rows)} sessions)\n"]
+    lines = [f"**Charging History** ({date_range}, {len(rows)} sessions)\n"]
     total_kwh = 0.0
     total_cost = 0.0
     for r in rows:
@@ -885,35 +897,35 @@ def _classify_trip(start_geofence: str | None, end_geofence: str | None, distanc
 
 
 @mcp.tool()
-async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, start_date: str | None = None, end_date: str | None = None) -> str:
+async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, date_from: str | None = None, date_to: str | None = None) -> str:
     """Get trips filtered by category.
 
     Args:
         category: "commute", "shopping", "leisure", "long_trip", or "other"
         limit: Max trips to return (default: 20)
-        days: Number of days to look back from today (default: all time if days/start_date not set)
-        start_date: Filter drives from this date (YYYY-MM-DD)
-        end_date: Filter drives until this date (YYYY-MM-DD)
+        days: Number of days to look back from today (default: all time if days/date_from not set)
+        date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_trips_by_category called")
     # Validate date parameters
     try:
-        if start_date:
-            start_dt = _parse_date(start_date)
+        if date_from:
+            start_dt = _parse_date(date_from)
         elif days:
             start_dt = _utcnow() - timedelta(days=days)
         else:
             start_dt = datetime(2000, 1, 1, tzinfo=timezone.utc)  # All time by default
 
-        end_dt = _parse_date(end_date, _utcnow())
-        # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
-        # e.g., end_date="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
-        if end_date and end_dt:
+        end_dt = _parse_date(date_to, _utcnow())
+        # Exclusive end boundary: add 1 day so [start, end) covers the full date_to
+        # e.g., date_to="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
+        if date_to and end_dt:
             end_dt = end_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    date_range = f"{start_date or ('last ' + str(days) + ' days' if days else 'all time')} to {end_date or 'today'}"
+    date_range = f"{date_from or ('last ' + str(days) + ' days' if days else 'all time')} to {date_to or 'today'}"
 
     rows = _query(
         """
@@ -1051,13 +1063,27 @@ async def tesla_battery_health() -> str:
 
 
 @mcp.tool()
-async def tesla_efficiency(days: int = 90) -> str:
+async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to: str | None = None) -> str:
     """Energy consumption trends -- Wh/mi over time.
 
     Shows weekly average efficiency from driving data.
+
+    Args:
+        days: Number of days to look back (default: 90)
+        date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_efficiency called")
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    try:
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    end_boundary = date_to_dt.isoformat() if date_to_dt else None
     rows = _query(
         """
         SELECT date_trunc('week', start_date) AS week,
@@ -1068,17 +1094,18 @@ async def tesla_efficiency(days: int = 90) -> str:
                COUNT(*) AS trips,
                AVG(outside_temp_avg) AS avg_temp
         FROM drives
-        WHERE car_id = %s AND start_date >= %s AND distance > 0
+        WHERE car_id = %s AND start_date >= %s AND (start_date < %s OR %s IS NULL) AND distance > 0
         GROUP BY date_trunc('week', start_date)
         ORDER BY week DESC
     """,
-        (KWH_PER_KM, CAR_ID, cutoff,),
+        (KWH_PER_KM, CAR_ID, cutoff, end_boundary, end_boundary),
     )
 
+    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
     if not rows:
-        return f"No driving data in the last {days} days."
+        return f"No driving data ({date_range})."
 
-    lines = [f"**Efficiency** (last {days} days, weekly)\n"]
+    lines = [f"**Efficiency** ({date_range}, weekly)\n"]
     for r in rows:
         km = r.get("total_km") or 0
         kwh = r.get("total_kwh") or 0
@@ -1097,13 +1124,27 @@ async def tesla_efficiency(days: int = 90) -> str:
 
 
 @mcp.tool()
-async def tesla_location_history(days: int = 7) -> str:
+async def tesla_location_history(days: int = 7, date_from: str | None = None, date_to: str | None = None) -> str:
     """Where the car has been -- top locations by time spent.
 
     Groups positions by proximity and shows time at each cluster.
+
+    Args:
+        days: Number of days to look back (default: 7)
+        date_from: Filter positions from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter positions until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_location_history called")
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    try:
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    end_boundary = date_to_dt.isoformat() if date_to_dt else None
 
     rows = _query(
         f"""
@@ -1113,20 +1154,21 @@ async def tesla_location_history(days: int = 7) -> str:
                MIN(date) AS first_seen,
                MAX(date) AS last_seen
         FROM positions
-        WHERE car_id = %s AND date >= %s
+        WHERE car_id = %s AND date >= %s AND (date < %s OR %s IS NULL)
         GROUP BY ROUND(latitude::numeric, 3), ROUND(longitude::numeric, 3)
         ORDER BY position_count DESC
         {_limit_sql(LIMIT_LOCATION_HISTORY)}
     """,
-        (CAR_ID, cutoff,),
+        (CAR_ID, cutoff, end_boundary, end_boundary),
     )
 
+    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
     if not rows:
-        return f"No location data in the last {days} days."
+        return f"No location data ({date_range})."
 
     geofences = _query("SELECT name, latitude, longitude, radius FROM geofences")
 
-    lines = [f"**Location History** (last {days} days)\n"]
+    lines = [f"**Location History** ({date_range})\n"]
     for r in rows:
         lat = float(r.get("lat", 0))
         lon = float(r.get("lon", 0))
@@ -1147,28 +1189,43 @@ async def tesla_location_history(days: int = 7) -> str:
 
 
 @mcp.tool()
-async def tesla_state_history(days: int = 7) -> str:
+async def tesla_state_history(days: int = 7, date_from: str | None = None, date_to: str | None = None) -> str:
     """Vehicle state transitions -- online, asleep, offline.
 
     Shows when the car was awake vs sleeping, useful for vampire drain analysis.
+
+    Args:
+        days: Number of days to look back (default: 7)
+        date_from: Filter states from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter states until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_state_history called")
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    try:
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    end_boundary = date_to_dt.isoformat() if date_to_dt else None
     rows = _query(
         f"""
         SELECT state, start_date, end_date
         FROM states
-        WHERE car_id = %s AND start_date >= %s
+        WHERE car_id = %s AND start_date >= %s AND (start_date < %s OR %s IS NULL)
         ORDER BY start_date DESC
         {_limit_sql(LIMIT_STATE_HISTORY)}
     """,
-        (CAR_ID, cutoff,),
+        (CAR_ID, cutoff, end_boundary, end_boundary),
     )
 
+    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
     if not rows:
-        return f"No state data in the last {days} days."
+        return f"No state data ({date_range})."
 
-    lines = [f"**State History** (last {days} days, {len(rows)} transitions)\n"]
+    lines = [f"**State History** ({date_range}, {len(rows)} transitions)\n"]
 
     totals: dict[str, float] = {}
     for r in rows:
@@ -1971,7 +2028,7 @@ async def tesla_tpms_status() -> str:
 
 
 @mcp.tool()
-async def tesla_tpms_history(days: int = 30) -> str:
+async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_to: str | None = None) -> str:
     """Recent TPMS pressure history from TeslaMate.
 
     Shows the average and min/max pressures recorded in positions table.
@@ -1979,28 +2036,40 @@ async def tesla_tpms_history(days: int = 30) -> str:
 
     Args:
         days: Number of days to look back (default: 30)
+        date_from: Filter TPMS from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter TPMS until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_tpms_history called")
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    try:
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    end_boundary = date_to_dt.isoformat() if date_to_dt else None
     rows = _query(
         f"""
         SELECT date,
                tpms_pressure_fl, tpms_pressure_fr,
                tpms_pressure_rl, tpms_pressure_rr
         FROM positions
-        WHERE car_id = %s AND date >= %s
+        WHERE car_id = %s AND date >= %s AND (date < %s OR %s IS NULL)
           AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL)
         ORDER BY date DESC
         {_limit_sql(LIMIT_TPMS_HISTORY)}
         """,
-        (CAR_ID, cutoff),
+        (CAR_ID, cutoff, end_boundary, end_boundary),
     )
 
+    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
     if not rows:
-        return f"No TPMS data in the last {days} days."
+        return f"No TPMS data ({date_range})."
 
     unit_label = "bar" if USE_METRIC_UNITS else "psi"
-    lines = [f"**TPMS History** (last {days} days, {len(rows)} records)\n"]
+    lines = [f"**TPMS History** ({date_range}, {len(rows)} records)\n"]
     for r in rows:
         date = _format_dt(r.get("date"))
         fl = r.get("tpms_pressure_fl")
@@ -2108,7 +2177,7 @@ async def tesla_monthly_summary(months: int = 6) -> str:
 
 
 @mcp.tool()
-async def tesla_vampire_drain(days: int = 14) -> str:
+async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date_to: str | None = None) -> str:
     """Vampire drain analysis -- battery loss while parked overnight.
 
     Checks for periods where the car was parked (no drives) for 8+ hours
@@ -2116,9 +2185,20 @@ async def tesla_vampire_drain(days: int = 14) -> str:
 
     Args:
         days: Number of days to analyze (default: 14)
+        date_from: Filter drain from this date (YYYY-MM-DD), overrides days param
+        date_to: Filter drain until this date (YYYY-MM-DD), defaults to today
     """
     _log.info(f"[TOOL] tesla_vampire_drain called")
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    try:
+        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(date_to, _utcnow())
+        if date_to and date_to_dt:
+            date_to_dt = date_to_dt + timedelta(days=1)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    end_boundary = date_to_dt.isoformat() if date_to_dt else None
     rows = _query(
         f"""
         WITH ordered AS (
@@ -2126,7 +2206,7 @@ async def tesla_vampire_drain(days: int = 14) -> str:
                    LAG(battery_level) OVER (ORDER BY date) AS prev_level,
                    LAG(date) OVER (ORDER BY date) AS prev_date
             FROM positions
-            WHERE car_id = %s AND date >= %s AND battery_level IS NOT NULL
+            WHERE car_id = %s AND date >= %s AND (date < %s OR %s IS NULL) AND battery_level IS NOT NULL
             ORDER BY date
         )
         SELECT date, prev_date, battery_level, prev_level,
@@ -2140,13 +2220,14 @@ async def tesla_vampire_drain(days: int = 14) -> str:
         ORDER BY drain DESC
         {_limit_sql(LIMIT_VAMPIRE_DRAIN)}
     """,
-        (CAR_ID, cutoff,),
+        (CAR_ID, cutoff, end_boundary, end_boundary),
     )
 
+    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
     if not rows:
-        return f"No significant vampire drain detected in the last {days} days."
+        return f"No significant vampire drain detected ({date_range})."
 
-    lines = [f"**Vampire Drain** (last {days} days)\n"]
+    lines = [f"**Vampire Drain** ({date_range})\n"]
     total_drain = 0
     total_hours = 0
     for r in rows:
