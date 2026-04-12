@@ -415,17 +415,21 @@ async def tesla_cars() -> str:
 
 
 @mcp.tool()
-async def tesla_status() -> str:
+async def tesla_status(car_id: int | None = None) -> str:
     """Current vehicle state -- battery, range, location, climate, odometer.
 
     Returns the latest position snapshot and vehicle info from TeslaMate.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_status called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     # Car info rarely changes — cache for 10 minutes
     car = _cached_query_one(
-        f"car_{CAR_ID}",
+        f"car_{effective_car_id}",
         "SELECT id, name, model, efficiency FROM cars WHERE id = %s LIMIT 1",
-        (CAR_ID,), ttl=600,
+        (effective_car_id,), ttl=600,
     )
 
     # Single query: latest position + state + charging + software version
@@ -455,7 +459,7 @@ async def tesla_status() -> str:
         LEFT JOIN LATERAL (
             SELECT version FROM updates WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
         ) u ON true
-    """, (CAR_ID, CAR_ID, CAR_ID, CAR_ID))
+    """, (effective_car_id, effective_car_id, effective_car_id, effective_car_id))
 
     if not combined:
         return "No vehicle data found. Is TeslaMate running?"
@@ -554,7 +558,7 @@ async def tesla_status() -> str:
 
 
 @mcp.tool()
-async def tesla_charging_history(days: int = 30, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_charging_history(days: int = 30, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Charging sessions over the last N days.
 
     Shows energy added, duration, battery range, and location for each session.
@@ -563,8 +567,10 @@ async def tesla_charging_history(days: int = 30, date_from: str | None = None, d
         days: Number of days to look back (default: 30, max: ~10 years)
         date_from: Filter charging from this date (YYYY-MM-DD), overrides days param
         date_to: Filter charging until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_charging_history called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     if days <= 0 or days > 3650:
         return "❌ days must be between 1 and 3650"
     try:
@@ -599,7 +605,7 @@ async def tesla_charging_history(days: int = 30, date_from: str | None = None, d
         ORDER BY cp.start_date DESC
         {_limit_sql(LIMIT_CHARGING)}
     """,
-        (CAR_ID, cutoff, end_boundary, end_boundary),
+        (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
@@ -637,6 +643,7 @@ async def tesla_charges(
     date_from: str | None = None,
     date_to: str | None = None,
     limit: int = 50,
+    car_id: int | None = None,
 ) -> str:
     """Detailed charging sessions with location, energy, cost breakdown.
 
@@ -648,8 +655,10 @@ async def tesla_charges(
         date_from: Filter from date (YYYY-MM-DD)
         date_to: Filter until date (YYYY-MM-DD)
         limit: Maximum sessions to return (default: 50, -1 for all)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_charges called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     if days <= 0 or days > 3650:
         return "❌ days must be between 1 and 3650"
 
@@ -694,7 +703,7 @@ async def tesla_charges(
         ORDER BY cp.start_date DESC
         {limit_sql}
     """,
-        (CAR_ID, cutoff, end_boundary, end_boundary),
+        (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     if not rows:
@@ -725,7 +734,7 @@ async def tesla_charges(
 
 
 @mcp.tool()
-async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Recent drives -- distance, duration, efficiency, start/end locations.
 
     Shows driving activity with energy consumption.
@@ -734,8 +743,10 @@ async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: st
         days: Number of days to look back from today (default: 30, max: 3650/10years)
         date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
         date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_drives called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate date parameters
     try:
         date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
@@ -762,7 +773,7 @@ async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: st
         ORDER BY d.start_date DESC
         {_limit_sql(LIMIT_DRIVES)}
     """,
-        (CAR_ID, date_from_dt.isoformat() if date_from_dt else None, date_to_dt.isoformat() if date_to_dt else None,),
+        (effective_car_id, date_from_dt.isoformat() if date_from_dt else None, date_to_dt.isoformat() if date_to_dt else None,),
     )
 
     date_range = f"{date_from}" if date_from else f"last {days} days"
@@ -846,8 +857,9 @@ def _calculate_driving_score(rows: list) -> tuple[float, int, list]:
     return safety_score, total_deduct, details
 
 
-def _query_drives(start_utc: datetime, end_utc: datetime) -> list:
+def _query_drives(start_utc: datetime, end_utc: datetime, car_id: int | None = None) -> list:
     """Query drives within date range (UTC)."""
+    effective_car_id = car_id if car_id is not None else CAR_ID
     return _query(
         """
         SELECT d.distance, d.duration_min, d.power_max, d.power_min,
@@ -857,7 +869,7 @@ def _query_drives(start_utc: datetime, end_utc: datetime) -> list:
           AND d.start_date >= %s AND d.start_date < %s
         ORDER BY d.start_date DESC
         """,
-        (CAR_ID, start_utc.isoformat(), end_utc.isoformat()),
+        (effective_car_id, start_utc.isoformat(), end_utc.isoformat()),
     )
 
 
@@ -881,6 +893,7 @@ async def tesla_driving_score(
     start_month: int | None = None,
     end_month: int | None = None,
     month: int | None = None,
+    car_id: int | None = None,
 ) -> str:
     """Driving score based on acceleration, braking, and speed habits.
 
@@ -892,8 +905,10 @@ async def tesla_driving_score(
         start_month: Start month (period="months", 1-12)
         end_month: End month (period="months", 1-12)
         month: Month (period="monthly", 1-12)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_driving_score called with period={period}")
+    effective_car_id = car_id if car_id is not None else CAR_ID
 
     if period == "recent_n":
         n = n or 10
@@ -905,7 +920,7 @@ async def tesla_driving_score(
             WHERE d.car_id = %s AND d.distance > 0
             ORDER BY d.start_date DESC LIMIT %s
             """,
-            (CAR_ID, n),
+            (effective_car_id, n),
         )
         if not rows:
             return f"No drives found for last {n} drives."
@@ -925,7 +940,7 @@ async def tesla_driving_score(
         end_utc = end_local.astimezone(timezone.utc)
         start_utc = start_local.astimezone(timezone.utc)
 
-        rows = _query_drives(start_utc, end_utc)
+        rows = _query_drives(start_utc, end_utc, effective_car_id)
         if not rows:
             return f"No drives found for last {days_val} days."
 
@@ -948,7 +963,7 @@ async def tesla_driving_score(
         else:
             end_local = datetime(year, month + 1, 1, tzinfo=USER_TZ)
 
-        rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+        rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), effective_car_id)
         if not rows:
             return f"No drives found for {year}-{month:02d}."
 
@@ -974,7 +989,7 @@ async def tesla_driving_score(
             else:
                 end_local = datetime(year, m + 1, 1, tzinfo=USER_TZ)
 
-            rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+            rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), effective_car_id)
             if rows:
                 safety_score, total_deduct, details = _calculate_driving_score(rows)
                 num_drives = len(rows)
@@ -1027,7 +1042,7 @@ def _classify_trip(start_geofence: str | None, end_geofence: str | None, distanc
 
 
 @mcp.tool()
-async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Get trips filtered by category.
 
     Args:
@@ -1036,8 +1051,10 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         days: Number of days to look back from today (default: all time if days/date_from not set)
         date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
         date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_trips_by_category called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate date parameters
     try:
         if date_from:
@@ -1068,7 +1085,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         WHERE d.car_id = %s AND d.distance > 0 AND d.start_date >= %s AND d.start_date < %s
         ORDER BY d.start_date DESC LIMIT %s
         """,
-        (CAR_ID, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None, limit * 5),
+        (effective_car_id, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None, limit * 5),
     )
 
     classified = []
@@ -1099,9 +1116,14 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
 
 
 @mcp.tool()
-async def tesla_trip_categories() -> str:
-    """Show count of trips by category for recent drives."""
+async def tesla_trip_categories(car_id: int | None = None) -> str:
+    """Show count of trips by category for recent drives.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
+    """
     _log.info(f"[TOOL] tesla_trip_categories called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     rows = _query(
         f"""
         SELECT d.distance,
@@ -1114,7 +1136,7 @@ async def tesla_trip_categories() -> str:
         ORDER BY d.start_date DESC
         {_limit_sql(LIMIT_TRIP_CATEGORIES)}
         """,
-        (CAR_ID,),
+        (effective_car_id,),
     )
 
     counts = {"commute": 0, "shopping": 0, "leisure": 0, "long_trip": 0, "other": 0}
@@ -1136,12 +1158,16 @@ async def tesla_trip_categories() -> str:
 
 
 @mcp.tool()
-async def tesla_battery_health() -> str:
+async def tesla_battery_health(car_id: int | None = None) -> str:
     """Battery degradation trend -- range at 100% charge over time.
 
     Shows monthly snapshots of ideal range when battery is at 100%.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_battery_health called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     rows = _query(f"""
         SELECT date_trunc('month', date) AS month,
                AVG(ideal_battery_range_km) AS avg_ideal_km,
@@ -1153,7 +1179,7 @@ async def tesla_battery_health() -> str:
         GROUP BY date_trunc('month', date)
         ORDER BY month DESC
         {_limit_sql(LIMIT_BATTERY_HEALTH)}
-    """, (CAR_ID,))
+    """, (effective_car_id,))
 
     if not rows:
         rows = _query(f"""
@@ -1164,7 +1190,7 @@ async def tesla_battery_health() -> str:
               AND ideal_battery_range_km IS NOT NULL
             ORDER BY date DESC
             {_limit_sql(LIMIT_BATTERY_SAMPLES)}
-        """, (CAR_ID,))
+        """, (effective_car_id,))
         if not rows:
             return "Not enough data for battery health. Need positions at 100% charge."
 
@@ -1193,7 +1219,7 @@ async def tesla_battery_health() -> str:
 
 
 @mcp.tool()
-async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Energy consumption trends -- Wh/mi over time.
 
     Shows weekly average efficiency from driving data.
@@ -1202,8 +1228,10 @@ async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to
         days: Number of days to look back (default: 90)
         date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
         date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_efficiency called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(date_to, _utcnow())
@@ -1228,7 +1256,7 @@ async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to
         GROUP BY date_trunc('week', start_date)
         ORDER BY week DESC
     """,
-        (KWH_PER_KM, CAR_ID, cutoff, end_boundary, end_boundary),
+        (KWH_PER_KM, effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
@@ -1254,7 +1282,7 @@ async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to
 
 
 @mcp.tool()
-async def tesla_location_history(days: int = 7, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_location_history(days: int = 7, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Where the car has been -- top locations by time spent.
 
     Groups positions by proximity and shows time at each cluster.
@@ -1263,8 +1291,10 @@ async def tesla_location_history(days: int = 7, date_from: str | None = None, da
         days: Number of days to look back (default: 7)
         date_from: Filter positions from this date (YYYY-MM-DD), overrides days param
         date_to: Filter positions until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_location_history called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(date_to, _utcnow())
@@ -1289,7 +1319,7 @@ async def tesla_location_history(days: int = 7, date_from: str | None = None, da
         ORDER BY position_count DESC
         {_limit_sql(LIMIT_LOCATION_HISTORY)}
     """,
-        (CAR_ID, cutoff, end_boundary, end_boundary),
+        (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
@@ -1319,7 +1349,7 @@ async def tesla_location_history(days: int = 7, date_from: str | None = None, da
 
 
 @mcp.tool()
-async def tesla_state_history(days: int = 7, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_state_history(days: int = 7, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Vehicle state transitions -- online, asleep, offline.
 
     Shows when the car was awake vs sleeping, useful for vampire drain analysis.
@@ -1328,8 +1358,10 @@ async def tesla_state_history(days: int = 7, date_from: str | None = None, date_
         days: Number of days to look back (default: 7)
         date_from: Filter states from this date (YYYY-MM-DD), overrides days param
         date_to: Filter states until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_state_history called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(date_to, _utcnow())
@@ -1348,7 +1380,7 @@ async def tesla_state_history(days: int = 7, date_from: str | None = None, date_
         ORDER BY start_date DESC
         {_limit_sql(LIMIT_STATE_HISTORY)}
     """,
-        (CAR_ID, cutoff, end_boundary, end_boundary),
+        (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
@@ -1396,16 +1428,21 @@ async def tesla_state_history(days: int = 7, date_from: str | None = None, date_
 
 
 @mcp.tool()
-async def tesla_software_updates() -> str:
-    """Firmware version history -- all recorded software versions and install dates."""
+async def tesla_software_updates(car_id: int | None = None) -> str:
+    """Firmware version history -- all recorded software versions and install dates.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
+    """
     _log.info(f"[TOOL] tesla_software_updates called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     rows = _query(f"""
         SELECT version, start_date, end_date
         FROM updates
         WHERE car_id = %s
         ORDER BY start_date DESC
         {_limit_sql(LIMIT_SOFTWARE_UPDATES)}
-    """, (CAR_ID,))
+    """, (effective_car_id,))
 
     if not rows:
         return "No software update history found."
@@ -1433,19 +1470,23 @@ async def tesla_software_updates() -> str:
 
 
 @mcp.tool()
-async def tesla_live() -> str:
+async def tesla_live(car_id: int | None = None) -> str:
     """Latest polled vehicle state from TeslaMate -- battery, climate, location.
 
     Data comes from TeslaMate's positions table (polled periodically, not
     real-time). Fields like sentry mode, lock status, and media are not
     available in TeslaMate and are omitted.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_live called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     # Car info — cached (same SQL as tesla_status to share cache key)
     car = _cached_query_one(
-        f"car_{CAR_ID}",
+        f"car_{effective_car_id}",
         "SELECT id, name, model, efficiency FROM cars WHERE id = %s LIMIT 1",
-        (CAR_ID,), ttl=600,
+        (effective_car_id,), ttl=600,
     )
 
     # Single combined query: position + charging + software
@@ -1476,7 +1517,7 @@ async def tesla_live() -> str:
         LEFT JOIN LATERAL (
             SELECT version FROM updates WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
         ) u ON true
-    """, (CAR_ID, CAR_ID, CAR_ID))
+    """, (effective_car_id, effective_car_id, effective_car_id))
 
     if not combined:
         return "No position data found. Is TeslaMate running?"
@@ -1533,7 +1574,7 @@ async def tesla_live() -> str:
     # State from states table
     current_state = _query_one("""
         SELECT state FROM states WHERE car_id = %s ORDER BY start_date DESC LIMIT 1
-    """, (CAR_ID,))
+    """, (effective_car_id,))
 
     state_label = "Unknown"
     if current_state:
@@ -1598,14 +1639,17 @@ async def tesla_live() -> str:
 async def tesla_savings(
     gas_price: float = None,
     mpg_equivalent: int = None,
+    car_id: int | None = None,
 ) -> str:
     """Gas savings scorecard -- how much you've saved vs a gas car.
 
     Args:
         gas_price: Gas price per gallon (default from TESLA_GAS_PRICE env, or $3.50)
         mpg_equivalent: Comparable gas vehicle MPG (default from TESLA_GAS_MPG env, or 28)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_savings called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
@@ -1614,14 +1658,14 @@ async def tesla_savings(
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
                    * %s), 0) AS total_kwh
         FROM drives WHERE car_id = %s AND distance > 0
-    """, (KWH_PER_KM, CAR_ID))
+    """, (KWH_PER_KM, effective_car_id))
     monthly = _query_one("""
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
                    * %s), 0) AS total_kwh
         FROM drives WHERE car_id = %s AND distance > 0
           AND date_trunc('month', start_date) = date_trunc('month', NOW())
-    """, (KWH_PER_KM, CAR_ID))
+    """, (KWH_PER_KM, effective_car_id))
 
     if not lifetime:
         return "No driving data yet."
@@ -1668,6 +1712,7 @@ async def tesla_trip_cost(
     destination: str,
     gas_price: float = None,
     mpg_equivalent: int = None,
+    car_id: int | None = None,
 ) -> str:
     """Estimate trip cost to a destination -- kWh, cost, range check.
 
@@ -1677,8 +1722,10 @@ async def tesla_trip_cost(
         destination: City, address, or place name (e.g. "Atlanta, GA")
         gas_price: Gas price per gallon (default from TESLA_GAS_PRICE env)
         mpg_equivalent: Comparable gas vehicle MPG (default from TESLA_GAS_MPG env)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_trip_cost called with destination={destination[:30]}...")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
@@ -1700,7 +1747,7 @@ async def tesla_trip_cost(
         SELECT latitude, longitude, battery_level
         FROM positions WHERE car_id = %s
         ORDER BY date DESC LIMIT 1
-    """, (CAR_ID,))
+    """, (effective_car_id,))
     if not pos:
         return "No current position data."
 
@@ -1721,7 +1768,7 @@ async def tesla_trip_cost(
                COALESCE(SUM(distance), 0) AS km
         FROM drives WHERE car_id = %s
           AND start_date >= NOW() - INTERVAL '30 days' AND distance > 0
-    """, (KWH_PER_KM, CAR_ID))
+    """, (KWH_PER_KM, effective_car_id))
 
     if USE_METRIC_UNITS:
         wh_per_km = 180  # default Wh/km
@@ -1784,12 +1831,16 @@ async def tesla_trip_cost(
 
 
 @mcp.tool()
-async def tesla_efficiency_by_temp() -> str:
+async def tesla_efficiency_by_temp(car_id: int | None = None) -> str:
     """Efficiency curve by temperature -- Wh/mi at different temps.
 
     Shows how outside temperature affects energy consumption.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_efficiency_by_temp called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     rows = _query("""
         SELECT
             CASE
@@ -1812,7 +1863,7 @@ async def tesla_efficiency_by_temp() -> str:
           AND outside_temp_avg IS NOT NULL
         GROUP BY temp_range
         ORDER BY MIN(outside_temp_avg)
-    """, (KWH_PER_KM, CAR_ID))
+    """, (KWH_PER_KM, effective_car_id))
 
     if not rows:
         return "Not enough driving data with temperature readings."
@@ -1857,15 +1908,17 @@ async def tesla_efficiency_by_temp() -> str:
 
 
 @mcp.tool()
-async def tesla_charging_by_location(days: int = 0) -> str:
+async def tesla_charging_by_location(days: int = 0, car_id: int | None = None) -> str:
     """Charging patterns by location -- where you charge and how much.
 
     Args:
         days: Number of days to look back (default: 0 = all time)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_charging_by_location called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     date_filter = ""
-    params = [CAR_ID]
+    params = [effective_car_id]
     if days > 0:
         cutoff = (_utcnow() - timedelta(days=days)).isoformat()
         date_filter = "AND cp.start_date >= %s"
@@ -1919,13 +1972,15 @@ async def tesla_charging_by_location(days: int = 0) -> str:
 
 
 @mcp.tool()
-async def tesla_top_destinations(limit: int = 15) -> str:
+async def tesla_top_destinations(limit: int = 15, car_id: int | None = None) -> str:
     """Most visited locations ranked by number of visits.
 
     Args:
         limit: Number of destinations to show (default: 15, max: 100)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_top_destinations called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     if limit <= 0 or limit > 100:
         return "❌ limit must be between 1 and 100"
     rows = _query(
@@ -1940,7 +1995,7 @@ async def tesla_top_destinations(limit: int = 15) -> str:
         ORDER BY visits DESC
         LIMIT %s
     """,
-        (CAR_ID, limit,),
+        (effective_car_id, limit,),
     )
 
     if not rows:
@@ -1957,13 +2012,15 @@ async def tesla_top_destinations(limit: int = 15) -> str:
 
 
 @mcp.tool()
-async def tesla_longest_trips(limit: int = 10) -> str:
+async def tesla_longest_trips(limit: int = 10, car_id: int | None = None) -> str:
     """Top drives ranked by distance -- your epic road trips.
 
     Args:
         limit: Number of trips to show (default: 10, max: 100)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_longest_trips called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     if limit <= 0 or limit > 100:
         return "❌ limit must be between 1 and 100"
     rows = _query(
@@ -1980,7 +2037,7 @@ async def tesla_longest_trips(limit: int = 10) -> str:
         ORDER BY d.distance DESC
         LIMIT %s
     """,
-        (KWH_PER_KM, CAR_ID, limit,),
+        (KWH_PER_KM, effective_car_id, limit,),
     )
 
     if not rows:
@@ -2000,14 +2057,16 @@ async def tesla_longest_trips(limit: int = 10) -> str:
 
 
 @mcp.tool()
-async def tesla_monthly_report(year: int, month: int) -> str:
+async def tesla_monthly_report(year: int, month: int, car_id: int | None = None) -> str:
     """Monthly driving report with stats and comparison to previous month.
 
     Args:
         year: Year (e.g., 2026)
         month: Month (1-12)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_monthly_report called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate parameters
     if month < 1 or month > 12:
         return "❌ month must be between 1 and 12"
@@ -2036,7 +2095,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (KWH_PER_KM, CAR_ID, start.isoformat(), next_start.isoformat()),
+        (KWH_PER_KM, effective_car_id, start.isoformat(), next_start.isoformat()),
     )
     r = rows[0] if rows else {}
 
@@ -2055,7 +2114,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (KWH_PER_KM, CAR_ID, prev_start.isoformat(), start.isoformat()),
+        (KWH_PER_KM, effective_car_id, prev_start.isoformat(), start.isoformat()),
     )
     prev_r = prev_rows[0] if prev_rows else {}
     prev_km = prev_r.get("total_km") or 0
@@ -2071,7 +2130,7 @@ async def tesla_monthly_report(year: int, month: int) -> str:
           AND cp.start_date >= %s AND cp.start_date < %s
           AND cp.end_date IS NOT NULL
         """,
-        (CAR_ID, start.isoformat(), next_start.isoformat()),
+        (effective_car_id, start.isoformat(), next_start.isoformat()),
     )
     charge_r = charge_rows[0] if charge_rows else {}
     total_cost = charge_r.get("total_cost") or 0
@@ -2104,14 +2163,18 @@ async def tesla_monthly_report(year: int, month: int) -> str:
 
 
 @mcp.tool()
-async def tesla_tpms_status() -> str:
+async def tesla_tpms_status(car_id: int | None = None) -> str:
     """Current TPMS pressures with warnings for anomalies.
 
     Reads from the latest position record in TeslaMate.
     Warns if any tyre is below TESLA_TPMS_MIN_THRESHOLD or above
     TESLA_TPMS_MAX_THRESHOLD, or differs from the average by > 0.15 bar.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_tpms_status called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     pos = _query_one("""
         SELECT date,
                tpms_pressure_fl, tpms_pressure_fr,
@@ -2122,7 +2185,7 @@ async def tesla_tpms_status() -> str:
                OR tpms_pressure_rl IS NOT NULL OR tpms_pressure_rr IS NOT NULL)
         ORDER BY date DESC
         LIMIT 1
-    """, (CAR_ID,))
+    """, (effective_car_id,))
 
     positions = [
         ("tpms_pressure_fl", "Front Left"),
@@ -2174,7 +2237,7 @@ async def tesla_tpms_status() -> str:
 
 
 @mcp.tool()
-async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Recent TPMS pressure history from TeslaMate.
 
     Shows the average and min/max pressures recorded in positions table.
@@ -2184,8 +2247,10 @@ async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_
         days: Number of days to look back (default: 30)
         date_from: Filter TPMS from this date (YYYY-MM-DD), overrides days param
         date_to: Filter TPMS until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_tpms_history called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(date_to, _utcnow())
@@ -2207,7 +2272,7 @@ async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_
         ORDER BY date DESC
         {_limit_sql(LIMIT_TPMS_HISTORY)}
         """,
-        (CAR_ID, cutoff, end_boundary, end_boundary),
+        (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
@@ -2237,13 +2302,15 @@ async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_
 
 
 @mcp.tool()
-async def tesla_monthly_summary(months: int = 6) -> str:
+async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> str:
     """Monthly driving summary -- miles, kWh, cost, efficiency.
 
     Args:
         months: Number of months to show (default: 6, max: 120)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_monthly_summary called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     if months <= 0 or months > 120:
         return "❌ months must be between 1 and 120"
     rows = _query(
@@ -2275,7 +2342,7 @@ async def tesla_monthly_summary(months: int = 6) -> str:
         ORDER BY d.month DESC
         LIMIT %s
     """,
-        (KWH_PER_KM, CAR_ID, CAR_ID, months,),
+        (KWH_PER_KM, effective_car_id, effective_car_id, months,),
     )
 
     if not rows:
@@ -2323,7 +2390,7 @@ async def tesla_monthly_summary(months: int = 6) -> str:
 
 
 @mcp.tool()
-async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date_to: str | None = None) -> str:
+async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
     """Vampire drain analysis -- battery loss while parked overnight.
 
     Checks for periods where the car was parked (no drives) for 8+ hours
@@ -2333,8 +2400,10 @@ async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date
         days: Number of days to analyze (default: 14)
         date_from: Filter drain from this date (YYYY-MM-DD), overrides days param
         date_to: Filter drain until this date (YYYY-MM-DD), defaults to today
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_vampire_drain called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(date_to, _utcnow())
@@ -2366,7 +2435,7 @@ async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date
         ORDER BY drain DESC
         {_limit_sql(LIMIT_VAMPIRE_DRAIN)}
     """,
-        (CAR_ID, cutoff, end_boundary, end_boundary),
+        (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
@@ -2409,6 +2478,7 @@ async def calculate_eco_savings_vs_icev(
     icev_mpg: float = 8.0,
     gas_price: float = 8.0,
     electricity_price: float = 0.5,
+    car_id: int | None = None,
 ) -> str:
     """Calculate eco savings and carbon reduction compared to an ICEV (燃油汽车).
 
@@ -2420,8 +2490,10 @@ async def calculate_eco_savings_vs_icev(
         icev_mpg: ICEV fuel consumption in L/100km (default: 8.0)
         gas_price: Gas price per litre in RMB (default: 8.0)
         electricity_price: Electricity cost per kWh in RMB (default: 0.5)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] calculate_eco_savings_vs_icev called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
 
     # Total driving distance from drives table
@@ -2431,7 +2503,7 @@ async def calculate_eco_savings_vs_icev(
         FROM drives
         WHERE car_id = %s AND start_date >= %s
         """,
-        (CAR_ID, cutoff,),
+        (effective_car_id, cutoff,),
     )
     total_km = drive_row["total_km"] if drive_row else 0.0
 
@@ -2443,7 +2515,7 @@ async def calculate_eco_savings_vs_icev(
         FROM charging_processes
         WHERE car_id = %s AND start_date >= %s AND end_date IS NOT NULL
         """,
-        (CAR_ID, cutoff,),
+        (effective_car_id, cutoff,),
     )
     charge_row = charge_rows[0] if charge_rows else {}
     total_kwh = charge_row.get("total_kwh", 0.0) or 0.0
@@ -2496,6 +2568,7 @@ async def calculate_eco_savings_vs_icev(
 async def generate_travel_narrative_context(
     start_time: str,
     end_time: str,
+    car_id: int | None = None,
 ) -> str:
     """Generate a travel narrative timeline for LLM-powered travel blogging.
 
@@ -2505,8 +2578,10 @@ async def generate_travel_narrative_context(
     Args:
         start_time: ISO8601 start time (e.g. "2026-03-01T00:00:00" or "2026-03-01")
         end_time: ISO8601 end time (e.g. "2026-03-03T23:59:59" or "2026-03-03")
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] generate_travel_narrative_context called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate ISO8601 format
     try:
         if "T" in start_time:
@@ -2538,7 +2613,7 @@ async def generate_travel_narrative_context(
           AND d.start_date >= %s AND d.start_date <= %s
         ORDER BY d.start_date ASC
         """,
-        (CAR_ID, start_time, end_time),
+        (effective_car_id, start_time, end_time),
     )
 
     if not rows:
@@ -2581,6 +2656,7 @@ async def get_vehicle_persona_status(
     days_lookback: int = 7,
     year: int = None,
     month: int = None,
+    car_id: int | None = None,
 ) -> str:
     """Get vehicle persona status -- activity, fatigue, extremes, and health metrics.
 
@@ -2591,8 +2667,10 @@ async def get_vehicle_persona_status(
         days_lookback: Number of days to analyze (default: 7, used when year/month not set)
         year: Specific year to analyze (e.g. 2025). Use with month for single month.
         month: Specific month to analyze (1-12). Requires year to be set.
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] get_vehicle_persona_status called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate parameters
     if month is not None and (month < 1 or month > 12):
         return "❌ month must be between 1 and 12"
@@ -2639,7 +2717,7 @@ async def get_vehicle_persona_status(
         FROM drives
         WHERE car_id = %s AND start_date >= %s
         """,
-        (CAR_ID, cutoff, CAR_ID, cutoff,),
+        (effective_car_id, cutoff, effective_car_id, cutoff,),
     )
     drive_r = drive_r or {}
     total_km = drive_r.get("total_km") or 0.0
@@ -2656,7 +2734,7 @@ async def get_vehicle_persona_status(
         WHERE car_id = %s AND start_date >= %s
         ORDER BY start_date ASC
         """,
-        (CAR_ID, cutoff,),
+        (effective_car_id, cutoff,),
     )
 
     idle_hours = 0.0
@@ -2703,7 +2781,7 @@ async def get_vehicle_persona_status(
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
         """,
-        (CAR_ID, cutoff,),
+        (effective_car_id, cutoff,),
     )
     vampire_drain_pct = 0.0
     if vampire_rows:
@@ -2748,7 +2826,7 @@ async def get_vehicle_persona_status(
 
 
 @mcp.tool()
-async def check_driving_achievements(days: int = 30) -> str:
+async def check_driving_achievements(days: int = 30, car_id: int | None = None) -> str:
     """Scan recent drives and charging sessions to check for driving achievements.
 
     Detects three achievements:
@@ -2758,8 +2836,10 @@ async def check_driving_achievements(days: int = 30) -> str:
 
     Args:
         days: Number of days to look back (default: 30)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] check_driving_achievements called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     cutoff = (_utcnow() - timedelta(days=days)).isoformat()
     unlocked = []
 
@@ -2774,7 +2854,7 @@ async def check_driving_achievements(days: int = 30) -> str:
           AND start_battery_level <= 5
         ORDER BY start_date DESC
         """,
-        (CAR_ID, cutoff,),
+        (effective_car_id, cutoff,),
     )
     for r in low_battery_rows:
         unlocked.append({
@@ -2803,7 +2883,7 @@ async def check_driving_achievements(days: int = 30) -> str:
           AND EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) < 4
         ORDER BY start_date DESC
         """,
-        (CAR_ID, cutoff, TIMEZONE, TIMEZONE),
+        (effective_car_id, cutoff, TIMEZONE, TIMEZONE),
     )
     # DEBUG: log ALL matched rows to diagnose false positives
     _log.warning(f"[MIDNIGHT GHOST] {len(midnight_drives)} drives matched, timezone={TIMEZONE}")
@@ -2834,7 +2914,7 @@ async def check_driving_achievements(days: int = 30) -> str:
           AND distance > 20
         ORDER BY start_date DESC
         """,
-        (CAR_ID, cutoff,),
+        (effective_car_id, cutoff,),
     )
     for r in cold_drives:
         unlocked.append({
@@ -2859,15 +2939,17 @@ async def check_driving_achievements(days: int = 30) -> str:
 
 
 @mcp.tool()
-async def get_charging_vintage_data(charge_id: int | None = None) -> str:
+async def get_charging_vintage_data(charge_id: int | None = None, car_id: int | None = None) -> str:
     """Get detailed physical parameters for a single charging session.
 
     Intended for LLM to roleplay a 'vintage data sommelier'.
 
     Args:
         charge_id: Specific charging session ID. If None, returns the latest.
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] get_charging_vintage_data called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
 
     if charge_id is not None:
         row = _query_one(
@@ -2889,7 +2971,7 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
             ) sa ON p.latitude IS NOT NULL
             WHERE cp.car_id = %s AND cp.id = %s
             """,
-            (CAR_ID, charge_id,),
+            (effective_car_id, charge_id,),
         )
     else:
         row = _query_one(
@@ -2913,7 +2995,7 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
             ORDER BY cp.start_date DESC
             LIMIT 1
             """,
-            (CAR_ID,),
+            (effective_car_id,),
         )
 
     if not row:
@@ -2961,6 +3043,7 @@ async def get_charging_vintage_data(charge_id: int | None = None) -> str:
 async def generate_weekend_blindbox(
     months_lookback: int = 12,
     min_stay_hours: float = 2.0,
+    car_id: int | None = None,
 ) -> str:
     """Discover rare one-time destinations as a weekend 'memory blindbox'.
 
@@ -2971,8 +3054,10 @@ async def generate_weekend_blindbox(
     Args:
         months_lookback: How many months to search back (default: 12)
         min_stay_hours: Minimum stay duration in hours (default: 2.0)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] generate_weekend_blindbox called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     import random
 
     cutoff = (_utcnow() - timedelta(days=months_lookback * 30)).isoformat()
@@ -3010,7 +3095,7 @@ async def generate_weekend_blindbox(
           AND EXTRACT(EPOCH FROM (next_start - end_date)) / 60 >= %s
         ORDER BY start_date DESC
         """,
-        (CAR_ID, cutoff, min_stay_min),
+        (effective_car_id, cutoff, min_stay_min),
     )
 
     # Exclude common place names
@@ -3052,6 +3137,7 @@ async def generate_weekend_blindbox(
 async def generate_monthly_driving_report(
     target_month: str | None = None,
     electricity_price: float = 0.5,
+    car_id: int | None = None,
 ) -> str:
     """Generate a polished Markdown monthly driving report with Emoji.
 
@@ -3059,8 +3145,10 @@ async def generate_monthly_driving_report(
         target_month: Month in 'YYYY-MM' format. Defaults to previous month.
                      Example: "2026-03" for March 2026.
         electricity_price: RMB/kWh fallback when cost is not recorded (default: 0.5)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] generate_monthly_driving_report called with target_month={target_month}")
+    effective_car_id = car_id if car_id is not None else CAR_ID
     if target_month is None:
         today = _utcnow()
         first_of_month = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
@@ -3103,7 +3191,7 @@ async def generate_monthly_driving_report(
         FROM drives
         WHERE car_id = %s AND start_date >= %s AND start_date < %s
         """,
-        (CAR_ID, start_iso, end_iso),
+        (effective_car_id, start_iso, end_iso),
     )
     drive_r = drive_rows[0] if drive_rows else {}
     trip_count = drive_r.get("trip_count") or 0
@@ -3123,7 +3211,7 @@ async def generate_monthly_driving_report(
         WHERE car_id = %s AND start_date >= %s AND start_date < %s
           AND end_date IS NOT NULL
         """,
-        (CAR_ID, start_iso, end_iso),
+        (effective_car_id, start_iso, end_iso),
     )
     charge_r = charge_rows[0] if charge_rows else {}
     charge_count = charge_r.get("charge_count") or 0
@@ -3153,7 +3241,7 @@ async def generate_monthly_driving_report(
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
           AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
         """,
-        (CAR_ID, start_iso, end_iso),
+        (effective_car_id, start_iso, end_iso),
     )
     vampire_penalty = 0
     if vampire_rows:
@@ -3207,7 +3295,7 @@ async def generate_monthly_driving_report(
 
 
 @mcp.tool()
-async def get_driver_profile() -> str:
+async def get_driver_profile(car_id: int | None = None) -> str:
     """Get driver gamification profile -- rank, milestones, and Easter eggs.
 
     Returns the user's current driving rank, total stats, unlocked milestones,
@@ -3215,20 +3303,24 @@ async def get_driver_profile() -> str:
 
     Returns JSON with: current_rank, total_distance_km, total_charges,
     milestones_unlocked (list), next_milestone_hint, and special_160k Easter egg.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] get_driver_profile called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
 
     # -- Query 1: total distance --
     drive_row = _query_one(
         "SELECT COALESCE(SUM(distance), 0) AS total_distance_km FROM drives WHERE car_id = %s",
-        (CAR_ID,),
+        (effective_car_id,),
     )
     total_km = float(drive_row["total_distance_km"]) if drive_row else 0.0
 
     # -- Query 2: total charge count --
     charge_row = _query_one(
         "SELECT COUNT(*) AS total_charge_count FROM charging_processes WHERE car_id = %s AND end_date IS NOT NULL",
-        (CAR_ID,),
+        (effective_car_id,),
     )
     total_charges = int(charge_row["total_charge_count"]) if charge_row else 0
 
@@ -3309,7 +3401,7 @@ async def get_driver_profile() -> str:
 
 
 @mcp.tool()
-async def check_daily_quest() -> str:
+async def check_daily_quest(car_id: int | None = None) -> str:
     """Check today's daily driving quest and progress.
 
     Uses a deterministic hash of the current Beijing date to select one quest
@@ -3320,10 +3412,14 @@ async def check_daily_quest() -> str:
       - explorer (探索者): max single trip > 50 km today
       - commuter (勤劳小蜜蜂): trip count >= 2 today
 
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
+
     Returns JSON with: date, quest_name, quest_description, status,
     current_progress, target.
     """
     _log.info(f"[TOOL] check_daily_quest called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
 
     QUEST_POOL = {
         "eco_driver": ("黄金右脚", "今日所有行程平均能耗低于 150 Wh/km", "avg_wh_per_km"),
@@ -3355,7 +3451,7 @@ async def check_daily_quest() -> str:
           AND start_date < %s
           AND end_date IS NOT NULL
         """,
-        (CAR_ID, today_utc.isoformat(), tomorrow_utc.isoformat()),
+        (effective_car_id, today_utc.isoformat(), tomorrow_utc.isoformat()),
     )
 
     trip_count = len(rows)
@@ -3411,7 +3507,7 @@ async def check_daily_quest() -> str:
 
 
 @mcp.tool()
-async def get_longest_trip_on_single_charge() -> str:
+async def get_longest_trip_on_single_charge(car_id: int | None = None) -> str:
     """Find the longest distance driven between two consecutive charges.
 
     Uses window functions on charging_processes to define charge windows,
@@ -3420,8 +3516,12 @@ async def get_longest_trip_on_single_charge() -> str:
     Returns JSON with: record_distance_km, start_time, end_time,
     start_battery_pct, arrival_battery_pct, battery_consumed_pct,
     efficiency_comment.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] get_longest_trip_on_single_charge called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
 
     row = _query_one(
         """
@@ -3464,7 +3564,7 @@ async def get_longest_trip_on_single_charge() -> str:
         ORDER BY total_distance_km DESC
         LIMIT 1
         """,
-        (CAR_ID, CAR_ID),
+        (effective_car_id, effective_car_id),
     )
 
     if not row or not row["total_distance_km"]:
