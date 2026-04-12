@@ -558,15 +558,15 @@ async def tesla_status(car_id: int | None = None) -> str:
 
 
 @mcp.tool()
-async def tesla_charging_history(days: int = 30, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_charging_history(days: int = 30, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Charging sessions over the last N days.
 
     Shows energy added, duration, battery range, and location for each session.
 
     Args:
         days: Number of days to look back (default: 30, max: ~10 years)
-        date_from: Filter charging from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter charging until this date (YYYY-MM-DD), defaults to today
+        start_date: Filter charging from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter charging until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_charging_history called")
@@ -574,9 +574,9 @@ async def tesla_charging_history(days: int = 30, date_from: str | None = None, d
     if days <= 0 or days > 3650:
         return "❌ days must be between 1 and 3650"
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
-        if date_to and date_to_dt:
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -608,7 +608,7 @@ async def tesla_charging_history(days: int = 30, date_from: str | None = None, d
         (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
-    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
+    date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
     if not rows:
         return f"No charging sessions ({date_range})."
 
@@ -640,8 +640,8 @@ async def tesla_charging_history(days: int = 30, date_from: str | None = None, d
 @mcp.tool()
 async def tesla_charges(
     days: int = 30,
-    date_from: str | None = None,
-    date_to: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     limit: int = 50,
     car_id: int | None = None,
 ) -> str:
@@ -652,8 +652,8 @@ async def tesla_charges(
 
     Args:
         days: Number of days to look back (default: 30)
-        date_from: Filter from date (YYYY-MM-DD)
-        date_to: Filter until date (YYYY-MM-DD)
+        start_date: Filter from date (YYYY-MM-DD)
+        end_date: Filter until date (YYYY-MM-DD)
         limit: Maximum sessions to return (default: 50, -1 for all)
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
@@ -663,9 +663,9 @@ async def tesla_charges(
         return "❌ days must be between 1 and 3650"
 
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
-        if date_to and date_to_dt:
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -734,26 +734,26 @@ async def tesla_charges(
 
 
 @mcp.tool()
-async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Recent drives -- distance, duration, efficiency, start/end locations.
 
     Shows driving activity with energy consumption.
 
     Args:
         days: Number of days to look back from today (default: 30, max: 3650/10years)
-        date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
+        start_date: Filter drives from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter drives until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_drives called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate date parameters
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
         # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
-        # e.g., date_to="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
-        if date_to and date_to_dt:
+        # e.g., end_date="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -776,9 +776,9 @@ async def tesla_drives(days: int = 30, date_from: str | None = None, date_to: st
         (effective_car_id, date_from_dt.isoformat() if date_from_dt else None, date_to_dt.isoformat() if date_to_dt else None,),
     )
 
-    date_range = f"{date_from}" if date_from else f"last {days} days"
-    if date_to:
-        date_range = f"{date_from or 'start'} to {date_to}"
+    date_range = f"{start_date}" if start_date else f"last {days} days"
+    if end_date:
+        date_range = f"{start_date or 'start'} to {end_date}"
     if not rows:
         return f"No drives recorded ({date_range})."
 
@@ -1042,37 +1042,37 @@ def _classify_trip(start_geofence: str | None, end_geofence: str | None, distanc
 
 
 @mcp.tool()
-async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_trips_by_category(category: str = "commute", limit: int = 20, days: int | None = None, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Get trips filtered by category.
 
     Args:
         category: "commute", "shopping", "leisure", "long_trip", or "other"
         limit: Max trips to return (default: 20)
-        days: Number of days to look back from today (default: all time if days/date_from not set)
-        date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
+        days: Number of days to look back from today (default: all time if days/start_date not set)
+        start_date: Filter drives from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter drives until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_trips_by_category called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate date parameters
     try:
-        if date_from:
-            start_dt = _parse_date(date_from)
+        if start_date:
+            start_dt = _parse_date(start_date)
         elif days:
             start_dt = _utcnow() - timedelta(days=days)
         else:
             start_dt = datetime(2000, 1, 1, tzinfo=timezone.utc)  # All time by default
 
-        end_dt = _parse_date(date_to, _utcnow())
-        # Exclusive end boundary: add 1 day so [start, end) covers the full date_to
-        # e.g., date_to="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
-        if date_to and end_dt:
+        end_dt = _parse_date(end_date, _utcnow())
+        # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
+        # e.g., end_date="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
+        if end_date and end_dt:
             end_dt = end_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    date_range = f"{date_from or ('last ' + str(days) + ' days' if days else 'all time')} to {date_to or 'today'}"
+    date_range = f"{start_date or ('last ' + str(days) + ' days' if days else 'all time')} to {end_date or 'today'}"
 
     rows = _query(
         """
@@ -1219,23 +1219,23 @@ async def tesla_battery_health(car_id: int | None = None) -> str:
 
 
 @mcp.tool()
-async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Energy consumption trends -- Wh/mi over time.
 
     Shows weekly average efficiency from driving data.
 
     Args:
         days: Number of days to look back (default: 90)
-        date_from: Filter drives from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter drives until this date (YYYY-MM-DD), defaults to today
+        start_date: Filter drives from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter drives until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_efficiency called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
-        if date_to and date_to_dt:
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -1259,7 +1259,7 @@ async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to
         (KWH_PER_KM, effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
-    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
+    date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
     if not rows:
         return f"No driving data ({date_range})."
 
@@ -1282,23 +1282,23 @@ async def tesla_efficiency(days: int = 90, date_from: str | None = None, date_to
 
 
 @mcp.tool()
-async def tesla_location_history(days: int = 7, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_location_history(days: int = 7, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Where the car has been -- top locations by time spent.
 
     Groups positions by proximity and shows time at each cluster.
 
     Args:
         days: Number of days to look back (default: 7)
-        date_from: Filter positions from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter positions until this date (YYYY-MM-DD), defaults to today
+        start_date: Filter positions from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter positions until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_location_history called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
-        if date_to and date_to_dt:
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -1322,7 +1322,7 @@ async def tesla_location_history(days: int = 7, date_from: str | None = None, da
         (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
-    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
+    date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
     if not rows:
         return f"No location data ({date_range})."
 
@@ -1349,23 +1349,23 @@ async def tesla_location_history(days: int = 7, date_from: str | None = None, da
 
 
 @mcp.tool()
-async def tesla_state_history(days: int = 7, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_state_history(days: int = 7, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Vehicle state transitions -- online, asleep, offline.
 
     Shows when the car was awake vs sleeping, useful for vampire drain analysis.
 
     Args:
         days: Number of days to look back (default: 7)
-        date_from: Filter states from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter states until this date (YYYY-MM-DD), defaults to today
+        start_date: Filter states from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter states until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_state_history called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
-        if date_to and date_to_dt:
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -1383,7 +1383,7 @@ async def tesla_state_history(days: int = 7, date_from: str | None = None, date_
         (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
-    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
+    date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
     if not rows:
         return f"No state data ({date_range})."
 
@@ -2237,7 +2237,7 @@ async def tesla_tpms_status(car_id: int | None = None) -> str:
 
 
 @mcp.tool()
-async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_tpms_history(days: int = 30, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Recent TPMS pressure history from TeslaMate.
 
     Shows the average and min/max pressures recorded in positions table.
@@ -2245,16 +2245,16 @@ async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_
 
     Args:
         days: Number of days to look back (default: 30)
-        date_from: Filter TPMS from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter TPMS until this date (YYYY-MM-DD), defaults to today
+        start_date: Filter TPMS from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter TPMS until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_tpms_history called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
-        if date_to and date_to_dt:
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -2275,7 +2275,7 @@ async def tesla_tpms_history(days: int = 30, date_from: str | None = None, date_
         (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
-    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
+    date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
     if not rows:
         return f"No TPMS data ({date_range})."
 
@@ -2390,7 +2390,7 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
 
 
 @mcp.tool()
-async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date_to: str | None = None, car_id: int | None = None) -> str:
+async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end_date: str | None = None, car_id: int | None = None) -> str:
     """Vampire drain analysis -- battery loss while parked overnight.
 
     Checks for periods where the car was parked (no drives) for 8+ hours
@@ -2398,16 +2398,16 @@ async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date
 
     Args:
         days: Number of days to analyze (default: 14)
-        date_from: Filter drain from this date (YYYY-MM-DD), overrides days param
-        date_to: Filter drain until this date (YYYY-MM-DD), defaults to today
+        start_date: Filter drain from this date (YYYY-MM-DD), overrides days param
+        end_date: Filter drain until this date (YYYY-MM-DD), defaults to today
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_vampire_drain called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
-        date_from_dt = _parse_date(date_from, _utcnow() - timedelta(days=days))
-        date_to_dt = _parse_date(date_to, _utcnow())
-        if date_to and date_to_dt:
+        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_to_dt = _parse_date(end_date, _utcnow())
+        if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
@@ -2438,7 +2438,7 @@ async def tesla_vampire_drain(days: int = 14, date_from: str | None = None, date
         (effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
-    date_range = f"{date_from or 'last ' + str(days) + ' days'} to {date_to or 'today'}"
+    date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
     if not rows:
         return f"No significant vampire drain detected ({date_range})."
 
