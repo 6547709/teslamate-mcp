@@ -10,7 +10,7 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ## Features
 
-**31 tools** across six categories — multi-vehicle support via optional `car_id` parameter
+**35 tools** across six categories — multi-vehicle support via optional `car_id` parameter
 
 **Multi-vehicle:** All tools accept an optional `car_id` parameter to query a specific vehicle. Use `tesla_cars()` to list all registered vehicles.
 
