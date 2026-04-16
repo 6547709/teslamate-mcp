@@ -94,35 +94,90 @@
 
 **1. 追加到 TeslaMate 的 `docker-compose.yml`：**
 
+所有配置通过环境变量完成。以下是**完整参考配置**，包含所有可用选项：
+
 ```yaml
 services:
   teslamate-mcp:
-    image: ghcr.io/<YOUR-GITHUB-USERNAME>/teslamate-mcp:latest
+    image: ghcr.io/6547709/teslamate-mcp:latest
     container_name: teslamate-mcp
     restart: always
     ports:
-      - "30002:8080"    # 主机端口:容器端口
+      - "30002:8080"              # 主机端口:容器端口
     environment:
-      # TeslaMate 数据库（与 teslamate 服务相同的配置）
-      - TESLAMATE_DB_HOST=database
-      - TESLAMATE_DB_PORT=5432
-      - TESLAMATE_DB_USER=teslamate
-      - TESLAMATE_DB_PASS=secret
-      - TESLAMATE_DB_NAME=teslamate
-      # HTTP 服务模式
-      - MCP_TRANSPORT=streamable-http
-      - HTTP_HOST=0.0.0.0
-      - HTTP_PORT=8080
-      # 单位与货币
-      - USE_METRIC_UNITS=true      # true = 公里/摄氏度/¥/Wh/km，false = 英里/华氏度/$/Wh/mi
-      - TESLA_ELECTRICITY_RATE_RMB=0.6  # 每度电价格（元）
-      # 车辆参数
-      - TESLA_CAR_ID=1
-      - TESLA_BATTERY_KWH=75        # 电池容量（千瓦时）
-      - TESLA_BATTERY_RANGE_KM=525  # 满电续航（公里）
+      # ── TeslaMate 数据库（必填）─────────────────────────
+      - TESLAMATE_DB_HOST=database      # PostgreSQL 主机（同一 Docker 网络下用 database）
+      - TESLAMATE_DB_PORT=5432          # PostgreSQL 端口
+      - TESLAMATE_DB_USER=teslamate     # 数据库用户名
+      - TESLAMATE_DB_PASS=secret        # 数据库密码  ← 请修改
+      - TESLAMATE_DB_NAME=teslamate     # 数据库名称
+
+      # ── 服务模式 ───────────────────────────────────────
+      - MCP_TRANSPORT=streamable-http   # stdio=命令行模式，streamable-http=容器模式
+      - HTTP_HOST=0.0.0.0              # 绑定地址
+      - HTTP_PORT=8080                 # 容器内部端口
+      # - MCP_DEBUG=false              # 设为 true 开启详细日志
+
+      # ── 时区 ───────────────────────────────────────────
+      - TIMEZONE=Asia/Shanghai          # IANA 时区名（如 Asia/Shanghai、America/Los_Angeles）
+
+      # ── 单位与货币 ─────────────────────────────────────
+      - USE_METRIC_UNITS=true           # true=公里/摄氏度/¥/Wh/km，false=英里/华氏度/$/Wh/mi
+      - TESLA_ELECTRICITY_RATE_RMB=0.6  # 电费（元/度）
+      # - TESLA_ELECTRICITY_RATE_USD=0.12  # 电费（美元/度，fallback）
+      # - TESLA_GAS_PRICE=3.50          # 油价（美元/加仑，用于节省计算）
+      # - TESLA_GAS_MPG=28              # 燃油车油耗（MPG，用于节省计算）
+
+      # ── 车辆参数 ───────────────────────────────────────
+      - TESLA_CAR_ID=1                  # 默认车辆 ID（查看 TeslaMate 仪表盘）
+      - TESLA_BATTERY_KWH=75            # 可用电池容量（kWh）
+      - TESLA_BATTERY_RANGE_KM=525      # 满电续航（km）
+      # 多车配置：JSON 格式，key 为车辆 ID，value 为电池参数
+      # 所有工具均支持 car_id 参数来查询指定车辆
+      # 设置后将覆盖上面的单车环境变量
+      # - TESLA_CAR_PARAMS={"1":{"kwh":75,"range_km":525},"2":{"kwh":60,"range_km":438}}
+
+      # ── 胎压阈值（可选）────────────────────────────────
+      # - TESLA_TPMS_MIN_THRESHOLD=2.5  # 低压警告阈值（bar）
+      # - TESLA_TPMS_MAX_THRESHOLD=3.5  # 高压警告阈值（bar）
+
+      # ── 查询限制（可选，设 -1 为不限制）────────────────
+      # - TESLA_LIMIT_DRIVES=500             # tesla_drives 最大返回条数
+      # - TESLA_LIMIT_CHARGING=500           # tesla_charging_history 最大返回条数
+      # - TESLA_LIMIT_TRIP_CATEGORIES=500    # tesla_trip_categories 分析行程数
+      # - TESLA_LIMIT_BATTERY_HEALTH=60      # tesla_battery_health 月度快照数
+      # - TESLA_LIMIT_BATTERY_SAMPLES=30     # tesla_battery_health 回退采样数
+      # - TESLA_LIMIT_LOCATION_HISTORY=50    # tesla_location_history 位置聚类数
+      # - TESLA_LIMIT_STATE_HISTORY=500      # tesla_state_history 状态转换数
+      # - TESLA_LIMIT_SOFTWARE_UPDATES=30    # tesla_software_updates 软件更新数
+      # - TESLA_LIMIT_CHARGING_BY_LOCATION=50  # tesla_charging_by_location 充电地点数
+      # - TESLA_LIMIT_TPMS_HISTORY=60        # tesla_tpms_history 胎压历史数
+      # - TESLA_LIMIT_VAMPIRE_DRAIN=50       # tesla_vampire_drain 掉电事件数
     depends_on:
       - database
 ```
+
+> 💡 注释掉的变量（`#`）显示的是默认值，只需取消注释并修改你需要的即可。
+
+**车型参考（中国）：**
+
+| 年份 | 车型 | 版本 | 电池（kWh） | 续航（km） | 备注 |
+|------|------|------|------------|------------|------|
+| 2014-2016 | Model S | 早期进口系列（60/75/85/90） | 60-90 | 280-440 | 早期 18650 三元锂 |
+| 2016-2018 | Model S/X | 100D 系列（进口） | 100.0 | 450-510 | 松下 18650 三元锂 |
+| 2019.02 | Model 3 | 进口高性能/长续后驱版 | 75.0 | ~490 | 松下 2170 三元锂 |
+| 2019.05 | Model 3 | 进口标准续航升级版 | 52.0 | ~380 | 松下 2170 三元锂 |
+| 2019.12 | Model 3 | 国产标续版（首批） | 52.5 | ~380 | 宁德时代 LFP/三元锂 |
+| 2020.04 | Model 3 | 国产长续航后驱版 | 75.0 | ~490 | LG 三元锂 |
+| 2021.01 | Model Y | 国产长续航/高性能版 | 76.8/78.4 | 480-505 | LG 三元锂 |
+| 2021.07 | Model Y | 国产后轮驱动版（标续） | 60.0 | ~435 | 宁德时代 LFP |
+| 2021.11 | Model 3 | 国产后轮驱动版（60度） | 60.0 | ~439 | 宁德时代 LFP |
+| 2022.03 | Model 3 | 2022款 高性能版（P版） | 78.4 | ~507 | LG 三元锂 |
+| 2023.01 | Model S/X | 新款（Plaid/双电机） | 100.0 | 520-620 | 三元锂（18650 改进版） |
+| 2023.09 | Model 3 | 焕新版 后驱/长续航 | 60/78.4 | 438-550 | LFP/三元锂 |
+| 2024.04 | Model 3 | 焕新版 高性能版（P版） | 78.4 | ~480 | LG 三元锂 |
+| 2025.01 | Model 3+ | 焕新版超长续航后驱版 | 78.4 | ~620 | 三元锂（新款） |
+| 2025.03 | Model Y L | 长续航六座版 | 82.0 | ~580 | 三元锂 |
 
 **2. 启动容器：**
 
@@ -175,98 +230,11 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 
 ---
 
-## 环境变量说明
-
-### TeslaMate 数据库（必填）
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `TESLAMATE_DB_HOST` | *（必填）* | PostgreSQL 主机地址，同一 Docker 网络下用 `database` |
-| `TESLAMATE_DB_PORT` | `5432` | PostgreSQL 端口 |
-| `TESLAMATE_DB_USER` | `teslamate` | 数据库用户名 |
-| `TESLAMATE_DB_PASS` | *（必填）* | 数据库密码 |
-| `TESLAMATE_DB_NAME` | `teslamate` | 数据库名称 |
-
-### 服务模式
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `MCP_TRANSPORT` | `stdio` | `stdio`=命令行模式，`streamable-http`=容器模式 |
-| `HTTP_HOST` | `0.0.0.0` | 绑定地址 |
-| `HTTP_PORT` | `8080` | 容器内部端口 |
-
-### 时区与显示
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `TIMEZONE` | `Asia/Shanghai` | 所有输出日期的时区（IANA 时区名，如 `Asia/Shanghai`、`America/Los_Angeles`） |
-
-### 单位与货币
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `USE_METRIC_UNITS` | `false` | `true`=公制（公里/摄氏度/¥），`false`=英制（英里/华氏度/$） |
-| `TESLA_ELECTRICITY_RATE_RMB` | `0.6` | 电费（元/度） |
-| `TESLA_ELECTRICITY_RATE_USD` | `0.12` | 电费（美元/度，fallback） |
-
-### 车辆参数
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `TESLA_CAR_ID` | `1` | TeslaMate 中的车辆 ID（查看 TeslaMate 仪表盘） |
-| `TESLA_BATTERY_KWH` | `75` | 可用电池容量（千瓦时） |
-| `TESLA_BATTERY_RANGE_KM` | `525` | 满电续航（公里） |
-
-**车型参考（中国）：**
-
-| 年份 | 车型 | 版本 | 电池（kWh） | 续航（km） | 备注 |
-|------|------|------|------------|------------|------|
-| 2014-2016 | Model S | 早期进口系列（60/75/85/90） | 60-90 | 280-440 | 早期 18650 三元锂 |
-| 2016-2018 | Model S/X | 100D 系列（进口） | 100.0 | 450-510 | 松下 18650 三元锂 |
-| 2019.02 | Model 3 | 进口高性能/长续后驱版 | 75.0 | ~490 | 松下 2170 三元锂 |
-| 2019.05 | Model 3 | 进口标准续航升级版 | 52.0 | ~380 | 松下 2170 三元锂 |
-| 2019.12 | Model 3 | 国产标续版（首批） | 52.5 | ~380 | 宁德时代 LFP/三元锂 |
-| 2020.04 | Model 3 | 国产长续航后驱版 | 75.0 | ~490 | LG 三元锂 |
-| 2021.01 | Model Y | 国产长续航/高性能版 | 76.8/78.4 | 480-505 | LG 三元锂 |
-| 2021.07 | Model Y | 国产后轮驱动版（标续） | 60.0 | ~435 | 宁德时代 LFP |
-| 2021.11 | Model 3 | 国产后轮驱动版（60度） | 60.0 | ~439 | 宁德时代 LFP |
-| 2022.03 | Model 3 | 2022款 高性能版（P版） | 78.4 | ~507 | LG 三元锂 |
-| 2023.01 | Model S/X | 新款（Plaid/双电机） | 100.0 | 520-620 | 三元锂（18650 改进版） |
-| 2023.09 | Model 3 | 焕新版 后驱/长续航 | 60/78.4 | 438-550 | LFP/三元锂 |
-| 2024.04 | Model 3 | 焕新版 高性能版（P版） | 78.4 | ~480 | LG 三元锂 |
-| 2025.01 | Model 3+ | 焕新版超长续航后驱版 | 78.4 | ~620 | 三元锂（新款） |
-| 2025.03 | Model Y L | 长续航六座版 | 82.0 | ~580 | 三元锂 |
-
-### 胎压阈值（可选）
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `TESLA_TPMS_MIN_THRESHOLD` | `2.0` | 低压警告阈值（bar） |
-| `TESLA_TPMS_MAX_THRESHOLD` | `2.5` | 高压警告阈值（bar） |
-
-### 查询限制
-
-设为 `-1` 表示不限制返回数量。
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `TESLA_LIMIT_DRIVES` | `500` | `tesla_drives` 最大返回条数 |
-| `TESLA_LIMIT_CHARGING` | `500` | `tesla_charging_history` 最大返回条数 |
-| `TESLA_LIMIT_TRIP_CATEGORIES` | `500` | `tesla_trip_categories` 分析的行程数 |
-| `TESLA_LIMIT_BATTERY_HEALTH` | `60` | `tesla_battery_health` 月度快照数量 |
-| `TESLA_LIMIT_BATTERY_SAMPLES` | `20` | `tesla_battery_health` 回退采样数 |
-| `TESLA_LIMIT_LOCATION_HISTORY` | `50` | `tesla_location_history` 位置聚类数量 |
-| `TESLA_LIMIT_STATE_HISTORY` | `500` | `tesla_state_history` 状态转换数量 |
-| `TESLA_LIMIT_SOFTWARE_UPDATES` | `20` | `tesla_software_updates` 软件更新数量 |
-| `TESLA_LIMIT_CHARGING_BY_LOCATION` | `50` | `tesla_charging_by_location` 充电地点数量 |
-| `TESLA_LIMIT_TPMS_HISTORY` | `30` | `tesla_tpms_history` 胎压历史记录数 |
-| `TESLA_LIMIT_VAMPIRE_DRAIN` | `50` | `tesla_vampire_drain` 吸血鬼耗电事件数 |
-
 ---
 
 ## 工作原理
 
-单文件 Python 服务器（~2700 行），使用 **FastMCP** 框架。直接从 TeslaMate PostgreSQL 数据库读取所有数据：
+单文件 Python 服务器（~3700 行），使用 **FastMCP** 框架。直接从 TeslaMate PostgreSQL 数据库读取所有数据：
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌───────────┐     ┌────────────┐

@@ -130,6 +130,43 @@ BATTERY_KWH = float(os.environ.get("TESLA_BATTERY_KWH", "75"))
 BATTERY_RANGE_KM = float(os.environ.get("TESLA_BATTERY_RANGE_KM", "525"))
 KWH_PER_KM = BATTERY_KWH / BATTERY_RANGE_KM
 
+# Multi-car support: JSON map of car_id -> {kwh, range_km}
+# Example: {"1":{"kwh":75,"range_km":525},"2":{"kwh":60,"range_km":438}}
+_CAR_PARAMS_RAW = os.environ.get("TESLA_CAR_PARAMS", "")
+_CAR_PARAMS: dict[int, dict] = {}
+if _CAR_PARAMS_RAW:
+    try:
+        for k, v in json.loads(_CAR_PARAMS_RAW).items():
+            _CAR_PARAMS[int(k)] = {
+                "kwh": float(v["kwh"]),
+                "range_km": float(v["range_km"]),
+                "kwh_per_km": float(v["kwh"]) / float(v["range_km"]),
+            }
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        _log.warning(f"Failed to parse TESLA_CAR_PARAMS: {e}, falling back to single-car config")
+
+# Always register the default car from env vars
+if CAR_ID not in _CAR_PARAMS:
+    _CAR_PARAMS[CAR_ID] = {
+        "kwh": BATTERY_KWH,
+        "range_km": BATTERY_RANGE_KM,
+        "kwh_per_km": KWH_PER_KM,
+    }
+
+def _get_car_config(car_id: int | None = None) -> dict:
+    """Get car-specific config (kwh, range_km, kwh_per_km) for a given car_id.
+    Returns default car config if car_id is None or not found in TESLA_CAR_PARAMS.
+    """
+    cid = car_id if car_id is not None else CAR_ID
+    if cid in _CAR_PARAMS:
+        return _CAR_PARAMS[cid]
+    # Fallback to default
+    return _CAR_PARAMS[CAR_ID]
+
+def _effective_car_id(car_id: int | None = None) -> int:
+    """Return effective car_id, falling back to global CAR_ID."""
+    return car_id if car_id is not None else CAR_ID
+
 # Cost defaults
 ELECTRICITY_RATE_RMB = float(os.environ.get("TESLA_ELECTRICITY_RATE_RMB", "0.6"))  # RMB/kWh
 ELECTRICITY_RATE = float(os.environ.get("TESLA_ELECTRICITY_RATE_USD", "0.12"))    # USD/kWh (fallback)
@@ -140,9 +177,9 @@ GAS_MPG = int(os.environ.get("TESLA_GAS_MPG", "28"))
 USE_METRIC_UNITS = os.environ.get("USE_METRIC_UNITS", "false").lower() in ("true", "1", "yes")
 
 # TPMS thresholds (bar)
-TPMS_MIN = float(os.environ.get("TESLA_TPMS_MIN_THRESHOLD", "2.0"))
-TPMS_MAX = float(os.environ.get("TESLA_TPMS_MAX_THRESHOLD", "2.5"))
-TPMS_WARN_DELTA = 0.15  # bar -- warn if any tire differs from average by this much
+TPMS_MIN = float(os.environ.get("TESLA_TPMS_MIN_THRESHOLD", "2.5"))
+TPMS_MAX = float(os.environ.get("TESLA_TPMS_MAX_THRESHOLD", "3.5"))
+TPMS_WARN_DELTA = 0.2  # bar -- warn if any tire differs from average by this much
 
 # Backend availability
 HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
@@ -163,12 +200,12 @@ LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "500"))
 LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "500"))
 LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "500"))
 LIMIT_BATTERY_HEALTH     = int(os.environ.get("TESLA_LIMIT_BATTERY_HEALTH", "60"))
-LIMIT_BATTERY_SAMPLES    = int(os.environ.get("TESLA_LIMIT_BATTERY_SAMPLES", "20"))
+LIMIT_BATTERY_SAMPLES    = int(os.environ.get("TESLA_LIMIT_BATTERY_SAMPLES", "30"))
 LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "50"))
 LIMIT_STATE_HISTORY      = int(os.environ.get("TESLA_LIMIT_STATE_HISTORY", "500"))
-LIMIT_SOFTWARE_UPDATES   = int(os.environ.get("TESLA_LIMIT_SOFTWARE_UPDATES", "20"))
+LIMIT_SOFTWARE_UPDATES   = int(os.environ.get("TESLA_LIMIT_SOFTWARE_UPDATES", "30"))
 LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "50"))
-LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "30"))
+LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "60"))
 LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "50"))
 
 mcp = FastMCP("tesla")
@@ -409,7 +446,11 @@ async def tesla_cars() -> str:
         vin = car.get("vin") or ""
         eff = car.get("efficiency")
         eff_str = f", efficiency {eff:.3f}" if eff else ""
-        lines.append(f"- Car {cid}: {name} ({model}), VIN: ...{vin[-6:]}{eff_str}")
+        # Show configured battery params if available
+        cfg = _CAR_PARAMS.get(cid)
+        cfg_str = f", battery {cfg['kwh']}kWh / {cfg['range_km']}km" if cfg else ""
+        default_str = " ⭐ default" if cid == CAR_ID else ""
+        lines.append(f"- Car {cid}: {name} ({model}), VIN: ...{vin[-6:]}{eff_str}{cfg_str}{default_str}")
 
     return "\n".join(lines)
 
@@ -487,7 +528,8 @@ async def tesla_status(car_id: int | None = None) -> str:
 
     bat = combined.get("battery_level")
     if bat is not None:
-        range_km = BATTERY_RANGE_KM * bat / 100
+        car_cfg = _get_car_config(effective_car_id)
+        range_km = car_cfg["range_km"] * bat / 100
         lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
 
     is_charging = (
@@ -796,7 +838,7 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         date_str = _format_dt(r.get("start_date"))
         range_start = r.get("start_ideal_range_km") or 0
         range_end = r.get("end_ideal_range_km") or 0
-        kwh = max(0, (range_start - range_end) * KWH_PER_KM)
+        kwh = max(0, (range_start - range_end) * _get_car_config(effective_car_id)["kwh_per_km"])
         total_kwh += kwh
 
         eff_str = _format_efficiency(kwh, dist_km) if dist_km > 0 and kwh > 0 else ""
@@ -1321,7 +1363,7 @@ async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_da
         GROUP BY date_trunc('week', start_date)
         ORDER BY week DESC
     """,
-        (KWH_PER_KM, effective_car_id, cutoff, end_boundary, end_boundary),
+        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
@@ -1593,7 +1635,7 @@ async def tesla_live(car_id: int | None = None) -> str:
     # Battery
     bat = combined.get("battery_level")
     if bat is not None:
-        range_km = BATTERY_RANGE_KM * bat / 100
+        range_km = _get_car_config(effective_car_id)["range_km"] * bat / 100
         if USE_METRIC_UNITS:
             lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
         else:
@@ -1723,14 +1765,14 @@ async def tesla_savings(
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
                    * %s), 0) AS total_kwh
         FROM drives WHERE car_id = %s AND distance > 0
-    """, (KWH_PER_KM, effective_car_id))
+    """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
     monthly = _query_one("""
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
                    * %s), 0) AS total_kwh
         FROM drives WHERE car_id = %s AND distance > 0
           AND date_trunc('month', start_date) = date_trunc('month', NOW())
-    """, (KWH_PER_KM, effective_car_id))
+    """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
 
     if not lifetime:
         return "No driving data yet."
@@ -1833,7 +1875,7 @@ async def tesla_trip_cost(
                COALESCE(SUM(distance), 0) AS km
         FROM drives WHERE car_id = %s
           AND start_date >= NOW() - INTERVAL '30 days' AND distance > 0
-    """, (KWH_PER_KM, effective_car_id))
+    """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
 
     if USE_METRIC_UNITS:
         wh_per_km = 180  # default Wh/km
@@ -1845,7 +1887,7 @@ async def tesla_trip_cost(
         cost_round = round(kwh_round * ELECTRICITY_RATE_RMB, 2)
 
         bat = pos.get("battery_level", 0)
-        range_km = round(BATTERY_RANGE_KM * bat / 100)
+        range_km = round(_get_car_config(effective_car_id)["range_km"] * bat / 100)
 
         lines = [
             f"**Trip to {dest_name}** ({road_km} km each way, {round_trip_km} km round trip)\n"
@@ -1873,7 +1915,7 @@ async def tesla_trip_cost(
         gas_equiv = round(round_trip / _mpg * _gas, 2)
 
         bat = pos.get("battery_level", 0)
-        range_mi = round(_km_to_mi(BATTERY_RANGE_KM * bat / 100))
+        range_mi = round(_km_to_mi(_get_car_config(effective_car_id)["range_km"] * bat / 100))
 
         lines = [
             f"**Trip to {dest_name}** ({road_mi} mi each way, {round_trip} mi round trip)\n"
@@ -1928,7 +1970,7 @@ async def tesla_efficiency_by_temp(car_id: int | None = None) -> str:
           AND outside_temp_avg IS NOT NULL
         GROUP BY temp_range
         ORDER BY MIN(outside_temp_avg)
-    """, (KWH_PER_KM, effective_car_id))
+    """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
 
     if not rows:
         return "Not enough driving data with temperature readings."
@@ -2102,7 +2144,7 @@ async def tesla_longest_trips(limit: int = 10, car_id: int | None = None) -> str
         ORDER BY d.distance DESC
         LIMIT %s
     """,
-        (KWH_PER_KM, effective_car_id, limit,),
+        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, limit,),
     )
 
     if not rows:
@@ -2160,7 +2202,7 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (KWH_PER_KM, effective_car_id, start.isoformat(), next_start.isoformat()),
+        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, start.isoformat(), next_start.isoformat()),
     )
     r = rows[0] if rows else {}
 
@@ -2179,7 +2221,7 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (KWH_PER_KM, effective_car_id, prev_start.isoformat(), start.isoformat()),
+        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, prev_start.isoformat(), start.isoformat()),
     )
     prev_r = prev_rows[0] if prev_rows else {}
     prev_km = prev_r.get("total_km") or 0
@@ -2407,7 +2449,7 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
         ORDER BY d.month DESC
         LIMIT %s
     """,
-        (KWH_PER_KM, effective_car_id, effective_car_id, months,),
+        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, effective_car_id, months,),
     )
 
     if not rows:
@@ -2896,7 +2938,7 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
 
     Detects three achievements:
       1. [极限续航幸存者] -- started a charge with <= 5% battery
-      2. [午夜幽灵] -- drove at least 3 times between 00:00 and 04:00
+      2. [午夜幽灵] -- drove at least 3 times between 00:15 and 05:00
       3. [冰雪勇士] -- drove > 20 km when outside temp was below 0 degC
 
     Args:
@@ -2935,7 +2977,7 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
             ),
         })
 
-    # Achievement 2:午夜幽灵 -- 3+ drives between 00:00 and 04:00 (in user's timezone)
+    # Achievement 2:午夜幽灵 -- 3+ drives between 00:15 and 05:00 (in user's timezone)
     # Double AT TIME ZONE ensures consistent behavior: first 'UTC' normalizes to naive UTC,
     # then converts to target timezone (works correctly for both tz-aware and naive inputs)
     midnight_drives = _query(
@@ -2944,16 +2986,19 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
                outside_temp_avg, end_address_id
         FROM drives
         WHERE car_id = %s AND start_date >= %s
-          AND EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) >= 0
-          AND EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) < 4
+          AND (
+              EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) * 60
+              + EXTRACT(MINUTE FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s)
+          ) >= 15
+          AND EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) < 5
         ORDER BY start_date DESC
         """,
-        (effective_car_id, cutoff, TIMEZONE, TIMEZONE),
+        (effective_car_id, cutoff, TIMEZONE, TIMEZONE, TIMEZONE),
     )
     # DEBUG: log ALL matched rows to diagnose false positives
-    _log.warning(f"[MIDNIGHT GHOST] {len(midnight_drives)} drives matched, timezone={TIMEZONE}")
+    _log.debug(f"[MIDNIGHT GHOST] {len(midnight_drives)} drives matched, timezone={TIMEZONE}")
     for i, r in enumerate(midnight_drives):
-        _log.warning(f"[MIDNIGHT GHOST] [{i}] start_date={r['start_date']} | distance={r['distance']}")
+        _log.debug(f"[MIDNIGHT GHOST] [{i}] start_date={r['start_date']} | distance={r['distance']}")
     if len(midnight_drives) >= 3:
         earliest = midnight_drives[-1]
         unlocked.append({
@@ -2962,7 +3007,7 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
             "first_midnight_drive": _format_dt(earliest["start_date"]),
             "total_midnight_drives": len(midnight_drives),
             "evidence": (
-                f"在凌晨 00:00~04:00 时段内共出行 {len(midnight_drives)} 次，"
+                f"在凌晨 00:15~05:00 时段内共出行 {len(midnight_drives)} 次，"
                 "是昼伏夜出的神秘驾驶员"
             ),
         })
@@ -3408,13 +3453,14 @@ async def get_driver_profile(car_id: int | None = None) -> str:
     milestones_unlocked = []
 
     # Distance milestones (thresholds are in km)
-    DISTANCE_NODES = [1_000, 5_000, 10_000, 16_000, 30_000]
+    DISTANCE_NODES = [1_000, 5_000, 10_000, 80_000, 120_000, 160_000]
     DISTANCE_LABELS = {
         1_000:  "累计里程突破 1 千公里！",
         5_000:  "累计里程突破 5 千公里！",
         10_000: "累计里程突破 1 万公里大关！",
-        16_000: "累计里程突破 16 万公里！质保期已满，真正的硬核模式开启！",
-        30_000: "累计里程突破 30 万公里！传奇级别！",
+        80_000: "累计里程突破 8 万公里！整车质保已满，继续精彩旅程！",
+        120_000: "累计里程突破 12 万公里！传奇级别！",
+        160_000: "累计里程突破 16 万公里！电池电机质保已满，真正的硬核模式开启！",
     }
     for node in DISTANCE_NODES:
         if total_km >= node:
@@ -3438,11 +3484,11 @@ async def get_driver_profile(car_id: int | None = None) -> str:
     # -- Easter egg: 160,000 km --
     special_160k = None
     if 160_000 <= total_km < 160_000 * 1.05:
-        special_160k = "🎉 恭喜达成 16 万公里！您已正式脱离特斯拉电池质保新手保护区，真正的硬核生存模式开启！"
+        special_160k = "🎉 恭喜达成 16 万公里！电池电机质保已过，从此每一公里都是额外的奖励！"
 
     # -- Next milestone hint --
     next_milestone_hint = None
-    all_distance_nodes = [1_000, 5_000, 10_000, 16_000, 30_000]
+    all_distance_nodes = [1_000, 5_000, 10_000, 80_000, 120_000, 160_000]
     all_rank_nodes = [10_000, 50_000, 100_000, 160_000, 300_000]
     all_nodes = sorted(set(all_distance_nodes + all_rank_nodes))
     for n in all_nodes:
@@ -3523,7 +3569,7 @@ async def check_daily_quest(car_id: int | None = None) -> str:
     total_distance = sum(float(r["distance"] or 0) for r in rows)
     # Energy is calculated from ideal range delta, not a direct column
     total_energy = sum(
-        max(0, (float(r["start_ideal_range_km"] or 0) - float(r["end_ideal_range_km"] or 0)) * KWH_PER_KM)
+        max(0, (float(r["start_ideal_range_km"] or 0) - float(r["end_ideal_range_km"] or 0)) * _get_car_config(effective_car_id)["kwh_per_km"])
         for r in rows
     )
 
