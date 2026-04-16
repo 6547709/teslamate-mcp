@@ -376,6 +376,37 @@ def _cached_query_one(key: str, sql: str, params: tuple = (), ttl: int = 300) ->
     return result
 
 
+def _cached_query(key: str, sql: str, params: tuple = (), ttl: int = 300) -> list[dict]:
+    """Query with TTL cache — for multi-row results like geofences."""
+    now = time.time()
+    if key in _cache and now - _cache[key]["ts"] < ttl:
+        return _cache[key]["data"]
+    result = _query(sql, params)
+    _cache[key] = {"data": result, "ts": now}
+    return result
+
+
+def _find_nearby_geofence(lat: float, lon: float) -> str | None:
+    """Find nearest geofence name using cached geofence data. Returns name or None."""
+    geofences = _cached_query(
+        "geofences_all",
+        "SELECT name, latitude, longitude, radius FROM geofences",
+        ttl=3600,
+    )
+    best_name = None
+    best_dist = float("inf")
+    for gf in geofences:
+        dlat = gf["latitude"] - lat
+        dlon = gf["longitude"] - lon
+        dist_sq = dlat * dlat + dlon * dlon
+        # Rough degree-to-meter: 1 degree ≈ 111km, so 0.01° ≈ 1.1km
+        radius_deg = (gf.get("radius") or 50) / 111_000.0
+        if dist_sq <= radius_deg * radius_deg and dist_sq < best_dist:
+            best_dist = dist_sq
+            best_name = gf["name"]
+    return best_name
+
+
 def _km_to_mi(km: float | None) -> float | None:
     """Convert km to miles, handling None."""
     if km is None:
@@ -508,14 +539,11 @@ async def tesla_status(car_id: int | None = None) -> str:
     # Geofence lookup (lightweight — geofences table is tiny)
     geofence = None
     lat, lon = combined.get("latitude"), combined.get("longitude")
+    geofence = None
     if lat and lon:
-        geofence = _query_one("""
-            SELECT name FROM geofences
-            WHERE latitude BETWEEN %s - 0.01 AND %s + 0.01
-              AND longitude BETWEEN %s - 0.01 AND %s + 0.01
-            ORDER BY (latitude - %s)^2 + (longitude - %s)^2
-            LIMIT 1
-        """, (lat, lat, lon, lon, lat, lon))
+        gf_name = _find_nearby_geofence(lat, lon)
+        if gf_name:
+            geofence = {"name": gf_name}
 
     lines = []
     if car:
@@ -1023,15 +1051,34 @@ async def tesla_driving_score(
         if start_month > end_month:
             return "start_month must be <= end_month"
 
+        # Single query for the entire range, then split by month in Python
+        range_start_local = datetime(year, start_month, 1, tzinfo=USER_TZ)
+        if end_month == 12:
+            range_end_local = datetime(year + 1, 1, 1, tzinfo=USER_TZ)
+        else:
+            range_end_local = datetime(year, end_month + 1, 1, tzinfo=USER_TZ)
+
+        all_rows = _query_drives(
+            range_start_local.astimezone(timezone.utc),
+            range_end_local.astimezone(timezone.utc),
+            effective_car_id,
+        )
+
+        # Group rows by month (using start_date in user timezone)
+        from collections import defaultdict
+        monthly_rows = defaultdict(list)
+        for r in all_rows:
+            sd = r.get("start_date")
+            if sd:
+                if hasattr(sd, 'astimezone'):
+                    local_dt = sd.astimezone(USER_TZ)
+                else:
+                    local_dt = sd
+                monthly_rows[local_dt.month].append(r)
+
         outputs = []
         for m in range(start_month, end_month + 1):
-            start_local = datetime(year, m, 1, tzinfo=USER_TZ)
-            if m == 12:
-                end_local = datetime(year + 1, 1, 1, tzinfo=USER_TZ)
-            else:
-                end_local = datetime(year, m + 1, 1, tzinfo=USER_TZ)
-
-            rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), effective_car_id)
+            rows = monthly_rows.get(m, [])
             if rows:
                 safety_score, total_deduct, details = _calculate_driving_score(rows)
                 num_drives = len(rows)
@@ -1433,7 +1480,8 @@ async def tesla_location_history(days: int = 7, start_date: str | None = None, e
     if not rows:
         return f"No location data ({date_range})."
 
-    geofences = _query("SELECT name, latitude, longitude, radius FROM geofences")
+    geofences = _cached_query("geofences_all",
+        "SELECT name, latitude, longitude, radius FROM geofences", ttl=3600)
 
     lines = [f"**Location History** ({date_range})\n"]
     for r in rows:
@@ -1700,15 +1748,9 @@ async def tesla_live(car_id: int | None = None) -> str:
     if lat and lon:
         lines.append(f"Location: {lat:.5f}, {lon:.5f}")
         try:
-            nearby = _query_one("""
-                SELECT name FROM geofences
-                WHERE latitude BETWEEN %s - 0.01 AND %s + 0.01
-                  AND longitude BETWEEN %s - 0.01 AND %s + 0.01
-                ORDER BY (latitude - %s)^2 + (longitude - %s)^2
-                LIMIT 1
-            """, (lat, lat, lon, lon, lat, lon))
-            if nearby and nearby.get("name"):
-                lines.append(f"  Near: {nearby['name']}")
+            gf_name = _find_nearby_geofence(lat, lon)
+            if gf_name:
+                lines.append(f"  Near: {gf_name}")
         except Exception:
             pass
     else:
