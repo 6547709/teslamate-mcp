@@ -1,6 +1,6 @@
 """Tesla MCP Server -- TeslaMate vehicle analytics.
 
-See README.md (English) or README_zh.md for full documentation.
+See README.md (中文) or README_en.md (English) for full documentation.
 
 Single-file FastMCP server. Stdio transport. All data is read-only
 from TeslaMate's PostgreSQL database -- no Owner API, no token decryption.
