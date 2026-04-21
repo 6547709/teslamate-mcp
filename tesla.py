@@ -88,14 +88,50 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import time
 import threading
 import atexit
 
-# -- Version (set at build time via --build-arg VERSION=tag, fallback to dev) ---
-VERSION = os.environ.get("VERSION", "dev")
+# -- Version ------------------------------------------------------------------
+# Source of truth for this release. Bump this constant when tagging a new
+# release. Overridable at runtime via env (Docker build-arg) or git describe
+# for development checkouts.
+__version__ = "1.1.0"
+
+
+def _detect_version() -> str:
+    """Multi-level version resolution:
+
+    1. VERSION env var (Docker build-arg injection) — authoritative when set
+       to anything other than "dev" (Dockerfile default).
+    2. __version__ constant above — always available, the normal case for
+       installed packages.
+    3. git describe — only reached if someone zapped __version__ and the
+       env var, useful for working-tree development snapshots.
+    """
+    env_v = os.environ.get("VERSION")
+    if env_v and env_v != "dev":
+        return env_v
+    if __version__ and __version__ != "dev":
+        return __version__
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=1,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return "dev"
+
+
+VERSION = _detect_version()
 
 # -- Debug mode: set MCP_DEBUG=true to enable verbose logging -----------------
 MCP_DEBUG = os.environ.get("MCP_DEBUG", "false").lower() in ("true", "1", "yes")
@@ -235,9 +271,9 @@ def _limit_sql(raw_limit: int | None) -> str:
         return ""
     return f"LIMIT {int(raw_limit)}"
 
-LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "500"))
+LIMIT_DRIVES             = int(os.environ.get("TESLA_LIMIT_DRIVES", "1000"))
 LIMIT_CHARGING           = int(os.environ.get("TESLA_LIMIT_CHARGING", "500"))
-LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "500"))
+LIMIT_TRIP_CATEGORIES    = int(os.environ.get("TESLA_LIMIT_TRIP_CATEGORIES", "1000"))
 LIMIT_BATTERY_HEALTH     = int(os.environ.get("TESLA_LIMIT_BATTERY_HEALTH", "60"))
 LIMIT_BATTERY_SAMPLES    = int(os.environ.get("TESLA_LIMIT_BATTERY_SAMPLES", "30"))
 LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "50"))
@@ -247,7 +283,15 @@ LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION"
 LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "180"))
 LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "50"))
 
-mcp = FastMCP("tesla")
+mcp = FastMCP(
+    name="teslamate-mcp",
+    version=VERSION,
+    instructions=(
+        "TeslaMate MCP server providing 36 read-only analytics tools over "
+        "your TeslaMate PostgreSQL data. Call tesla_version() for build info."
+    ),
+    website_url="https://github.com/6547709/teslamate-mcp",
+)
 
 # -- Timezone helpers ----------------------------------------------------------
 
@@ -451,6 +495,86 @@ def _cached_query(key: str, sql: str, params: tuple = (), ttl: int = 300) -> lis
     return result
 
 
+# -- Persistent geocode cache (cross-process, ~/.cache/teslamate-mcp/geocode.json) --
+# Saves Nominatim round-trips for repeat trip_cost queries.
+_GEOCODE_CACHE_FILE = Path.home() / ".cache" / "teslamate-mcp" / "geocode.json"
+_geocode_cache: dict[str, list] = {}
+_geocode_cache_loaded = False
+_geocode_cache_lock = threading.Lock()
+
+
+def _geocode_cache_load() -> dict:
+    """Load persistent geocode cache from disk (lazy, once per process)."""
+    global _geocode_cache_loaded
+    if _geocode_cache_loaded:
+        return _geocode_cache
+    with _geocode_cache_lock:
+        if _geocode_cache_loaded:  # double-check under lock
+            return _geocode_cache
+        try:
+            if _GEOCODE_CACHE_FILE.exists():
+                _geocode_cache.update(json.loads(_GEOCODE_CACHE_FILE.read_text(encoding="utf-8")))
+                _log.info(f"[CACHE] geocode cache loaded: {len(_geocode_cache)} entries")
+        except (OSError, ValueError) as e:
+            _log.warning(f"[CACHE] geocode cache load failed: {e}")
+        _geocode_cache_loaded = True
+    return _geocode_cache
+
+
+def _geocode_cache_get(query: str) -> tuple[float, float, str] | None:
+    """Lookup a geocoded destination. Returns (lat, lon, name) or None."""
+    cache = _geocode_cache_load()
+    key = query.strip().lower()
+    entry = cache.get(key)
+    if entry and len(entry) == 3:
+        return float(entry[0]), float(entry[1]), str(entry[2])
+    return None
+
+
+def _geocode_cache_put(query: str, lat: float, lon: float, name: str) -> None:
+    """Persist a geocoded destination to disk. Best-effort; no error on IO failure."""
+    cache = _geocode_cache_load()
+    key = query.strip().lower()
+    with _geocode_cache_lock:
+        cache[key] = [lat, lon, name]
+        try:
+            _GEOCODE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _GEOCODE_CACHE_FILE.write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            _log.warning(f"[CACHE] geocode cache save failed: {e}")
+
+
+# -- Result-level cache for slow aggregate tools --------------------------------
+# Wrap an entire tool's output (string) instead of caching individual SQL rows.
+# Useful for tools like battery_health (1.5s on 18.6M-row positions table)
+# where the underlying data changes slowly (monthly granularity).
+_result_cache: dict[str, dict] = {}
+_result_cache_lock = threading.Lock()
+
+
+async def _cached_result(key: str, ttl: int, fn) -> str:
+    """Cache an async producer's string result for `ttl` seconds.
+
+    Args:
+        key:  cache key (must include all relevant params, e.g. f"savings:{car_id}")
+        ttl:  seconds to cache
+        fn:   async callable that produces the string when cache miss
+    """
+    now = time.time()
+    with _result_cache_lock:
+        entry = _result_cache.get(key)
+        if entry and now - entry["ts"] < ttl:
+            _log.debug(f"[CACHE] result hit: {key} (age {now - entry['ts']:.1f}s)")
+            return entry["data"]
+    result = await fn()
+    with _result_cache_lock:
+        _result_cache[key] = {"data": result, "ts": now}
+    return result
+
+
 def _find_nearby_geofence(lat: float, lon: float) -> str | None:
     """Find nearest geofence name using cached geofence data. Returns name or None."""
     geofences = _cached_query(
@@ -520,6 +644,67 @@ def _format_cost(kwh: float) -> str:
 
 
 # -- TeslaMate Read Tools ------------------------------------------------------
+
+@mcp.tool()
+async def tesla_version() -> str:
+    """Server version & diagnostic info — call first to confirm the build.
+
+    Returns the running server version, Python/fastmcp versions, timezone,
+    tool count, and whether the TeslaMate database is reachable. Useful for
+    support, debugging, and confirming you hit the expected deployment.
+    """
+    _log.info("[TOOL] tesla_version called")
+    # Runtime metadata
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    try:
+        from importlib.metadata import version as _pkg_ver
+        fastmcp_ver = _pkg_ver("fastmcp")
+    except Exception:
+        fastmcp_ver = "unknown"
+    try:
+        from importlib.metadata import version as _pkg_ver
+        psycopg2_ver = _pkg_ver("psycopg2-binary")
+    except Exception:
+        psycopg2_ver = "unknown"
+
+    # Count tools registered on the MCP instance
+    try:
+        tools = await mcp.list_tools()
+        tool_count = len(tools)
+    except Exception:
+        tool_count = 36  # fallback
+
+    # DB health check (1-row query with tight timeout)
+    db_status = "not configured"
+    db_detail = ""
+    if HAS_TESLAMATE:
+        try:
+            row = _query_one("SELECT 1 AS ok, NOW() AS ts, current_database() AS db", ())
+            if row and row.get("ok") == 1:
+                db_status = "✅ connected"
+                db_detail = f" ({row.get('db')}@{DB_HOST}:{DB_PORT}, server time {row.get('ts')})"
+            else:
+                db_status = "⚠️ query unexpected result"
+        except Exception as e:
+            db_status = f"❌ unreachable: {type(e).__name__}"
+
+    lines = [
+        f"**teslamate-mcp server**",
+        "",
+        f"- **Version:** `{VERSION}`",
+        f"- **Source:** <https://github.com/6547709/teslamate-mcp>",
+        f"- **Tools registered:** {tool_count}",
+        f"- **Python:** {py_ver}",
+        f"- **fastmcp:** {fastmcp_ver}",
+        f"- **psycopg2-binary:** {psycopg2_ver}",
+        f"- **User timezone:** {USER_TZ}",
+        f"- **Units:** {'metric (km/RMB)' if USE_METRIC_UNITS else 'imperial (mi/USD)'}",
+        f"- **TeslaMate DB:** {db_status}{db_detail}",
+    ]
+    if CAR_ID:
+        lines.append(f"- **Default car_id:** {CAR_ID}")
+    return "\n".join(lines)
+
 
 @mcp.tool()
 async def tesla_cars() -> str:
@@ -915,6 +1100,21 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         date_range = f"{start_date or 'start'} to {end_date}"
     if not rows:
         return f"No drives recorded ({date_range})."
+
+    # Issue-3: when user passes an oversized days (e.g. 10000) and we hit the
+    # row cap, "last 10000 days" is misleading. Show the ACTUAL window covered
+    # by the returned rows instead. Only activate when the gap is meaningful.
+    if not start_date and not end_date and rows:
+        first_date = rows[-1].get("start_date")  # ORDER BY start_date DESC → last is oldest
+        last_date  = rows[0].get("start_date")
+        if first_date and last_date and hasattr(last_date, "day"):
+            actual_days = (last_date - first_date).days + 1
+            # Only rewrite header when requested window is significantly larger
+            # than actual data (avoids noise for typical 30-day calls).
+            if actual_days < days * 0.9:
+                actual_first = _format_dt(first_date)[:10]
+                actual_last  = _format_dt(last_date)[:10]
+                date_range = f"{actual_first} → {actual_last}, {actual_days} days of data"
 
     lines = [f"**Drives** ({date_range}, {len(rows)} trips)\n"]
     total_km = 0.0
@@ -1489,6 +1689,19 @@ async def tesla_battery_health(car_id: int | None = None) -> str:
     """
     _log.info(f"[TOOL] tesla_battery_health called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+
+    # PERF: cache 1h — degradation moves at month-granularity, no need to recompute often.
+    return await _cached_result(
+        f"bh:{effective_car_id}",
+        ttl=3600,
+        fn=lambda: _battery_health_compute(effective_car_id),
+    )
+
+
+async def _battery_health_compute(effective_car_id: int) -> str:
+    # NOTE: tried two-stage CTE (day → month) but PG optimizer treats it as
+    # equivalent plan when no covering index exists; same ~1.5s. Keeping the
+    # simple form. The 1h result-cache above takes care of repeated calls.
     rows = _query(f"""
         SELECT date_trunc('month', date) AS month,
                AVG(ideal_battery_range_km) AS avg_ideal_km,
@@ -1998,29 +2211,39 @@ async def tesla_savings(
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
-    # Lifetime: distance from drives, energy from charging_processes (actual kWh charged)
-    lifetime_drive = _query_one("""
-        SELECT COALESCE(SUM(distance), 0) AS total_km
-        FROM drives WHERE car_id = %s AND distance > 0
+    # PERF: cache 10min — savings are aggregated across lifetime/month, slow-changing.
+    return await _cached_result(
+        f"sv:{effective_car_id}:{_gas}:{_mpg}",
+        ttl=600,
+        fn=lambda: _savings_compute(effective_car_id, _gas, _mpg, gas_price, mpg_equivalent),
+    )
+
+
+async def _savings_compute(effective_car_id: int, _gas: float, _mpg: int,
+                            gas_price: float | None, mpg_equivalent: int | None) -> str:
+    # PERF: 4 queries → 2 queries via FILTER (WHERE) aggregate condition.
+    # Lifetime + this-month from drives in one scan; same for charging_processes.
+    drive_row = _query_one("""
+        SELECT
+            COALESCE(SUM(distance), 0)                                                                  AS lifetime_km,
+            COALESCE(SUM(distance) FILTER (WHERE date_trunc('month', start_date) = date_trunc('month', NOW())), 0) AS monthly_km
+        FROM drives
+        WHERE car_id = %s AND distance > 0
     """, (effective_car_id,))
-    lifetime_charge = _query_one("""
-        SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh
+    charge_row = _query_one("""
+        SELECT
+            COALESCE(SUM(charge_energy_added), 0)                                                                          AS lifetime_kwh,
+            COALESCE(SUM(charge_energy_added) FILTER (WHERE date_trunc('month', start_date) = date_trunc('month', NOW())), 0) AS monthly_kwh
         FROM charging_processes
         WHERE car_id = %s AND end_date IS NOT NULL
     """, (effective_car_id,))
 
-    # This month: same split
-    monthly_drive = _query_one("""
-        SELECT COALESCE(SUM(distance), 0) AS total_km
-        FROM drives WHERE car_id = %s AND distance > 0
-          AND date_trunc('month', start_date) = date_trunc('month', NOW())
-    """, (effective_car_id,))
-    monthly_charge = _query_one("""
-        SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh
-        FROM charging_processes
-        WHERE car_id = %s AND end_date IS NOT NULL
-          AND date_trunc('month', start_date) = date_trunc('month', NOW())
-    """, (effective_car_id,))
+    drive_row = drive_row or {}
+    charge_row = charge_row or {}
+    lifetime_drive  = {"total_km":  drive_row.get("lifetime_km")  or 0}
+    monthly_drive   = {"total_km":  drive_row.get("monthly_km")   or 0}
+    lifetime_charge = {"total_kwh": charge_row.get("lifetime_kwh") or 0}
+    monthly_charge  = {"total_kwh": charge_row.get("monthly_kwh")  or 0}
 
     def _merge(drive_row: dict | None, charge_row: dict | None) -> tuple[dict, bool]:
         """Merge drive and charge rows. Returns (merged, is_estimated).
@@ -2123,36 +2346,81 @@ async def tesla_trip_cost(
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_trip_cost called with destination={destination[:30]}...")
+    # Bug-1: empty/whitespace destination must NOT fall through to ILIKE '%%' which
+    # matches any address in the table. Validate before any geocoding logic runs.
+    if not destination or not destination.strip():
+        return "❌ destination cannot be empty. Please provide a city, address, or place name (e.g. '万达·天樾' or 'Atlanta, GA')."
+    destination = destination.strip()
     effective_car_id = car_id if car_id is not None else CAR_ID
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
-    # #7: Nominatim requires a valid User-Agent with contact info (https://operations.osmfoundation.org/policies/nominatim/)
-    # Wrap the request in try/except so network/service failures don't crash the tool.
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": destination, "format": "json", "limit": "1"},
-                headers={
-                    "User-Agent": "teslamate-mcp/1.0 (https://github.com/6547709/teslamate-mcp)"
-                },
-            )
-            resp.raise_for_status()
-            results = resp.json()
-    except httpx.TimeoutException:
-        return f"❌ Geocoding timeout for '{destination}'. Try again later."
-    except httpx.HTTPError as e:
-        return f"❌ Geocoding service error: {e}. Try again later."
-    except (ValueError, KeyError):
-        return f"❌ Geocoding service returned invalid response for '{destination}'."
+    # PERF #1: try local TeslaMate addresses table first (1700+ visited places, FREE).
+    # Falls back to Nominatim only if no local match.
+    dest_lat: float | None = None
+    dest_lon: float | None = None
+    dest_name: str | None = None
+    local_hit = _query_one(
+        """
+        SELECT latitude, longitude,
+               COALESCE(name, display_name) AS label
+        FROM addresses
+        WHERE name        ILIKE %s
+           OR display_name ILIKE %s
+           OR city         ILIKE %s
+        ORDER BY
+          (CASE WHEN name ILIKE %s THEN 0
+                WHEN display_name ILIKE %s THEN 1
+                ELSE 2 END),
+          id DESC
+        LIMIT 1
+        """,
+        (
+            f"%{destination}%", f"%{destination}%", f"%{destination}%",
+            f"%{destination}%", f"%{destination}%",
+        ),
+    )
+    if local_hit and local_hit.get("latitude") is not None and local_hit.get("longitude") is not None:
+        dest_lat = float(local_hit["latitude"])
+        dest_lon = float(local_hit["longitude"])
+        full_label = local_hit.get("label") or destination
+        dest_name = full_label.split(",")[0].strip()
+        _log.info(f"[PERF] trip_cost: addresses cache hit for '{destination}' → ({dest_lat:.4f}, {dest_lon:.4f})")
+    else:
+        # PERF #2: persistent Nominatim cache (cross-process, ~/.cache/teslamate-mcp/geocode.json).
+        cached = _geocode_cache_get(destination)
+        if cached is not None:
+            dest_lat, dest_lon, dest_name = cached
+            _log.info(f"[PERF] trip_cost: nominatim file-cache hit for '{destination}'")
+        else:
+            # #7: Nominatim requires a valid User-Agent with contact info (https://operations.osmfoundation.org/policies/nominatim/)
+            # Wrap the request in try/except so network/service failures don't crash the tool.
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        "https://nominatim.openstreetmap.org/search",
+                        params={"q": destination, "format": "json", "limit": "1"},
+                        headers={
+                            "User-Agent": "teslamate-mcp/1.0 (https://github.com/6547709/teslamate-mcp)"
+                        },
+                    )
+                    resp.raise_for_status()
+                    results = resp.json()
+            except httpx.TimeoutException:
+                return f"❌ Geocoding timeout for '{destination}'. Try again later."
+            except httpx.HTTPError as e:
+                return f"❌ Geocoding service error: {e}. Try again later."
+            except (ValueError, KeyError):
+                return f"❌ Geocoding service returned invalid response for '{destination}'."
 
-    if not results:
-        return f"Could not geocode '{destination}'."
+            if not results:
+                return f"Could not geocode '{destination}'."
 
-    dest_lat = float(results[0]["lat"])
-    dest_lon = float(results[0]["lon"])
-    dest_name = results[0].get("display_name", destination).split(",")[0]
+            dest_lat = float(results[0]["lat"])
+            dest_lon = float(results[0]["lon"])
+            dest_name = results[0].get("display_name", destination).split(",")[0]
+            # Persist for next time (cross-process cache).
+            _geocode_cache_put(destination, dest_lat, dest_lon, dest_name)
 
     pos = _query_one("""
         SELECT latitude, longitude, battery_level
@@ -2271,6 +2539,15 @@ async def tesla_efficiency_by_temp(car_id: int | None = None) -> str:
     """
     _log.info(f"[TOOL] tesla_efficiency_by_temp called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    # PERF: cache 30min — temperature efficiency curve is a slowly-evolving aggregate.
+    return await _cached_result(
+        f"eft:{effective_car_id}",
+        ttl=1800,
+        fn=lambda: _efficiency_by_temp_compute(effective_car_id),
+    )
+
+
+async def _efficiency_by_temp_compute(effective_car_id: int) -> str:
     rows = _query("""
         SELECT
             CASE
@@ -2340,7 +2617,7 @@ async def tesla_efficiency_by_temp(car_id: int | None = None) -> str:
 
 @mcp.tool()
 async def tesla_charging_by_location(days: int = 0, car_id: int | None = None) -> str:
-    """Charging patterns by location -- where you charge and how much.
+    """Charging sessions grouped by location.
 
     Args:
         days: Number of days to look back (default: 0 = all time)
@@ -2348,6 +2625,15 @@ async def tesla_charging_by_location(days: int = 0, car_id: int | None = None) -
     """
     _log.info(f"[TOOL] tesla_charging_by_location called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    # PERF: cache 30min — charging sessions don't appear that often.
+    return await _cached_result(
+        f"cbl:{effective_car_id}:{days}",
+        ttl=1800,
+        fn=lambda: _charging_by_location_compute(effective_car_id, days),
+    )
+
+
+async def _charging_by_location_compute(effective_car_id: int, days: int) -> str:
     date_filter = ""
     params = [effective_car_id]
     if days > 0:
@@ -2407,6 +2693,15 @@ async def tesla_top_destinations(limit: int = 15, car_id: int | None = None) -> 
     effective_car_id = car_id if car_id is not None else CAR_ID
     if limit <= 0 or limit > 100:
         return "❌ limit must be between 1 and 100"
+    # PERF: cache 30min — visited destinations evolve slowly.
+    return await _cached_result(
+        f"td:{effective_car_id}:{limit}",
+        ttl=1800,
+        fn=lambda: _top_destinations_compute(effective_car_id, limit),
+    )
+
+
+async def _top_destinations_compute(effective_car_id: int, limit: int) -> str:
     # 按坐标聚合（精度 0.002 度 ≈ 220m），避免 GPS 漂移导致同一地点被分成多个 address_id
     rows = _query(
         """
@@ -2505,6 +2800,20 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
     if year < 2000 or year > 2100:
         return "❌ year must be between 2000 and 2100"
 
+    # PERF: cache only HISTORICAL months (immutable). Current month is skipped
+    # because data is still being appended.
+    today = datetime.now(USER_TZ)
+    is_current_month = (year == today.year and month == today.month)
+    if not is_current_month:
+        return await _cached_result(
+            f"mr:{effective_car_id}:{year}:{month}",
+            ttl=86400,  # 1 day; historical data doesn't change
+            fn=lambda: _monthly_report_compute(effective_car_id, year, month),
+        )
+    return await _monthly_report_compute(effective_car_id, year, month)
+
+
+async def _monthly_report_compute(effective_car_id: int, year: int, month: int) -> str:
     start = datetime(year, month, 1)
     if month == 12:
         next_start = datetime(year + 1, 1, 1)
@@ -2515,39 +2824,57 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
     else:
         prev_start = datetime(year, month - 1, 1)
 
-    # Current month: distance from drives, energy from charging_processes
-    rows = _query(
+    # PERF: 4 queries → 2 queries via FILTER (WHERE).
+    # Drives: trips/km/min for current month + km for prev month, single scan.
+    drive_row = _query_one(
         """
-        SELECT COUNT(*) AS trips,
-               COALESCE(SUM(distance), 0) AS total_km,
-               COALESCE(SUM(duration_min), 0) AS total_min
+        SELECT
+            COUNT(*) FILTER (WHERE start_date >= %s AND start_date < %s)               AS cur_trips,
+            COALESCE(SUM(distance) FILTER (WHERE start_date >= %s AND start_date < %s), 0)     AS cur_km,
+            COALESCE(SUM(duration_min) FILTER (WHERE start_date >= %s AND start_date < %s), 0) AS cur_min,
+            COALESCE(SUM(distance) FILTER (WHERE start_date >= %s AND start_date < %s), 0)     AS prev_km
         FROM drives
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (effective_car_id, start.isoformat(), next_start.isoformat()),
+        (
+            start.isoformat(), next_start.isoformat(),       # cur_trips
+            start.isoformat(), next_start.isoformat(),       # cur_km
+            start.isoformat(), next_start.isoformat(),       # cur_min
+            prev_start.isoformat(), start.isoformat(),       # prev_km
+            effective_car_id,
+            prev_start.isoformat(), next_start.isoformat(),  # window guard (prev..next)
+        ),
     )
-    r = rows[0] if rows else {}
+    drive_row = drive_row or {}
+    trips   = drive_row.get("cur_trips") or 0
+    km      = drive_row.get("cur_km") or 0
+    minutes = drive_row.get("cur_min") or 0
+    prev_km = drive_row.get("prev_km") or 0
 
-    trips = r.get("trips") or 0
-    km = r.get("total_km") or 0
-    minutes = r.get("total_min") or 0
-
-    # Charging cost + actual kWh from TeslaMate
-    charge_rows = _query(
+    # Charging: cost + actual kWh for current month + prev kWh, single scan.
+    charge_row = _query_one(
         """
-        SELECT COALESCE(SUM(cp.cost), 0) AS total_cost,
-               COALESCE(SUM(cp.charge_energy_added), 0) AS total_kwh
-        FROM charging_processes cp
-        WHERE cp.car_id = %s
-          AND cp.start_date >= %s AND cp.start_date < %s
-          AND cp.end_date IS NOT NULL
+        SELECT
+            COALESCE(SUM(cost) FILTER (WHERE start_date >= %s AND start_date < %s), 0)                  AS cur_cost,
+            COALESCE(SUM(charge_energy_added) FILTER (WHERE start_date >= %s AND start_date < %s), 0)   AS cur_kwh,
+            COALESCE(SUM(charge_energy_added) FILTER (WHERE start_date >= %s AND start_date < %s), 0)   AS prev_kwh
+        FROM charging_processes
+        WHERE car_id = %s AND end_date IS NOT NULL
+          AND start_date >= %s AND start_date < %s
         """,
-        (effective_car_id, start.isoformat(), next_start.isoformat()),
+        (
+            start.isoformat(), next_start.isoformat(),       # cur_cost
+            start.isoformat(), next_start.isoformat(),       # cur_kwh
+            prev_start.isoformat(), start.isoformat(),       # prev_kwh
+            effective_car_id,
+            prev_start.isoformat(), next_start.isoformat(),  # window guard
+        ),
     )
-    charge_r = charge_rows[0] if charge_rows else {}
-    total_cost = charge_r.get("total_cost") or 0
-    kwh = charge_r.get("total_kwh") or 0
+    charge_row = charge_row or {}
+    total_cost = charge_row.get("cur_cost") or 0
+    kwh        = charge_row.get("cur_kwh") or 0
+    prev_kwh   = charge_row.get("prev_kwh") or 0
 
     # Fallback: estimate energy from ideal-range deltas if no charging sessions recorded
     kwh_estimated = False
@@ -2566,29 +2893,7 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
         kwh = (est or {}).get("total_kwh") or 0
         kwh_estimated = True
 
-    # Previous month for comparison
-    prev_rows = _query(
-        """
-        SELECT COALESCE(SUM(distance), 0) AS total_km
-        FROM drives
-        WHERE car_id = %s AND distance > 0
-          AND start_date >= %s AND start_date < %s
-        """,
-        (effective_car_id, prev_start.isoformat(), start.isoformat()),
-    )
-    prev_r = prev_rows[0] if prev_rows else {}
-    prev_km = prev_r.get("total_km") or 0
-
-    prev_charge_rows = _query(
-        """
-        SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh
-        FROM charging_processes
-        WHERE car_id = %s AND end_date IS NOT NULL
-          AND start_date >= %s AND start_date < %s
-        """,
-        (effective_car_id, prev_start.isoformat(), start.isoformat()),
-    )
-    prev_kwh = (prev_charge_rows[0] if prev_charge_rows else {}).get("total_kwh") or 0
+    # PERF: prev_km / prev_kwh already computed above via FILTER aggregate.
 
     if USE_METRIC_UNITS:
         lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]

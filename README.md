@@ -8,26 +8,26 @@
 
 ---
 
-## ✨ v1.0.0 新特性
+## ✨ v1.1.0 新特性
 
-> 稳定性与准确性大版本 —— 修复 **30+ 个 Bug**、重写 **9 个统计工具**、**35/35 个工具**在真实 TeslaMate 数据库上全部通过验证。
+> 性能与可观测性大版本 —— **0 项数据库改动**，全部在程序层优化。冷启动延迟 ↓ 28%，热缓存 ↓ 69%。新增诊断工具。36/36 全部通过测试。
 
-- 🛡️ **稳如磐石的可靠性** —— 缓存并发锁、时区一致性、不再有 00:00–05:00 的"午夜幽灵"数据、不再有孤立行导致的 72 小时"幻影行程"。
-- 🎯 **贴近真实的统计口径** —— 续航基于真实电池衰减（362 → 329 km 实测）、驾驶评分采用合理阈值（急加速 100 kW / 急刹车 -50 kW / 限速 135 km/h）、中文场所词典（万达/银泰/火锅/超市）让"购物"分类从 3% → 25% 正确识别。
-- 🗺️ **更聪明的地点聚合** —— 220 m 网格 + `MODE() WITHIN GROUP` 合并同一地点重复打卡（"万达·天樾"552 → 626 次正确合并）。
-- 🔋 **吸血鬼耗电重写** —— 从事件表派生空闲窗口（drive_end → 下一次 drive/charge），对齐 TeslaMate 官方 UI 口径。
-- ⚡ **性能提升** —— 5 处 LATERAL 子查询换成直连 JOIN（3–10 倍加速）；`trips_by_category` 从 5 条查询压缩为 1 条；全量 35 工具跑完仅 4.4 秒（平均 126 ms/次）。
-- 📊 **透明度** —— 能耗报告现在直接展示 `charging_processes` 中的真实充电量"（实际充电 X kWh）"，不再用电量差估算。
-- 🧰 **工程打磨** —— 只读连接 autocommit、Nominatim 合规限速、日志带 `%z` 时区标记、`TESLA_CAR_PARAMS` 逐字段校验报错。
-- 📚 **`STATS_LOGIC_REVIEW.md`** —— 所有工具统计口径合理性审计文档（已作为 Release 附件提供）。
+- 🔍 **新增诊断工具 `tesla_version()`** —— 返回服务端版本、工具数、Python / fastmcp / psycopg2 版本、时区、单位、**真实 DB 连通性检查**。部署后第一时间确认版本。
+- 🤝 **MCP 协议元数据** —— 服务端在握手阶段直接暴露 `name=teslamate-mcp` + `version=1.1.0` + `website_url`，无需调工具客户端就能识别。
+- ⚡ **SQL 查询合并（FILTER WHERE）** —— `tesla_savings` 4→2 次查询（27×）、`tesla_monthly_report` 4→2 次查询（60×），完全等价但 round-trip 减半。
+- 🗺️ **`tesla_trip_cost` 三级兜底** —— 先查 TeslaMate 本地 `addresses` 表（1700+ 常去地点），再查持久化文件缓存（`~/.cache/teslamate-mcp/geocode.json`），最后才打 Nominatim。本地命中 1296ms → **~15ms（86×）**。
+- 🚀 **结果级缓存框架** —— 6 个聚合慢工具加缓存：battery_health（1h）、efficiency_by_temp（30min）、charging_by_location（30min）、top_destinations（30min）、savings（10min）、monthly_report（历史月 1 天，当前月始终实时）。**缓存命中 8827× 加速！**
+- 📈 **`tesla_drives` 历史窗口 +88%** —— `LIMIT_DRIVES` 500 → 1000，`tesla_drives(365+)` 覆盖从 131 天提升到 **247 天**。`days=10000` 这种超大输入现在会显示真实数据范围而非误导性的 "last 10000 days"。
+- 🛡️ **Bug 修复** —— `tesla_trip_cost("")` 空串不再误命中任意地址（`ILIKE '%%'`），返回明确错误。
+- 📊 **性能实证** —— 36/36 工具全通过，6/6 缓存工具 hash 完全一致，15/15 边界场景零崩溃。测试过程见 `TEST_REPORT.md` + `PERFORMANCE_IMPLEMENTATION.md`（本次发布附件）。
 
-完整清单见 [CHANGELOG.md](CHANGELOG.md#100---2026-04-21)。
+完整清单见 [CHANGELOG.md](CHANGELOG.md#110---2026-04-22)。
 
 ---
 
 ## 功能特性
 
-**35 个工具**，分为六大类 — 多车辆支持，所有工具都支持可选的 `car_id` 参数
+**36 个工具**，分为六大类 — 多车辆支持，所有工具都支持可选的 `car_id` 参数
 
 **多车辆支持：** 所有工具都支持可选的 `car_id` 参数来查询特定车辆。使用 `tesla_cars()` 列出所有已注册的车辆。
 
@@ -35,6 +35,7 @@
 
 | 工具 | 说明 |
 |------|------|
+| `tesla_version` | **服务端版本与诊断信息（版本号、工具数、DB 连通状态、Python/fastmcp 版本）** |
 | `tesla_cars` | 列出 TeslaMate 中已注册的所有车辆 |
 | `tesla_status` | 当前车辆状态 — 电量、续航、位置、空调、里程 |
 | `tesla_live` | 实时轮询状态（GPS、电池、温度、TPMS、充电） |

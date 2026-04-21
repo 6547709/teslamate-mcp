@@ -8,26 +8,26 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ---
 
-## ✨ What's New in v1.0.0
+## ✨ What's New in v1.1.0
 
-> Major stability & accuracy overhaul — **30+ bugs fixed**, **9 statistics tools rewritten**, **35/35 tools validated** against a live TeslaMate database.
+> Performance & observability release — **0 database changes**, pure in-app optimizations. Cold-cache workload ↓ 28%, warm-cache ↓ 69%. New diagnostic tool. **36/36 tools validated**.
 
-- 🛡️ **Rock-solid reliability** — race-free cache locking, timezone-consistent math, no more midnight ghost reads, no more phantom 72h "trips" from orphaned drive rows.
-- 🎯 **Real-world accurate statistics** — range now reflects true battery degradation (362 → 329 km), driving score uses proper thresholds (100 kW accel / -50 kW brake / 135 km/h), Chinese venue keywords (万达/银泰/火锅) correctly classify "shopping" from 3% → 25%.
-- 🗺️ **Smarter location clustering** — 220 m grid + `MODE() WITHIN GROUP` merges repeated visits to the same place (e.g. "万达·天樾" 552 → 626 correct visits).
-- 🔋 **Vampire drain rewrite** — now derives idle windows from the event table (drive_end → next drive/charge) matching TeslaMate's own UI logic.
-- ⚡ **Performance** — 5 LATERAL subqueries replaced with direct JOINs (3-10× faster); `trips_by_category` collapsed from 5 queries to 1; full 35-tool suite runs in 4.4s (avg 126 ms/call).
-- 📊 **Transparency** — efficiency reports now show actual charging energy "（实际充电 X kWh）" from `charging_processes`, not battery-delta guesses.
-- 🧰 **Operational polish** — autocommit read-only connections, Nominatim rate-limit compliance, `%z` timezone-tagged logs, per-field config validation.
-- 📚 **`STATS_LOGIC_REVIEW.md`** — full audit of every tool's statistical validity (attached to this release).
+- 🔍 **New diagnostic tool `tesla_version()`** — returns server version, tool count, Python / fastmcp / psycopg2 versions, timezone, units, and a **live TeslaMate DB health check**. First thing to call to confirm your deployment.
+- 🤝 **MCP protocol metadata** — server now advertises `name=teslamate-mcp` + `version=1.1.0` + `website_url` during handshake. MCP-compliant clients see it without any tool call.
+- ⚡ **SQL query consolidation (FILTER WHERE)** — `tesla_savings` 4→2 queries (27×), `tesla_monthly_report` 4→2 queries (60×), semantically identical but round-trips halved.
+- 🗺️ **`tesla_trip_cost` 3-stage fallback** — first search local TeslaMate `addresses` table (1,700+ visited places), then persistent file cache (`~/.cache/teslamate-mcp/geocode.json`), finally Nominatim. Local hits drop from 1296ms → **~15ms (86×)**.
+- 🚀 **Result-level cache framework** — 6 slow aggregate tools now cached: battery_health (1h), efficiency_by_temp (30min), charging_by_location (30min), top_destinations (30min), savings (10min), monthly_report (historical months 1 day, current month always live). **Cache hits achieve 8827× speedup!**
+- 📈 **`tesla_drives` history window +88%** — `LIMIT_DRIVES` 500 → 1000. `tesla_drives(365+)` now covers **247 days** of history instead of 131. Oversized inputs like `days=10000` now show actual data range instead of a misleading "last 10000 days".
+- 🛡️ **Bug fix** — `tesla_trip_cost("")` empty string no longer matches arbitrary addresses via `ILIKE '%%'`; returns a clear error instead.
+- 📊 **Full test evidence** — 36/36 tools pass, 6/6 cached tools hash-identical across calls, 15/15 edge cases zero-crash. See `TEST_REPORT.md` + `PERFORMANCE_IMPLEMENTATION.md` (attached to this release).
 
-Full details in [CHANGELOG.md](CHANGELOG.md#100---2026-04-21).
+Full details in [CHANGELOG.md](CHANGELOG.md#110---2026-04-22).
 
 ---
 
 ## Features
 
-**35 tools** across six categories — multi-vehicle support via optional `car_id` parameter
+**36 tools** across six categories — multi-vehicle support via optional `car_id` parameter
 
 **Multi-vehicle:** All tools accept an optional `car_id` parameter to query a specific vehicle. Use `tesla_cars()` to list all registered vehicles.
 
@@ -35,6 +35,7 @@ Full details in [CHANGELOG.md](CHANGELOG.md#100---2026-04-21).
 
 | Tool | Description |
 |------|-------------|
+| `tesla_version` | **Server version & diagnostic info (version, tool count, DB connectivity, Python/fastmcp versions)** |
 | `tesla_cars` | List all vehicles registered in TeslaMate |
 | `tesla_status` | Current state — battery, range, location, climate, odometer |
 | `tesla_live` | Latest polled state (GPS, battery, climate, TPMS, charging) |

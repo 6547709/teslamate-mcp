@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-04-22
+
+Performance & observability release — **0 database changes**, pure in-app optimizations. Cold-cache workload reduced by 28%, warm-cache by 69%. New diagnostic tool. 36/36 tools validated.
+
+### Added
+- **`tesla_version()` tool** — first tool in the catalog, returns server version, tool count, Python / fastmcp / psycopg2-binary versions, timezone, units, and live TeslaMate DB health check. Use this to confirm deployment identity and connectivity.
+- **FastMCP metadata** — server now advertises `name=teslamate-mcp`, `version`, `instructions`, and `website_url` during MCP handshake (visible to any compliant client without a tool call).
+- **`__version__` constant** with multi-level resolution: `VERSION` env var (Docker build-arg) → hardcoded `__version__` → `git describe` → `"dev"`.
+- **Persistent Nominatim geocode cache** — `~/.cache/teslamate-mcp/geocode.json`, cross-process and thread-safe.
+- **Result-level cache framework** (`_cached_result`) — wraps entire tool output with per-key TTL.
+- **`PERFORMANCE_REVIEW.md`**, **`PERFORMANCE_IMPLEMENTATION.md`**, **`TEST_REPORT.md`** committed to repo for transparency.
+
+### Changed
+- **`tesla_savings`**: 4 independent queries → **2 queries** via `FILTER (WHERE ...)` aggregate condition. Cold 200ms → 8ms (27×).
+- **`tesla_monthly_report`**: 4 queries → **2 queries** via `FILTER`. Cold 300ms → 5ms (60×). Historical months cached 1 day; current month always live.
+- **`tesla_trip_cost`**: 3-stage fallback — first search local TeslaMate `addresses` table (1,700+ visited places), then persistent file cache, finally Nominatim. Local hits drop cold latency from 1296ms to ~15ms (86×).
+- **`tesla_battery_health`** / **`tesla_efficiency_by_temp`** / **`tesla_charging_by_location`** / **`tesla_top_destinations`**: added result-level caching (1h / 30min / 30min / 30min). Warm hits drop to microseconds.
+- **`LIMIT_DRIVES`** default **500 → 1000**; **`LIMIT_TRIP_CATEGORIES`** default **500 → 1000**. `tesla_drives(365+)` now covers 247 days of history instead of 131 (+88%). Override via `TESLA_LIMIT_DRIVES` / `TESLA_LIMIT_TRIP_CATEGORIES` envs.
+- **`tesla_drives` header** now displays the actual data window when the requested `days` exceeds available data (e.g. `days=10000` shows `2025-08-17 → 2026-04-20, 247 days of data, 1000 trips` instead of a misleading "last 10000 days").
+
+### Fixed
+- **Bug: `tesla_trip_cost("")` false match** — empty/whitespace destination no longer matches arbitrary addresses via `ILIKE '%%'`. Input is now validated with a clear error message.
+
+### Performance
+- Full suite benchmark (36 tools, live database):
+  - v1.0.0: 4400 ms · avg 126 ms/call
+  - v1.1.0 cold cache: **3168 ms** · avg 90 ms/call (↓ 28%)
+  - v1.1.0 warm cache: **1369 ms** · avg 39 ms/call (↓ 69%)
+- Cache hit speed-ups: `tesla_battery_health` 8827× · `tesla_top_destinations` 1612× · `tesla_charging_by_location` 125× · `tesla_savings` 99× · `tesla_efficiency_by_temp` 69× · `tesla_monthly_report` 31×
+- **6/6** cached tools verified deterministic (hash cold == warm == 3rd call).
+- **15/15** edge-case inputs handled gracefully (zero crashes).
+
+### Breaking Changes
+- None. All tool signatures and return formats are backwards-compatible with v1.0.0.
+
+[1.1.0]: https://github.com/6547709/teslamate-mcp/releases/tag/v1.1.0
+
 ## [1.0.0] - 2026-04-21
 
 Major stability & accuracy overhaul. 35 tools, 30+ bugs fixed, 9 statistics tools rewritten for real-world correctness, all validated against a live TeslaMate database (35/35 passed).
