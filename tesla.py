@@ -6,36 +6,54 @@ Single-file FastMCP server. Stdio transport. All data is read-only
 from TeslaMate's PostgreSQL database -- no Owner API, no token decryption.
 
 Read tools (TeslaMate):
+  # Vehicle status
+  tesla_cars              -- List all registered vehicles
   tesla_status            -- Current vehicle state (battery, range, location, climate)
-  tesla_charging_history  -- Charging sessions over N days
+  tesla_live              -- Latest polled vehicle state (from positions table)
+  tesla_tpms_status        -- Current tyre pressures with anomaly warnings
+  tesla_tpms_history       -- Recent TPMS history
+
+  # Drives
   tesla_drives            -- Recent drives with distance, duration, efficiency
-  tesla_battery_health    -- Battery degradation trend
-  tesla_efficiency        -- Wh/mi consumption trends
-  tesla_location_history  -- Where the car has been, time at each location
-  tesla_state_history     -- Vehicle state transitions (online/asleep/offline)
-  tesla_software_updates  -- Firmware version history
   tesla_driving_score    -- Driving behaviour score
   tesla_trips_by_category -- Trip classification (commute, long_trip, etc.)
   tesla_trip_categories   -- Count trips by category
+  tesla_longest_trips     -- Top drives ranked by distance
+  tesla_top_destinations  -- Most visited locations
+  tesla_location_history  -- Where the car has been, time at each location
+
+  # Battery & Charging
+  tesla_charging_history  -- Charging sessions over N days
+  tesla_charges           -- Detailed charging sessions with location and cost
+  tesla_charging_by_location -- Charging patterns by location
+  tesla_battery_health    -- Battery degradation trend
+  tesla_vampire_drain     -- Battery loss while parked
+
+  # Energy
+  tesla_efficiency        -- Wh/mi consumption trends
+  tesla_efficiency_by_temp -- Efficiency curve by temperature
   tesla_monthly_report    -- Single month summary with comparison
-  tesla_tpms_status        -- Current tyre pressures with anomaly warnings
-  tesla_tpms_history       -- Recent TPMS history
+  tesla_monthly_summary   -- Monthly driving summary
+
+  # Savings & Eco
   tesla_savings           -- Gas savings scorecard
   tesla_trip_cost         -- Estimate trip cost to a destination
-  tesla_efficiency_by_temp -- Efficiency curve by temperature
-  tesla_charging_by_location -- Charging patterns by location
-  tesla_top_destinations  -- Most visited locations
-  tesla_longest_trips     -- Top drives ranked by distance
-  tesla_monthly_summary   -- Monthly driving summary
-  tesla_vampire_drain     -- Battery loss while parked
-  tesla_live              -- Latest polled vehicle state (from positions table)
   calculate_eco_savings_vs_icev -- ICEV vs EV cost/CO2 comparison
-  generate_travel_narrative_context -- Travel timeline for LLM blogging
-  get_vehicle_persona_status -- Vehicle activity/fatigue/persona metrics
+
+  # Achievements & Fun
   check_driving_achievements -- Driving achievements (eco, midnight, cold)
-  get_charging_vintage_data -- Single charge detailed parameters
+  generate_travel_narrative_context -- Travel timeline for LLM blogging
   generate_weekend_blindbox -- Rare one-time destinations as blindbox recommendation
   generate_monthly_driving_report -- Polished Markdown monthly report
+  get_vehicle_persona_status -- Vehicle activity/fatigue/persona metrics
+  get_charging_vintage_data -- Single charge detailed parameters
+  get_driver_profile      -- Driver gamification profile (rank, milestones, Easter eggs)
+  check_daily_quest       -- Today's random driving quest
+  get_longest_trip_on_single_charge -- Longest distance on a single charge
+
+  # System & History
+  tesla_state_history     -- Vehicle state transitions (online/asleep/offline)
+  tesla_software_updates  -- Firmware version history
 
 Environment variables:
   # TeslaMate Postgres
@@ -68,6 +86,7 @@ import logging
 import math
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -85,7 +104,7 @@ MCP_DEBUG = os.environ.get("MCP_DEBUG", "false").lower() in ("true", "1", "yes")
 logging.basicConfig(
     level=logging.DEBUG if MCP_DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S%z",
     stream=sys.stdout,
 )
 _log = logging.getLogger("teslamate-mcp")
@@ -136,14 +155,34 @@ _CAR_PARAMS_RAW = os.environ.get("TESLA_CAR_PARAMS", "")
 _CAR_PARAMS: dict[int, dict] = {}
 if _CAR_PARAMS_RAW:
     try:
-        for k, v in json.loads(_CAR_PARAMS_RAW).items():
-            _CAR_PARAMS[int(k)] = {
-                "kwh": float(v["kwh"]),
-                "range_km": float(v["range_km"]),
-                "kwh_per_km": float(v["kwh"]) / float(v["range_km"]),
+        _raw_params = json.loads(_CAR_PARAMS_RAW)
+    except json.JSONDecodeError as e:
+        _log.warning(
+            f"Failed to parse TESLA_CAR_PARAMS as JSON: {e}. "
+            f"Falling back to single-car config from TESLA_CAR_ID/TESLA_BATTERY_KWH."
+        )
+        _raw_params = {}
+    for k, v in _raw_params.items():
+        try:
+            _cid = int(k)
+            _kwh = float(v["kwh"])
+            _range = float(v["range_km"])
+            if _range <= 0:
+                raise ValueError(f"range_km must be positive, got {_range}")
+            _CAR_PARAMS[_cid] = {
+                "kwh": _kwh,
+                "range_km": _range,
+                "kwh_per_km": _kwh / _range,
             }
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        _log.warning(f"Failed to parse TESLA_CAR_PARAMS: {e}, falling back to single-car config")
+        except KeyError as e:
+            _log.warning(
+                f"TESLA_CAR_PARAMS car_id={k!r}: missing required field {e}. "
+                f"Expected 'kwh' and 'range_km'. Skipped."
+            )
+        except (TypeError, ValueError) as e:
+            _log.warning(
+                f"TESLA_CAR_PARAMS car_id={k!r}: invalid value ({e}). Skipped."
+            )
 
 # Always register the default car from env vars
 if CAR_ID not in _CAR_PARAMS:
@@ -205,7 +244,7 @@ LIMIT_LOCATION_HISTORY   = int(os.environ.get("TESLA_LIMIT_LOCATION_HISTORY", "5
 LIMIT_STATE_HISTORY      = int(os.environ.get("TESLA_LIMIT_STATE_HISTORY", "500"))
 LIMIT_SOFTWARE_UPDATES   = int(os.environ.get("TESLA_LIMIT_SOFTWARE_UPDATES", "30"))
 LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "50"))
-LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "60"))
+LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "180"))
 LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "50"))
 
 mcp = FastMCP("tesla")
@@ -313,9 +352,18 @@ def _init_pool():
 
 
 def _get_conn():
-    """Get a connection from the pool."""
+    """Get a connection from the pool.
+
+    Connections run in autocommit mode because this MCP server performs
+    read-only queries. Autocommit prevents SELECTs from leaving the connection
+    in 'idle in transaction' state after it's returned to the pool, which
+    would otherwise accumulate until Postgres terminates the session.
+    """
     _init_pool()
-    return _pool.getconn()
+    conn = _pool.getconn()
+    if not conn.autocommit:
+        conn.autocommit = True
+    return conn
 
 
 def _put_conn(conn):
@@ -364,25 +412,42 @@ def _query_one(sql: str, params: tuple = ()) -> dict | None:
 # -- Simple TTL cache for low-frequency data -----------------------------------
 
 _cache: dict[str, dict] = {}
+_cache_lock = threading.Lock()
 
 
 def _cached_query_one(key: str, sql: str, params: tuple = (), ttl: int = 300) -> dict | None:
-    """Query with TTL cache — ideal for rarely-changing data (car info, sw version)."""
+    """Query with TTL cache — ideal for rarely-changing data (car info, sw version).
+
+    Thread-safe: reads/writes to _cache are protected by _cache_lock, but the
+    underlying DB query runs outside the lock to avoid blocking other threads
+    on slow queries. Under high concurrency, the same key may be fetched twice
+    in parallel — that's acceptable (correctness preserved, duplicate work rare).
+    """
     now = time.time()
-    if key in _cache and now - _cache[key]["ts"] < ttl:
-        return _cache[key]["data"]
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and now - entry["ts"] < ttl:
+            return entry["data"]
+    # Run query outside the lock
     result = _query_one(sql, params)
-    _cache[key] = {"data": result, "ts": now}
+    with _cache_lock:
+        _cache[key] = {"data": result, "ts": now}
     return result
 
 
 def _cached_query(key: str, sql: str, params: tuple = (), ttl: int = 300) -> list[dict]:
-    """Query with TTL cache — for multi-row results like geofences."""
+    """Query with TTL cache — for multi-row results like geofences.
+
+    Thread-safe (see _cached_query_one for details).
+    """
     now = time.time()
-    if key in _cache and now - _cache[key]["ts"] < ttl:
-        return _cache[key]["data"]
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and now - entry["ts"] < ttl:
+            return entry["data"]
     result = _query(sql, params)
-    _cache[key] = {"data": result, "ts": now}
+    with _cache_lock:
+        _cache[key] = {"data": result, "ts": now}
     return result
 
 
@@ -507,7 +572,8 @@ async def tesla_status(car_id: int | None = None) -> str:
     # Single query: latest position + state + charging + software version
     combined = _query_one("""
         SELECT
-            p.battery_level, p.is_climate_on, p.inside_temp, p.outside_temp,
+            p.battery_level, p.ideal_battery_range_km,
+            p.is_climate_on, p.inside_temp, p.outside_temp,
             p.odometer, p.speed, p.latitude, p.longitude, p.date AS pos_date,
             s.state AS vehicle_state,
             cp.charge_energy_added, cp.duration_min AS charge_duration,
@@ -516,7 +582,8 @@ async def tesla_status(car_id: int | None = None) -> str:
             cp.start_date AS charge_start, cp.end_date AS charge_end,
             u.version AS sw_version
         FROM (
-            SELECT battery_level, is_climate_on, inside_temp, outside_temp,
+            SELECT battery_level, ideal_battery_range_km,
+                   is_climate_on, inside_temp, outside_temp,
                    odometer, speed, latitude, longitude, date
             FROM positions WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) p
@@ -526,7 +593,7 @@ async def tesla_status(car_id: int | None = None) -> str:
         LEFT JOIN LATERAL (
             SELECT charge_energy_added, duration_min, start_battery_level,
                    end_battery_level, start_date, end_date
-            FROM charging_processes WHERE car_id = %s ORDER BY id DESC LIMIT 1
+            FROM charging_processes WHERE car_id = %s ORDER BY start_date DESC NULLS LAST LIMIT 1
         ) cp ON true
         LEFT JOIN LATERAL (
             SELECT version FROM updates WHERE car_id = %s ORDER BY id DESC LIMIT 1
@@ -539,7 +606,6 @@ async def tesla_status(car_id: int | None = None) -> str:
     # Geofence lookup (lightweight — geofences table is tiny)
     geofence = None
     lat, lon = combined.get("latitude"), combined.get("longitude")
-    geofence = None
     if lat and lon:
         gf_name = _find_nearby_geofence(lat, lon)
         if gf_name:
@@ -556,13 +622,23 @@ async def tesla_status(car_id: int | None = None) -> str:
 
     bat = combined.get("battery_level")
     if bat is not None:
-        car_cfg = _get_car_config(effective_car_id)
-        range_km = car_cfg["range_km"] * bat / 100
+        # 优先用车辆实时续航（反映电池衰减），falls back 到配置值
+        ideal_km = combined.get("ideal_battery_range_km")
+        if ideal_km and ideal_km > 0:
+            range_km = ideal_km
+        else:
+            car_cfg = _get_car_config(effective_car_id)
+            range_km = car_cfg["range_km"] * bat / 100
         lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
 
+    # is_charging：要求 end_date 为空 AND start_date 在最近 24 小时内
+    charge_start_dt = combined.get("charge_start")
+    if charge_start_dt and charge_start_dt.tzinfo is None:
+        charge_start_dt = charge_start_dt.replace(tzinfo=timezone.utc)
     is_charging = (
         combined.get("charge_end") is None
-        and combined.get("charge_start") is not None
+        and charge_start_dt is not None
+        and (_utcnow() - charge_start_dt).total_seconds() < 86400  # 24h
     )
     if is_charging:
         kwh = combined.get("charge_energy_added") or 0
@@ -653,6 +729,7 @@ async def tesla_charging_history(days: int = 30, start_date: str | None = None, 
 
     cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
+    # #15: 用 cp.address_id 直接 JOIN（TeslaMate 自动填充），替代原来的 LATERAL 坐标近邻扫描
     rows = _query(
         f"""
         SELECT cp.start_date, cp.end_date,
@@ -662,15 +739,7 @@ async def tesla_charging_history(days: int = 30, start_date: str | None = None, 
                COALESCE(gf.name, a.display_name) AS location
         FROM charging_processes cp
         LEFT JOIN geofences gf ON cp.geofence_id = gf.id
-        LEFT JOIN positions p ON cp.position_id = p.id
-        LEFT JOIN LATERAL (
-            SELECT a2.display_name
-            FROM addresses a2
-            WHERE a2.latitude BETWEEN p.latitude - 0.001 AND p.latitude + 0.001
-              AND a2.longitude BETWEEN p.longitude - 0.001 AND p.longitude + 0.001
-            ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
-            LIMIT 1
-        ) a ON p.latitude IS NOT NULL
+        LEFT JOIN addresses a ON cp.address_id = a.id
         WHERE cp.car_id = %s AND cp.start_date >= %s AND (cp.start_date < %s OR %s IS NULL) AND cp.end_date IS NOT NULL
         ORDER BY cp.start_date DESC
         {_limit_sql(LIMIT_CHARGING)}
@@ -731,6 +800,9 @@ async def tesla_charges(
     effective_car_id = car_id if car_id is not None else CAR_ID
     if days <= 0 or days > 3650:
         return "❌ days must be between 1 and 3650"
+    # #12: 避免超大 limit 拖死数据库；-1 表示"所有"保留
+    if limit != -1 and (limit <= 0 or limit > 1000):
+        return "❌ limit must be between 1 and 1000 (use -1 for all)"
 
     try:
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
@@ -757,15 +829,7 @@ async def tesla_charges(
             addr.city, addr.country
         FROM charging_processes cp
         LEFT JOIN geofences gf ON cp.geofence_id = gf.id
-        LEFT JOIN positions p ON cp.position_id = p.id
-        LEFT JOIN LATERAL (
-            SELECT display_name, city, country
-            FROM addresses a2
-            WHERE a2.latitude BETWEEN p.latitude - 0.001 AND p.latitude + 0.001
-              AND a2.longitude BETWEEN p.longitude - 0.001 AND p.longitude + 0.001
-            ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
-            LIMIT 1
-        ) addr ON p.latitude IS NOT NULL
+        LEFT JOIN addresses addr ON cp.address_id = addr.id
         WHERE cp.car_id = %s
           AND cp.start_date >= %s
           AND (cp.start_date < %s OR %s IS NULL)
@@ -854,8 +918,9 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
 
     lines = [f"**Drives** ({date_range}, {len(rows)} trips)\n"]
     total_km = 0.0
-    total_kwh = 0.0
+    total_kwh = 0.0     # 净能耗（允许为负，反映回收大于消耗）
     total_min = 0
+    kwh_per_km = _get_car_config(effective_car_id)["kwh_per_km"]
     for r in rows:
         dist_km = r.get("distance") or 0
         total_km += dist_km
@@ -866,22 +931,33 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
         date_str = _format_dt(r.get("start_date"))
         range_start = r.get("start_ideal_range_km") or 0
         range_end = r.get("end_ideal_range_km") or 0
-        kwh = max(0, (range_start - range_end) * _get_car_config(effective_car_id)["kwh_per_km"])
+        # 允许为负：下坡/制动能量回收会让 range_end > range_start
+        kwh = (range_start - range_end) * kwh_per_km
         total_kwh += kwh
 
-        eff_str = _format_efficiency(kwh, dist_km) if dist_km > 0 and kwh > 0 else ""
+        # 单次能耗显示
+        if dist_km > 0 and kwh > 0:
+            eff_str = ", " + _format_efficiency(kwh, dist_km) + f" ({kwh:.1f} kWh)"
+        elif dist_km > 0 and kwh < 0:
+            eff_str = f", ↻{abs(kwh):.1f} kWh 回收"
+        else:
+            eff_str = ""
 
         lines.append(f"- {date_str}: {_format_distance(dist_km)}, {dur} min, {start} -> {end}{eff_str}")
 
     avg_eff = ""
     if total_km > 0 and total_kwh > 0:
         avg_eff = f", avg {_format_efficiency(total_kwh, total_km)}"
+    elif total_km > 0 and total_kwh < 0:
+        avg_eff = f"（净回收 {abs(total_kwh):.1f} kWh）"
     lines.append(
         f"\n**Total:** {_format_distance(total_km)}, {total_kwh:.1f} kWh, "
         f"{total_min} min across {len(rows)} trips{avg_eff}"
     )
     if LIMIT_DRIVES > 0 and len(rows) >= LIMIT_DRIVES:
         lines.append(f"\n⚠ Results capped at {LIMIT_DRIVES} rows. Increase TESLA_LIMIT_DRIVES or set to -1 for all data.")
+    if total_kwh != 0:
+        lines.append("\n*注：单次能耗基于续航差值估算。↻ 表示能量回收大于消耗。*")
     return "\n".join(lines)
 
 
@@ -889,13 +965,20 @@ def _calculate_driving_score(rows: list) -> tuple[float, int, list]:
     """Calculate driving score from rows of drive data.
 
     Returns: (safety_score, total_deduct, details)
+
+    阈值调整说明（2026-04-21 更新）：
+    - 加速 100 kW：Tesla Model 3P 起步常达 100-200 kW，之前 50 kW 太严
+    - 刹车 -50 kW：市区日常 -30 kW 很常见，-50 kW 才算急刹
+    - 速度 135 km/h：高速公路合规 120，放宽到 135 留出缓冲
+    - 扣分乘数 ×5（之前 ×10）：避免一次违规就掉 20 分
     """
     if not rows:
         return 100.0, 0, []
 
-    POWER_ACCEL_THRESHOLD = 50
-    POWER_BRAKE_THRESHOLD = -30
-    SPEED_THRESHOLD_KMH = 130
+    POWER_ACCEL_THRESHOLD = 100  # kW (was 50)
+    POWER_BRAKE_THRESHOLD = -50  # kW (was -30)
+    SPEED_THRESHOLD_KMH = 135    # km/h (was 130)
+    DEDUCT_MULTIPLIER = 5        # 评分扣分乘数 (was 10)
 
     total_deduct = 0
     details = []
@@ -921,8 +1004,8 @@ def _calculate_driving_score(rows: list) -> tuple[float, int, list]:
             details.append(f"high speed ({speed_max:.0f} km/h)")
 
     num_drives = len(rows)
-    avg_deduct = total_deduct / num_drives
-    safety_score = max(0, 100 - avg_deduct * 10)
+    avg_deduct = total_deduct / (num_drives or 1)
+    safety_score = max(0, 100 - avg_deduct * DEDUCT_MULTIPLIER)
 
     return safety_score, total_deduct, details
 
@@ -996,7 +1079,7 @@ async def tesla_driving_score(
             return f"No drives found for last {n} drives."
         safety_score, total_deduct, details = _calculate_driving_score(rows)
         num_drives = len(rows)
-        avg_deduct = total_deduct / num_drives
+        avg_deduct = total_deduct / (num_drives or 1)
         label = f"last {num_drives} drives"
         return _format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details)
 
@@ -1016,7 +1099,7 @@ async def tesla_driving_score(
 
         safety_score, total_deduct, details = _calculate_driving_score(rows)
         num_drives = len(rows)
-        avg_deduct = total_deduct / num_drives
+        avg_deduct = total_deduct / (num_drives or 1)
         label = f"last {days_val} days"
         return _format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details)
 
@@ -1039,7 +1122,7 @@ async def tesla_driving_score(
 
         safety_score, total_deduct, details = _calculate_driving_score(rows)
         num_drives = len(rows)
-        avg_deduct = total_deduct / num_drives
+        avg_deduct = total_deduct / (num_drives or 1)
         label = f"{year}-{month:02d}"
         return _format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details)
 
@@ -1065,7 +1148,6 @@ async def tesla_driving_score(
         )
 
         # Group rows by month (using start_date in user timezone)
-        from collections import defaultdict
         monthly_rows = defaultdict(list)
         for r in all_rows:
             sd = r.get("start_date")
@@ -1082,7 +1164,7 @@ async def tesla_driving_score(
             if rows:
                 safety_score, total_deduct, details = _calculate_driving_score(rows)
                 num_drives = len(rows)
-                avg_deduct = total_deduct / num_drives
+                avg_deduct = total_deduct / (num_drives or 1)
                 label = f"{year}-{m:02d}"
                 outputs.append(_format_driving_score_output(label, safety_score, avg_deduct, total_deduct, num_drives, details))
             else:
@@ -1106,16 +1188,23 @@ COMMUTE_PAIRS = [
 # Simple in-memory cache for routine locations
 # Key: car_id, Value: (dict of ids, timestamp)
 ROUTINE_CACHE = {}
-ROUTINE_CACHE_TTL = 86400  # 24 hours
+ROUTINE_CACHE_TTL = 3600  # 1 hour — previously 24h was too stale when user's routine changes
+_routine_cache_lock = threading.Lock()
 
 
 def _get_routine_locations(car_id: int) -> dict:
-    """Identify top 2 most frequent address IDs for a car as routine locations (Home/Work)."""
+    """Identify top 2 most frequent address IDs for a car as routine locations (Home/Work).
+
+    Thread-safe: ROUTINE_CACHE access is protected by _routine_cache_lock.
+    The DB query runs outside the lock to avoid blocking concurrent readers.
+    """
     now = time.time()
-    if car_id in ROUTINE_CACHE:
-        ids, ts = ROUTINE_CACHE[car_id]
-        if now - ts < ROUTINE_CACHE_TTL:
-            return ids
+    with _routine_cache_lock:
+        entry = ROUTINE_CACHE.get(car_id)
+        if entry is not None:
+            ids, ts = entry
+            if now - ts < ROUTINE_CACHE_TTL:
+                return ids
 
     # Find Top 3 most frequent start and end address IDs combined
     rows = _query(
@@ -1140,7 +1229,8 @@ def _get_routine_locations(car_id: int) -> dict:
     if len(rows) >= 2:
         ids["work_id"] = rows[1]["addr_id"]
 
-    ROUTINE_CACHE[car_id] = (ids, now)
+    with _routine_cache_lock:
+        ROUTINE_CACHE[car_id] = (ids, now)
     return ids
 
 
@@ -1172,14 +1262,33 @@ def _classify_trip(
         if (start_addr_id == h_id and end_addr_id == w_id) or (start_addr_id == w_id and end_addr_id == h_id):
             return "commute"
 
-    # Shopping keywords
-    shopping_keywords = ["mall", "store", "shop", "market", "supermarket", "grocery"]
-    if any(kw in start or kw in end for kw in shopping_keywords):
+    # Shopping keywords（含中文及常见品牌）
+    shopping_keywords = [
+        # 英文
+        "mall", "store", "shop", "market", "supermarket", "grocery",
+        # 中文通用
+        "商场", "购物", "超市", "百货", "奥特莱斯", "菜市场", "便利店", "购物中心",
+        # 常见品牌
+        "万达", "银泰", "龙湖", "天街", "华润万家", "家乐福", "沃尔玛", "盒马",
+        "永辉", "万象城", "SKP", "印象城", "爱琴海", "环宇城",
+    ]
+    if any(kw.lower() in start or kw.lower() in end for kw in shopping_keywords):
         return "shopping"
 
-    # Leisure keywords
-    leisure_keywords = ["park", "beach", "restaurant", "cafe", "movie", "gym", "playground"]
-    if any(kw in start or kw in end for kw in leisure_keywords):
+    # Leisure keywords（含中文：休闲 / 餐饮 / 运动 / 旅游 / 娱乐）
+    leisure_keywords = [
+        # 英文
+        "park", "beach", "restaurant", "cafe", "movie", "gym", "playground",
+        # 中文通用
+        "公园", "景区", "体育", "健身", "运动",
+        # 餐饮
+        "餐厅", "饭店", "火锅", "烧烤", "咖啡", "茶馆", "酒吧", "夜市",
+        # 娱乐
+        "电影院", "影城", "KTV", "游乐", "博物馆", "图书馆", "游泳",
+        # 旅游住宿
+        "温泉", "民宿", "酒店",
+    ]
+    if any(kw.lower() in start or kw.lower() in end for kw in leisure_keywords):
         return "leisure"
 
     return "other"
@@ -1217,38 +1326,96 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         return f"❌ {e}"
 
     date_range = f"{start_date or ('last ' + str(days) + ' days' if days else 'all time')} to {end_date or 'today'}"
-
-    rows = _query(
-        """
-        SELECT d.start_date, d.distance, d.duration_min,
-               d.start_address_id, d.end_address_id,
-               sa.display_name AS start_location,
-               ea.display_name AS end_location
-        FROM drives d
-        LEFT JOIN addresses sa ON d.start_address_id = sa.id
-        LEFT JOIN addresses ea ON d.end_address_id = ea.id
-        WHERE d.car_id = %s AND d.distance > 0 AND d.start_date >= %s AND d.start_date < %s
-        ORDER BY d.start_date DESC LIMIT %s
-        """,
-        (effective_car_id, start_dt.isoformat() if start_dt else None, end_dt.isoformat() if end_dt else None, limit * 5),
-    )
+    start_iso = start_dt.isoformat() if start_dt else None
+    end_iso = end_dt.isoformat() if end_dt else None
 
     routine_ids = _get_routine_locations(effective_car_id)
-    classified = []
-    for r in rows:
-        dist_km = r.get("distance") or 0
-        cat = _classify_trip(
-            r.get("start_location"),
-            r.get("end_location"),
-            dist_km,
-            start_addr_id=r.get("start_address_id"),
-            end_addr_id=r.get("end_address_id"),
-            routine_ids=routine_ids,
+    classified: list[dict] = []
+
+    # #17: 对可以 SQL 直接过滤的类别走快路径（long_trip / commute），避免 Python 端漏捡数据
+    if category == "long_trip":
+        # long_trip 定义：distance > TRIP_THRESHOLD_KM (100)
+        rows = _query(
+            """
+            SELECT d.start_date, d.distance, d.duration_min,
+                   d.start_address_id, d.end_address_id,
+                   sa.display_name AS start_location,
+                   ea.display_name AS end_location
+            FROM drives d
+            LEFT JOIN addresses sa ON d.start_address_id = sa.id
+            LEFT JOIN addresses ea ON d.end_address_id = ea.id
+            WHERE d.car_id = %s AND d.distance > %s
+              AND d.start_date >= %s AND d.start_date < %s
+            ORDER BY d.start_date DESC LIMIT %s
+            """,
+            (effective_car_id, TRIP_THRESHOLD_KM, start_iso, end_iso, limit),
         )
-        if cat == category:
-            classified.append(r)
-        if len(classified) >= limit:
-            break
+        classified = list(rows)
+    elif category == "commute" and routine_ids.get("home_id") and routine_ids.get("work_id"):
+        # commute 定义：home_id ↔ work_id 往返 AND distance >= COMMUTE_MIN_DIST_KM AND distance <= TRIP_THRESHOLD_KM
+        h_id = routine_ids["home_id"]
+        w_id = routine_ids["work_id"]
+        rows = _query(
+            """
+            SELECT d.start_date, d.distance, d.duration_min,
+                   d.start_address_id, d.end_address_id,
+                   sa.display_name AS start_location,
+                   ea.display_name AS end_location
+            FROM drives d
+            LEFT JOIN addresses sa ON d.start_address_id = sa.id
+            LEFT JOIN addresses ea ON d.end_address_id = ea.id
+            WHERE d.car_id = %s AND d.distance >= %s AND d.distance <= %s
+              AND d.start_date >= %s AND d.start_date < %s
+              AND (
+                  (d.start_address_id = %s AND d.end_address_id = %s)
+                  OR (d.start_address_id = %s AND d.end_address_id = %s)
+              )
+            ORDER BY d.start_date DESC LIMIT %s
+            """,
+            (effective_car_id, COMMUTE_MIN_DIST_KM, TRIP_THRESHOLD_KM,
+             start_iso, end_iso,
+             h_id, w_id, w_id, h_id,
+             limit),
+        )
+        classified = list(rows)
+    else:
+        # 其他类别（shopping/leisure/other）或 commute 但没识别出 routine：循环拉取
+        # 避免 limit*5 预拉时类别分布不均导致漏数据
+        MAX_SCAN = min(max(limit * 50, 500), 2000)
+        BATCH = max(limit * 5, 100)
+        offset = 0
+        while len(classified) < limit and offset < MAX_SCAN:
+            batch = _query(
+                """
+                SELECT d.start_date, d.distance, d.duration_min,
+                       d.start_address_id, d.end_address_id,
+                       sa.display_name AS start_location,
+                       ea.display_name AS end_location
+                FROM drives d
+                LEFT JOIN addresses sa ON d.start_address_id = sa.id
+                LEFT JOIN addresses ea ON d.end_address_id = ea.id
+                WHERE d.car_id = %s AND d.distance > 0
+                  AND d.start_date >= %s AND d.start_date < %s
+                ORDER BY d.start_date DESC LIMIT %s OFFSET %s
+                """,
+                (effective_car_id, start_iso, end_iso, BATCH, offset),
+            )
+            if not batch:
+                break
+            for r in batch:
+                cat = _classify_trip(
+                    r.get("start_location"),
+                    r.get("end_location"),
+                    r.get("distance") or 0,
+                    start_addr_id=r.get("start_address_id"),
+                    end_addr_id=r.get("end_address_id"),
+                    routine_ids=routine_ids,
+                )
+                if cat == category:
+                    classified.append(r)
+                    if len(classified) >= limit:
+                        break
+            offset += BATCH
 
     if not classified:
         return f"No {category} trips found ({date_range})."
@@ -1398,19 +1565,32 @@ async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_da
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
     rows = _query(
         """
-        SELECT date_trunc('week', start_date) AS week,
-               SUM(distance) AS total_km,
-               SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * %s) AS total_kwh,
-               SUM(duration_min) AS total_min,
-               COUNT(*) AS trips,
-               AVG(outside_temp_avg) AS avg_temp
-        FROM drives
-        WHERE car_id = %s AND start_date >= %s AND (start_date < %s OR %s IS NULL) AND distance > 0
-        GROUP BY date_trunc('week', start_date)
-        ORDER BY week DESC
+        SELECT d.week, d.total_km, d.total_kwh AS estimated_kwh, d.total_min, d.trips, d.avg_temp,
+               COALESCE(c.charged_kwh, 0) AS charged_kwh
+        FROM (
+            SELECT date_trunc('week', start_date) AS week,
+                   SUM(distance) AS total_km,
+                   SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                       * %s) AS total_kwh,
+                   SUM(duration_min) AS total_min,
+                   COUNT(*) AS trips,
+                   AVG(outside_temp_avg) AS avg_temp
+            FROM drives
+            WHERE car_id = %s AND start_date >= %s AND (start_date < %s OR %s IS NULL) AND distance > 0
+            GROUP BY date_trunc('week', start_date)
+        ) d
+        LEFT JOIN (
+            SELECT date_trunc('week', start_date) AS week,
+                   SUM(charge_energy_added) AS charged_kwh
+            FROM charging_processes
+            WHERE car_id = %s AND end_date IS NOT NULL
+              AND start_date >= %s AND (start_date < %s OR %s IS NULL)
+            GROUP BY date_trunc('week', start_date)
+        ) c ON d.week = c.week
+        ORDER BY d.week DESC
     """,
-        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, cutoff, end_boundary, end_boundary),
+        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, cutoff, end_boundary, end_boundary,
+         effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
@@ -1420,18 +1600,21 @@ async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_da
     lines = [f"**Efficiency** ({date_range}, weekly)\n"]
     for r in rows:
         km = r.get("total_km") or 0
-        kwh = r.get("total_kwh") or 0
+        kwh = r.get("estimated_kwh") or 0
+        charged = r.get("charged_kwh") or 0
         trips = r.get("trips", 0)
         week = str(r.get("week", ""))[:10]
         temp = r.get("avg_temp")
         temp_str = f", avg {_format_temp(temp)}" if temp is not None else ""
 
-        eff_str = _format_efficiency(kwh, km) if km > 0 and kwh > 0 else ""
+        eff_str = ", " + _format_efficiency(kwh, km) if km > 0 and kwh > 0 else ""
+        charged_note = f"（实际充电 {charged:.1f} kWh）" if charged > 0 else ""
 
         lines.append(
-            f"- {week}: {_format_distance(km)}, {kwh:.1f} kWh, {trips} trips{eff_str}{temp_str}"
+            f"- {week}: {_format_distance(km)}, 估算 {kwh:.1f} kWh, {trips} trips{eff_str}{temp_str}{charged_note}"
         )
 
+    lines.append("\n*注：能耗基于续航差值估算（每周独立计算）；实际充电量作参考，二者时间边界未严格对齐（可能跨周充电）。*")
     return "\n".join(lines)
 
 
@@ -1462,15 +1645,17 @@ async def tesla_location_history(days: int = 7, start_date: str | None = None, e
 
     rows = _query(
         f"""
-        SELECT ROUND(latitude::numeric, 3) AS lat,
-               ROUND(longitude::numeric, 3) AS lon,
-               COUNT(*) AS position_count,
-               MIN(date) AS first_seen,
-               MAX(date) AS last_seen
+        SELECT
+            FLOOR(latitude / 0.002) * 0.002 AS lat,
+            FLOOR(longitude / 0.002) * 0.002 AS lon,
+            COUNT(*) AS position_count,
+            MIN(date) AS first_seen,
+            MAX(date) AS last_seen,
+            EXTRACT(EPOCH FROM (MAX(date) - MIN(date))) / 3600 AS span_hours
         FROM positions
         WHERE car_id = %s AND date >= %s AND (date < %s OR %s IS NULL)
-        GROUP BY ROUND(latitude::numeric, 3), ROUND(longitude::numeric, 3)
-        ORDER BY position_count DESC
+        GROUP BY FLOOR(latitude / 0.002), FLOOR(longitude / 0.002)
+        ORDER BY span_hours DESC NULLS LAST, position_count DESC
         {_limit_sql(LIMIT_LOCATION_HISTORY)}
     """,
         (effective_car_id, cutoff, end_boundary, end_boundary),
@@ -1488,6 +1673,7 @@ async def tesla_location_history(days: int = 7, start_date: str | None = None, e
         lat = float(r.get("lat", 0))
         lon = float(r.get("lon", 0))
         count = r.get("position_count", 0)
+        span_h = r.get("span_hours") or 0
         last = str(r.get("last_seen", ""))[:16]
 
         loc = f"{lat}, {lon}"
@@ -1498,7 +1684,8 @@ async def tesla_location_history(days: int = 7, start_date: str | None = None, e
                 loc = gf["name"]
                 break
 
-        lines.append(f"- {loc}: {count} data points, last seen {last}")
+        # 停留时长 span_hours 作为主指标，point count 作为数据密度参考
+        lines.append(f"- {loc}: 累计停留 {span_h:.1f} 小时 ({count} 采样点, last seen {last})")
 
     return "\n".join(lines)
 
@@ -1667,7 +1854,7 @@ async def tesla_live(car_id: int | None = None) -> str:
         ) p
         LEFT JOIN LATERAL (
             SELECT start_date, end_date, charge_energy_added
-            FROM charging_processes WHERE car_id = %s ORDER BY id DESC LIMIT 1
+            FROM charging_processes WHERE car_id = %s ORDER BY start_date DESC NULLS LAST LIMIT 1
         ) cp ON true
         LEFT JOIN LATERAL (
             SELECT version FROM updates WHERE car_id = %s ORDER BY id DESC LIMIT 1
@@ -1683,7 +1870,12 @@ async def tesla_live(car_id: int | None = None) -> str:
     # Battery
     bat = combined.get("battery_level")
     if bat is not None:
-        range_km = _get_car_config(effective_car_id)["range_km"] * bat / 100
+        # 优先用车辆实时续航（反映电池衰减），falls back 到配置值
+        ideal_km = combined.get("ideal_battery_range_km")
+        if ideal_km and ideal_km > 0:
+            range_km = ideal_km
+        else:
+            range_km = _get_car_config(effective_car_id)["range_km"] * bat / 100
         if USE_METRIC_UNITS:
             lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
         else:
@@ -1692,10 +1884,14 @@ async def tesla_live(car_id: int | None = None) -> str:
     else:
         lines.append("Battery: N/A")
 
-    # Charging state
+    # Charging state (要求 end_date 空 AND start_date 在 24h 内)
+    charge_start_dt = combined.get("charge_start")
+    if charge_start_dt and charge_start_dt.tzinfo is None:
+        charge_start_dt = charge_start_dt.replace(tzinfo=timezone.utc)
     is_charging = (
         combined.get("charge_end") is None
-        and combined.get("charge_start") is not None
+        and charge_start_dt is not None
+        and (_utcnow() - charge_start_dt).total_seconds() < 86400
     )
     if is_charging:
         added = combined.get("charge_energy_added") or 0
@@ -1786,8 +1982,8 @@ async def tesla_live(car_id: int | None = None) -> str:
 
 @mcp.tool()
 async def tesla_savings(
-    gas_price: float = None,
-    mpg_equivalent: int = None,
+    gas_price: float | None = None,
+    mpg_equivalent: int | None = None,
     car_id: int | None = None,
 ) -> str:
     """Gas savings scorecard -- how much you've saved vs a gas car.
@@ -1802,35 +1998,85 @@ async def tesla_savings(
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
-    lifetime = _query_one("""
-        SELECT COALESCE(SUM(distance), 0) AS total_km,
-               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * %s), 0) AS total_kwh
+    # Lifetime: distance from drives, energy from charging_processes (actual kWh charged)
+    lifetime_drive = _query_one("""
+        SELECT COALESCE(SUM(distance), 0) AS total_km
         FROM drives WHERE car_id = %s AND distance > 0
-    """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
-    monthly = _query_one("""
-        SELECT COALESCE(SUM(distance), 0) AS total_km,
-               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * %s), 0) AS total_kwh
+    """, (effective_car_id,))
+    lifetime_charge = _query_one("""
+        SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh
+        FROM charging_processes
+        WHERE car_id = %s AND end_date IS NOT NULL
+    """, (effective_car_id,))
+
+    # This month: same split
+    monthly_drive = _query_one("""
+        SELECT COALESCE(SUM(distance), 0) AS total_km
         FROM drives WHERE car_id = %s AND distance > 0
           AND date_trunc('month', start_date) = date_trunc('month', NOW())
-    """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
+    """, (effective_car_id,))
+    monthly_charge = _query_one("""
+        SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh
+        FROM charging_processes
+        WHERE car_id = %s AND end_date IS NOT NULL
+          AND date_trunc('month', start_date) = date_trunc('month', NOW())
+    """, (effective_car_id,))
 
-    if not lifetime:
+    def _merge(drive_row: dict | None, charge_row: dict | None) -> tuple[dict, bool]:
+        """Merge drive and charge rows. Returns (merged, is_estimated).
+
+        Falls back to ideal-range energy estimation only when no charging data exists.
+        """
+        total_km = (drive_row or {}).get("total_km") or 0
+        total_kwh = (charge_row or {}).get("total_kwh") or 0
+        is_estimated = False
+        if total_km > 0 and total_kwh == 0:
+            # Fallback: estimate from ideal range (only when no charge data available)
+            est = _query_one("""
+                SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                    * %s), 0) AS total_kwh
+                FROM drives WHERE car_id = %s AND distance > 0
+            """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
+            total_kwh = (est or {}).get("total_kwh") or 0
+            is_estimated = True
+        return {"total_km": total_km, "total_kwh": total_kwh}, is_estimated
+
+    lifetime, lifetime_estimated = _merge(lifetime_drive, lifetime_charge)
+    monthly, monthly_estimated = _merge(monthly_drive, monthly_charge)
+
+    if not lifetime["total_km"]:
         return "No driving data yet."
 
     lines = ["**Gas Savings Scorecard**\n"]
 
-    for label, data in [("This Month", monthly), ("Lifetime", lifetime)]:
+    for label, data, estimated in [
+        ("This Month", monthly, monthly_estimated),
+        ("Lifetime", lifetime, lifetime_estimated),
+    ]:
         if not data or not data.get("total_km"):
             continue
         km = data["total_km"]
         kwh = data["total_kwh"] or 0
+        est_note = " *(估算)*" if estimated else ""
 
         if USE_METRIC_UNITS:
             elec_cost = round(kwh * ELECTRICITY_RATE_RMB, 2)
-            lines.append(f"**{label}:** {km:,.1f} km")
+            # Gas equivalent: L/100km baseline of 8 L/100km unless gas_price/mpg_equivalent given
+            # mpg_equivalent repurposed as L/100km in metric mode when provided
+            gas_l_per_100km = mpg_equivalent if mpg_equivalent else 8.0
+            fuel_liters = km / 100.0 * gas_l_per_100km
+            gas_cost = round(fuel_liters * (gas_price if gas_price else 8.0), 2)
+            saved = round(gas_cost - elec_cost, 2)
+            cost_per_km = round(elec_cost / km, 3) if km > 0 else 0
+
+            lines.append(f"**{label}:** {km:,.1f} km{est_note}")
             lines.append(f"  Electricity: {kwh:,.1f} kWh x RMB{ELECTRICITY_RATE_RMB} = RMB{elec_cost:,.2f}")
+            lines.append(
+                f"  Gas equivalent: {fuel_liters:,.1f} L x RMB{gas_price if gas_price else 8.0}/L = RMB{gas_cost:,.2f}"
+            )
+            lines.append(
+                f"  **Saved: RMB{saved:,.2f}** ({cost_per_km} RMB/km electric)"
+            )
             lines.append("")
         else:
             mi = round(km * 0.621371, 1)
@@ -1839,7 +2085,7 @@ async def tesla_savings(
             saved = round(gas_cost - elec_cost, 2)
             cost_per_mi = round(elec_cost / mi * 100, 1) if mi > 0 else 0
 
-            lines.append(f"**{label}:** {mi:,.1f} mi")
+            lines.append(f"**{label}:** {mi:,.1f} mi{est_note}")
             lines.append(
                 f"  Electricity: {kwh:,.1f} kWh x ${ELECTRICITY_RATE} = ${elec_cost:,.2f}"
             )
@@ -1853,14 +2099,17 @@ async def tesla_savings(
             )
             lines.append("")
 
+    if lifetime_estimated or monthly_estimated:
+        lines.append("*注：标记「估算」的数据基于续航差值估算，实际充电能耗可能更高。*")
+
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def tesla_trip_cost(
     destination: str,
-    gas_price: float = None,
-    mpg_equivalent: int = None,
+    gas_price: float | None = None,
+    mpg_equivalent: int | None = None,
     car_id: int | None = None,
 ) -> str:
     """Estimate trip cost to a destination -- kWh, cost, range check.
@@ -1878,13 +2127,26 @@ async def tesla_trip_cost(
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": destination, "format": "json", "limit": "1"},
-            headers={"User-Agent": "TeslaMCP/1.0"},
-        )
-        results = resp.json()
+    # #7: Nominatim requires a valid User-Agent with contact info (https://operations.osmfoundation.org/policies/nominatim/)
+    # Wrap the request in try/except so network/service failures don't crash the tool.
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": destination, "format": "json", "limit": "1"},
+                headers={
+                    "User-Agent": "teslamate-mcp/1.0 (https://github.com/6547709/teslamate-mcp)"
+                },
+            )
+            resp.raise_for_status()
+            results = resp.json()
+    except httpx.TimeoutException:
+        return f"❌ Geocoding timeout for '{destination}'. Try again later."
+    except httpx.HTTPError as e:
+        return f"❌ Geocoding service error: {e}. Try again later."
+    except (ValueError, KeyError):
+        return f"❌ Geocoding service returned invalid response for '{destination}'."
+
     if not results:
         return f"Could not geocode '{destination}'."
 
@@ -1899,6 +2161,9 @@ async def tesla_trip_cost(
     """, (effective_car_id,))
     if not pos:
         return "No current position data."
+    # #8: lat/lon can be NULL when the vehicle is asleep — guard against math.radians(None)
+    if pos.get("latitude") is None or pos.get("longitude") is None:
+        return "Current position has no GPS coordinates (vehicle may be asleep)."
 
     lat1, lon1 = math.radians(pos["latitude"]), math.radians(pos["longitude"])
     lat2, lon2 = math.radians(dest_lat), math.radians(dest_lon)
@@ -1928,8 +2193,9 @@ async def tesla_trip_cost(
         kwh_round = round(round_trip_km * wh_per_km / 1000, 1)
         cost_round = round(kwh_round * ELECTRICITY_RATE_RMB, 2)
 
-        bat = pos.get("battery_level", 0)
-        range_km = round(_get_car_config(effective_car_id)["range_km"] * bat / 100)
+        bat = pos.get("battery_level", 0) or 0
+        car_cfg = _get_car_config(effective_car_id)
+        range_km = round(car_cfg["range_km"] * bat / 100)
 
         lines = [
             f"**Trip to {dest_name}** ({road_km} km each way, {round_trip_km} km round trip)\n"
@@ -1943,10 +2209,17 @@ async def tesla_trip_cost(
         elif range_km >= road_km:
             lines.append("Range: Sufficient one-way, charge at destination for return")
         else:
-            pct_needed = min(95, round(round_trip_km / range_km * bat)) if range_km > 0 else 95
-            lines.append(
-                f"Range: NOT sufficient -- charge to {pct_needed}%+ before departure"
-            )
+            # #9: 按满电续航算需要充到多少百分比
+            full_range_km = car_cfg["range_km"]
+            if round_trip_km > full_range_km:
+                lines.append(
+                    f"Range: NOT sufficient even at 100% ({full_range_km:.0f} km) -- 途中必须补电"
+                )
+            else:
+                pct_needed = min(95, round(round_trip_km / full_range_km * 100))
+                lines.append(
+                    f"Range: NOT sufficient -- charge to {pct_needed}%+ before departure"
+                )
     else:
         wh_per_mi = 300  # default
         if eff and eff["km"] > 0:
@@ -1956,8 +2229,9 @@ async def tesla_trip_cost(
         cost_round = round(kwh_round * ELECTRICITY_RATE, 2)
         gas_equiv = round(round_trip / _mpg * _gas, 2)
 
-        bat = pos.get("battery_level", 0)
-        range_mi = round(_km_to_mi(_get_car_config(effective_car_id)["range_km"] * bat / 100))
+        bat = pos.get("battery_level", 0) or 0
+        car_cfg = _get_car_config(effective_car_id)
+        range_mi = round(_km_to_mi(car_cfg["range_km"] * bat / 100))
 
         lines = [
             f"**Trip to {dest_name}** ({road_mi} mi each way, {round_trip} mi round trip)\n"
@@ -1971,10 +2245,17 @@ async def tesla_trip_cost(
         elif range_mi >= road_mi:
             lines.append("Range: Sufficient one-way, charge at destination for return")
         else:
-            pct_needed = min(95, round(round_trip / range_mi * bat)) if range_mi > 0 else 95
-            lines.append(
-                f"Range: NOT sufficient -- charge to {pct_needed}%+ before departure"
-            )
+            # #9: 按满电续航算需要充到多少百分比
+            full_range_mi = round(_km_to_mi(car_cfg["range_km"]) or 0)
+            if round_trip > full_range_mi:
+                lines.append(
+                    f"Range: NOT sufficient even at 100% ({full_range_mi} mi) -- 途中必须补电"
+                )
+            else:
+                pct_needed = min(95, round(round_trip / full_range_mi * 100)) if full_range_mi > 0 else 95
+                lines.append(
+                    f"Range: NOT sufficient -- charge to {pct_needed}%+ before departure"
+                )
 
     return "\n".join(lines)
 
@@ -2053,6 +2334,7 @@ async def tesla_efficiency_by_temp(car_id: int | None = None) -> str:
                 f"{r['temp_range']:<15} {r['trips']:>6} {wh_mi:>7} {round(mi):>9,}"
             )
 
+    lines.append("\n*注：能耗基于续航差值估算，实际充电量可能更高。*")
     return "\n".join(lines)
 
 
@@ -2074,7 +2356,7 @@ async def tesla_charging_by_location(days: int = 0, car_id: int | None = None) -
         params.append(cutoff)
 
     rows = _query(f"""
-        SELECT a.display_name AS location,
+        SELECT COALESCE(gf.name, a.display_name) AS location,
                COUNT(*) AS sessions,
                COALESCE(SUM(cp.charge_energy_added), 0) AS total_kwh,
                COALESCE(AVG(cp.charge_energy_added), 0) AS avg_kwh,
@@ -2083,17 +2365,10 @@ async def tesla_charging_by_location(days: int = 0, car_id: int | None = None) -
                COALESCE(SUM(cp.duration_min), 0) AS total_min,
                COALESCE(SUM(cp.cost), 0) AS total_cost
         FROM charging_processes cp
-        JOIN positions p ON cp.position_id = p.id
-        LEFT JOIN LATERAL (
-            SELECT a2.display_name
-            FROM addresses a2
-            WHERE a2.latitude BETWEEN p.latitude - 0.005 AND p.latitude + 0.005
-              AND a2.longitude BETWEEN p.longitude - 0.005 AND p.longitude + 0.005
-            ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
-            LIMIT 1
-        ) a ON true
+        LEFT JOIN geofences gf ON cp.geofence_id = gf.id
+        LEFT JOIN addresses a ON cp.address_id = a.id
         WHERE cp.car_id = %s AND cp.end_date IS NOT NULL {date_filter}
-        GROUP BY a.display_name
+        GROUP BY COALESCE(gf.name, a.display_name)
         ORDER BY total_kwh DESC
         {_limit_sql(LIMIT_CHARGING_BY_LOC)}
     """, tuple(params))
@@ -2132,15 +2407,22 @@ async def tesla_top_destinations(limit: int = 15, car_id: int | None = None) -> 
     effective_car_id = car_id if car_id is not None else CAR_ID
     if limit <= 0 or limit > 100:
         return "❌ limit must be between 1 and 100"
+    # 按坐标聚合（精度 0.002 度 ≈ 220m），避免 GPS 漂移导致同一地点被分成多个 address_id
     rows = _query(
         """
-        SELECT ea.display_name AS destination,
-               COUNT(*) AS visits,
-               COALESCE(SUM(d.distance), 0) AS total_km
+        SELECT
+            -- 代表地址：该坐标簇里出现次数最多的 display_name（优先 geofence）
+            MODE() WITHIN GROUP (ORDER BY COALESCE(gf.name, ea.display_name)) AS destination,
+            COUNT(*) AS visits,
+            COALESCE(SUM(d.distance), 0) AS total_km
         FROM drives d
-        JOIN addresses ea ON d.end_address_id = ea.id
+        LEFT JOIN addresses ea ON d.end_address_id = ea.id
+        LEFT JOIN geofences gf ON d.end_geofence_id = gf.id
+        JOIN positions p ON d.end_position_id = p.id
         WHERE d.car_id = %s AND d.distance > 1
-        GROUP BY ea.display_name
+          AND p.latitude IS NOT NULL AND p.longitude IS NOT NULL
+        GROUP BY FLOOR(p.latitude / 0.002), FLOOR(p.longitude / 0.002)
+        HAVING MODE() WITHIN GROUP (ORDER BY COALESCE(gf.name, ea.display_name)) IS NOT NULL
         ORDER BY visits DESC
         LIMIT %s
     """,
@@ -2202,6 +2484,7 @@ async def tesla_longest_trips(limit: int = 10, car_id: int | None = None) -> str
         kwh = r.get("consumption_kwh") or 0
         lines.append(f"{i}. {_format_distance(dist_km)} -- {start} -> {end} ({date}, {dur}min, {kwh:.1f}kWh)")
 
+    lines.append("\n*注：单次能耗基于续航差值估算，实际充电量可能更高。*")
     return "\n".join(lines)
 
 
@@ -2232,44 +2515,25 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
     else:
         prev_start = datetime(year, month - 1, 1)
 
-    # Current month data
+    # Current month: distance from drives, energy from charging_processes
     rows = _query(
         """
         SELECT COUNT(*) AS trips,
                COALESCE(SUM(distance), 0) AS total_km,
-               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * %s), 0) AS total_kwh,
                COALESCE(SUM(duration_min), 0) AS total_min
         FROM drives
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
         """,
-        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, start.isoformat(), next_start.isoformat()),
+        (effective_car_id, start.isoformat(), next_start.isoformat()),
     )
     r = rows[0] if rows else {}
 
     trips = r.get("trips") or 0
     km = r.get("total_km") or 0
-    kwh = r.get("total_kwh") or 0
     minutes = r.get("total_min") or 0
 
-    # Previous month for comparison
-    prev_rows = _query(
-        """
-        SELECT COALESCE(SUM(distance), 0) AS total_km,
-               COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                   * %s), 0) AS total_kwh
-        FROM drives
-        WHERE car_id = %s AND distance > 0
-          AND start_date >= %s AND start_date < %s
-        """,
-        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, prev_start.isoformat(), start.isoformat()),
-    )
-    prev_r = prev_rows[0] if prev_rows else {}
-    prev_km = prev_r.get("total_km") or 0
-    prev_kwh = prev_r.get("total_kwh") or 0
-
-    # Charging cost from TeslaMate
+    # Charging cost + actual kWh from TeslaMate
     charge_rows = _query(
         """
         SELECT COALESCE(SUM(cp.cost), 0) AS total_cost,
@@ -2283,6 +2547,48 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
     )
     charge_r = charge_rows[0] if charge_rows else {}
     total_cost = charge_r.get("total_cost") or 0
+    kwh = charge_r.get("total_kwh") or 0
+
+    # Fallback: estimate energy from ideal-range deltas if no charging sessions recorded
+    kwh_estimated = False
+    if km > 0 and kwh == 0:
+        est = _query_one(
+            """
+            SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                * %s), 0) AS total_kwh
+            FROM drives
+            WHERE car_id = %s AND distance > 0
+              AND start_date >= %s AND start_date < %s
+            """,
+            (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id,
+             start.isoformat(), next_start.isoformat()),
+        )
+        kwh = (est or {}).get("total_kwh") or 0
+        kwh_estimated = True
+
+    # Previous month for comparison
+    prev_rows = _query(
+        """
+        SELECT COALESCE(SUM(distance), 0) AS total_km
+        FROM drives
+        WHERE car_id = %s AND distance > 0
+          AND start_date >= %s AND start_date < %s
+        """,
+        (effective_car_id, prev_start.isoformat(), start.isoformat()),
+    )
+    prev_r = prev_rows[0] if prev_rows else {}
+    prev_km = prev_r.get("total_km") or 0
+
+    prev_charge_rows = _query(
+        """
+        SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh
+        FROM charging_processes
+        WHERE car_id = %s AND end_date IS NOT NULL
+          AND start_date >= %s AND start_date < %s
+        """,
+        (effective_car_id, prev_start.isoformat(), start.isoformat()),
+    )
+    prev_kwh = (prev_charge_rows[0] if prev_charge_rows else {}).get("total_kwh") or 0
 
     if USE_METRIC_UNITS:
         lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]
@@ -2307,6 +2613,9 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
         dist_delta = round((km - prev_km) / prev_km * 100)
         eff_delta = round((kwh - prev_kwh) / prev_kwh * 100) if prev_kwh > 0 else 0
         lines.append(f"\nvs prev month: distance {dist_delta:+d}%, energy {eff_delta:+d}%")
+
+    if kwh_estimated:
+        lines.append("\n*注：当月无充电记录，能耗基于续航差值估算，实际值可能更高。*")
 
     return "\n".join(lines)
 
@@ -2410,15 +2719,25 @@ async def tesla_tpms_history(days: int = 30, start_date: str | None = None, end_
 
     cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
+    # 4 小时桶聚合：每天 6 个数据点，30 天 × 6 = 180 条刚好
     rows = _query(
         f"""
-        SELECT date,
-               tpms_pressure_fl, tpms_pressure_fr,
-               tpms_pressure_rl, tpms_pressure_rr
+        SELECT
+            date_trunc('hour', date)
+              - INTERVAL '1 hour' * (EXTRACT(HOUR FROM date)::int %% 4) AS bucket,
+            AVG(tpms_pressure_fl) AS fl_avg,
+            AVG(tpms_pressure_fr) AS fr_avg,
+            AVG(tpms_pressure_rl) AS rl_avg,
+            AVG(tpms_pressure_rr) AS rr_avg,
+            MIN(tpms_pressure_fl) AS fl_min, MAX(tpms_pressure_fl) AS fl_max,
+            MIN(tpms_pressure_fr) AS fr_min, MAX(tpms_pressure_fr) AS fr_max,
+            MIN(tpms_pressure_rl) AS rl_min, MAX(tpms_pressure_rl) AS rl_max,
+            MIN(tpms_pressure_rr) AS rr_min, MAX(tpms_pressure_rr) AS rr_max
         FROM positions
         WHERE car_id = %s AND date >= %s AND (date < %s OR %s IS NULL)
           AND (tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL)
-        ORDER BY date DESC
+        GROUP BY bucket
+        ORDER BY bucket DESC
         {_limit_sql(LIMIT_TPMS_HISTORY)}
         """,
         (effective_car_id, cutoff, end_boundary, end_boundary),
@@ -2429,24 +2748,43 @@ async def tesla_tpms_history(days: int = 30, start_date: str | None = None, end_
         return f"No TPMS data ({date_range})."
 
     unit_label = "bar" if USE_METRIC_UNITS else "psi"
-    lines = [f"**TPMS History** ({date_range}, {len(rows)} records)\n"]
-    for r in rows:
-        date = _format_dt(r.get("date"))
-        fl = r.get("tpms_pressure_fl")
-        fr = r.get("tpms_pressure_fr")
-        rl = r.get("tpms_pressure_rl")
-        rr = r.get("tpms_pressure_rr")
+    lines = [f"**TPMS History** ({date_range}, {len(rows)} 4-hour buckets, avg values)\n"]
+
+    # 波动阈值：单个桶内 (max-min) 超过 0.2 bar 才显示 min/max 详情
+    VOLATILITY_THRESHOLD = 0.2  # bar
+
+    def _fmt(v):
+        """格式化单个压力值"""
+        if v is None:
+            return "--"
         if USE_METRIC_UNITS:
-            fl_s = f"{fl:.2f}" if fl else "--"
-            fr_s = f"{fr:.2f}" if fr else "--"
-            rl_s = f"{rl:.2f}" if rl else "--"
-            rr_s = f"{rr:.2f}" if rr else "--"
-        else:
-            fl_s = f"{round(fl*14.5038,1)}" if fl else "--"
-            fr_s = f"{round(fr*14.5038,1)}" if fr else "--"
-            rl_s = f"{round(rl*14.5038,1)}" if rl else "--"
-            rr_s = f"{round(rr*14.5038,1)}" if rr else "--"
-        lines.append(f"{date}: FL={fl_s} FR={fr_s} RL={rl_s} RR={rr_s} {unit_label}")
+            return f"{v:.2f}"
+        return f"{round(v * 14.5038, 1)}"
+
+    for r in rows:
+        bucket_str = _format_dt(r.get("bucket"))
+        fl_avg = r.get("fl_avg")
+        fr_avg = r.get("fr_avg")
+        rl_avg = r.get("rl_avg")
+        rr_avg = r.get("rr_avg")
+        lines.append(
+            f"{bucket_str}: FL={_fmt(fl_avg)} FR={_fmt(fr_avg)} "
+            f"RL={_fmt(rl_avg)} RR={_fmt(rr_avg)} {unit_label}"
+        )
+
+        # 异常波动检测：任一轮 max-min > 0.2 bar 就附详情
+        anomalies = []
+        for label, vmin, vmax in [
+            ("FL", r.get("fl_min"), r.get("fl_max")),
+            ("FR", r.get("fr_min"), r.get("fr_max")),
+            ("RL", r.get("rl_min"), r.get("rl_max")),
+            ("RR", r.get("rr_min"), r.get("rr_max")),
+        ]:
+            if vmin is not None and vmax is not None and (vmax - vmin) > VOLATILITY_THRESHOLD:
+                anomalies.append(f"{label}:{_fmt(vmin)}→{_fmt(vmax)}")
+        if anomalies:
+            lines.append(f"  ⚠ 波动 > {VOLATILITY_THRESHOLD} bar: {', '.join(anomalies)}")
+
     return "\n".join(lines)
 
 
@@ -2467,15 +2805,13 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
         SELECT d.month,
                d.trips,
                d.total_km,
-               d.total_kwh,
                d.total_min,
+               COALESCE(c.total_kwh, 0) AS total_kwh,
                COALESCE(c.total_cost, 0) AS total_cost
         FROM (
             SELECT date_trunc('month', start_date) AS month,
                    COUNT(id) AS trips,
                    COALESCE(SUM(distance), 0) AS total_km,
-                   COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                       * %s), 0) AS total_kwh,
                    COALESCE(SUM(duration_min), 0) AS total_min
             FROM drives
             WHERE car_id = %s AND distance > 0
@@ -2483,6 +2819,7 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
         ) d
         LEFT JOIN (
             SELECT date_trunc('month', start_date) AS month,
+                   SUM(charge_energy_added) AS total_kwh,
                    SUM(cost) AS total_cost
             FROM charging_processes
             WHERE car_id = %s AND end_date IS NOT NULL
@@ -2491,7 +2828,7 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
         ORDER BY d.month DESC
         LIMIT %s
     """,
-        (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, effective_car_id, months,),
+        (effective_car_id, effective_car_id, months,),
     )
 
     if not rows:
@@ -2513,7 +2850,7 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
             eff_str = _format_efficiency(kwh, km) if km > 0 else "N/A"
             cost_str = f"RMB{total_cost:.2f}" if total_cost else "N/A"
             lines.append(
-                f"{month:<12} {trips:>6} {km:>9,} {kwh:>7.1f} {eff_str:>7} {cost_str:>8}"
+                f"{month:<12} {trips:>6} {km:>9,.0f} {kwh:>7.1f} {eff_str:>7} {cost_str:>8}"
             )
     else:
         lines = ["**Monthly Summary**\n"]
@@ -2563,28 +2900,56 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
 
     cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
+    # TeslaMate 在车辆休眠时不上报 positions，因此"两条 positions 间隔 >= 8h"的条件极少命中。
+    # 改用事件表（drives/charging_processes）推算：每次驾驶结束后，到下一次驾驶或充电开始之前，
+    # 就是停放期间。停放期间的电量损失即为 vampire drain。
+    # 注意：drives 表没有 battery_level 字段，需要 JOIN positions（通过 start/end_position_id）拿。
     rows = _query(
         f"""
-        WITH ordered AS (
-            SELECT date, battery_level,
-                   LAG(battery_level) OVER (ORDER BY date) AS prev_level,
-                   LAG(date) OVER (ORDER BY date) AS prev_date
-            FROM positions
-            WHERE car_id = %s AND date >= %s AND (date < %s OR %s IS NULL) AND battery_level IS NOT NULL
-            ORDER BY date
+        WITH events AS (
+            -- driving 结束：用 end_position_id 查 positions.battery_level
+            SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
+            FROM drives d
+            JOIN positions p ON p.id = d.end_position_id
+            WHERE d.car_id = %s AND d.end_date IS NOT NULL AND p.battery_level IS NOT NULL
+            UNION ALL
+            -- driving 开始：用 start_position_id 查 positions.battery_level
+            SELECT d.start_date AS ts, p.battery_level, 'drive_start' AS kind
+            FROM drives d
+            JOIN positions p ON p.id = d.start_position_id
+            WHERE d.car_id = %s AND p.battery_level IS NOT NULL
+            UNION ALL
+            -- charging 开始：直接用 start_battery_level
+            SELECT start_date AS ts, start_battery_level AS battery_level, 'charge_start' AS kind
+            FROM charging_processes
+            WHERE car_id = %s AND start_battery_level IS NOT NULL
+        ),
+        ordered AS (
+            SELECT ts, battery_level, kind,
+                   LEAD(ts) OVER (ORDER BY ts) AS next_ts,
+                   LEAD(battery_level) OVER (ORDER BY ts) AS next_battery_level,
+                   LEAD(kind) OVER (ORDER BY ts) AS next_kind
+            FROM events
         )
-        SELECT date, prev_date, battery_level, prev_level,
-               prev_level - battery_level AS drain,
-               EXTRACT(EPOCH FROM (date - prev_date)) / 3600 AS hours_parked
+        SELECT ts AS prev_date,
+               next_ts AS date,
+               battery_level AS prev_level,
+               next_battery_level AS battery_level,
+               (battery_level - next_battery_level) AS drain,
+               EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 AS hours_parked
         FROM ordered
-        WHERE prev_level IS NOT NULL
-          AND prev_level - battery_level > 0
-          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 8
-          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 48
+        WHERE kind = 'drive_end'                       -- 上次"停放起点"必须是驾驶结束
+          AND next_kind IN ('drive_start', 'charge_start')  -- 下次是驾驶或充电
+          AND next_ts IS NOT NULL
+          AND ts >= %s
+          AND (ts < %s OR %s IS NULL)
+          AND (battery_level - next_battery_level) > 0
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 8
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168  -- 最多 7 天内
         ORDER BY drain DESC
         {_limit_sql(LIMIT_VAMPIRE_DRAIN)}
     """,
-        (effective_car_id, cutoff, end_boundary, end_boundary),
+        (effective_car_id, effective_car_id, effective_car_id, cutoff, end_boundary, end_boundary),
     )
 
     date_range = f"{start_date or 'last ' + str(days) + ' days'} to {end_date or 'today'}"
@@ -2669,6 +3034,21 @@ async def calculate_eco_savings_vs_icev(
     charge_row = charge_rows[0] if charge_rows else {}
     total_kwh = charge_row.get("total_kwh", 0.0) or 0.0
     total_cost = charge_row.get("total_cost", 0.0) or 0.0
+    kwh_estimated = False
+
+    # Fallback: if no charging sessions recorded, estimate kWh from ideal-range deltas
+    if total_kwh == 0 and total_km > 0:
+        est = _query_one(
+            """
+            SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                * %s), 0) AS total_kwh
+            FROM drives
+            WHERE car_id = %s AND distance > 0 AND start_date >= %s
+            """,
+            (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, cutoff),
+        )
+        total_kwh = (est or {}).get("total_kwh") or 0.0
+        kwh_estimated = True
 
     # Fallback: use energy * electricity_price if cost not recorded
     if total_cost == 0 and total_kwh > 0:
@@ -2693,6 +3073,7 @@ async def calculate_eco_savings_vs_icev(
         "period_days": days,
         "total_distance_km": round(total_km, 1),
         "total_charged_kwh": round(total_kwh, 1),
+        "kwh_source": "estimated_from_ideal_range" if kwh_estimated else "charging_processes",
         "electricity_cost_actual": actual_electricity_cost,
         "icev": {
             "icev_mpg_L_per_100km": icev_mpg,
@@ -2731,20 +3112,29 @@ async def generate_travel_narrative_context(
     """
     _log.info(f"[TOOL] generate_travel_narrative_context called")
     effective_car_id = car_id if car_id is not None else CAR_ID
-    # Validate ISO8601 format
-    try:
-        if "T" in start_time:
-            start_dt = datetime.fromisoformat(start_time)
+
+    # Parse input times. Naive datetimes are interpreted in USER_TZ (user's timezone),
+    # then converted to UTC for the DB query — consistent with other tools in this file.
+    # For date-only end_time (e.g. "2026-03-03"), expand to the next day's 00:00 so the
+    # full end date is included (half-open interval [start, end)).
+    def _parse_narrative_time(s: str, is_end: bool) -> datetime:
+        if "T" in s:
+            dt = datetime.fromisoformat(s)
         else:
-            start_dt = datetime.strptime(start_time, "%Y-%m-%d")
+            dt = datetime.strptime(s, "%Y-%m-%d")
+            if is_end:
+                dt = dt + timedelta(days=1)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=USER_TZ)
+        return dt.astimezone(timezone.utc)
+
+    try:
+        start_utc = _parse_narrative_time(start_time, is_end=False)
     except ValueError:
         return f"❌ Invalid start_time format: '{start_time}'. Use ISO8601 like '2026-03-01T00:00:00' or '2026-03-01'"
 
     try:
-        if "T" in end_time:
-            end_dt = datetime.fromisoformat(end_time)
-        else:
-            end_dt = datetime.strptime(end_time, "%Y-%m-%d")
+        end_utc = _parse_narrative_time(end_time, is_end=True)
     except ValueError:
         return f"❌ Invalid end_time format: '{end_time}'. Use ISO8601 like '2026-03-03T23:59:59' or '2026-03-03'"
 
@@ -2759,10 +3149,10 @@ async def generate_travel_narrative_context(
         LEFT JOIN addresses sa ON d.start_address_id = sa.id
         LEFT JOIN addresses ea ON d.end_address_id = ea.id
         WHERE d.car_id = %s
-          AND d.start_date >= %s AND d.start_date <= %s
+          AND d.start_date >= %s AND d.start_date < %s
         ORDER BY d.start_date ASC
         """,
-        (effective_car_id, start_time, end_time),
+        (effective_car_id, start_utc.isoformat(), end_utc.isoformat()),
     )
 
     if not rows:
@@ -2803,8 +3193,8 @@ async def generate_travel_narrative_context(
 @mcp.tool()
 async def get_vehicle_persona_status(
     days_lookback: int = 7,
-    year: int = None,
-    month: int = None,
+    year: int | None = None,
+    month: int | None = None,
     car_id: int | None = None,
 ) -> str:
     """Get vehicle persona status -- activity, fatigue, extremes, and health metrics.
@@ -2831,18 +3221,18 @@ async def get_vehicle_persona_status(
     # Determine query period
     period_str = None
     if year is not None and month is not None:
-        # Specific month
-        start = datetime(year, month, 1, tzinfo=timezone.utc)
+        # Specific month — #14: 用 USER_TZ 界定边界，再转 UTC 查询
+        start = datetime(year, month, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
         if month == 12:
-            end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            end = datetime(year + 1, 1, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
         else:
-            end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+            end = datetime(year, month + 1, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
         period_str = f"{year}-{month:02d}"
         total_period_hours = (end - start).total_seconds() / 3600
     elif year is not None:
-        # Full year
-        start = datetime(year, 1, 1, tzinfo=timezone.utc)
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        # Full year — 同样按 USER_TZ 界定
+        start = datetime(year, 1, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
+        end = datetime(year + 1, 1, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
         period_str = str(year)
         total_period_hours = (end - start).total_seconds() / 3600
     else:
@@ -2857,6 +3247,7 @@ async def get_vehicle_persona_status(
     drive_r = _query_one(
         """
         SELECT COALESCE(SUM(distance), 0) AS total_km,
+               COALESCE(SUM(duration_min), 0) AS total_driving_min,
                MAX(duration_min) AS max_single_drive_min,
                MAX(speed_max) AS max_speed_kmh,
                COUNT(*) AS trip_count,
@@ -2870,12 +3261,17 @@ async def get_vehicle_persona_status(
     )
     drive_r = drive_r or {}
     total_km = drive_r.get("total_km") or 0.0
+    total_driving_min = drive_r.get("total_driving_min") or 0
     max_single_drive_min = drive_r.get("max_single_drive_min") or 0
     max_speed_kmh = drive_r.get("max_speed_kmh") or 0.0
     trip_count = drive_r.get("trip_count") or 0
     longest_drive_km = drive_r.get("longest_drive_km") or 0
 
-    # -- Idle time: states not 'driving'
+    # -- Driving hours from drives table (TeslaMate's states table doesn't have a 'driving'
+    # state — drives are a sub-state of 'online'. Use drives.duration_min as source of truth.)
+    driving_hours = total_driving_min / 60.0
+
+    # -- Idle time: use states table for asleep/offline + non-driving online time
     state_rows = _query(
         """
         SELECT state, start_date, end_date
@@ -2886,8 +3282,8 @@ async def get_vehicle_persona_status(
         (effective_car_id, cutoff,),
     )
 
-    idle_hours = 0.0
-    driving_hours = 0.0
+    asleep_offline_hours = 0.0
+    online_hours = 0.0
     for s in state_rows:
         st = s.get("start_date")
         en = s.get("end_date")
@@ -2900,37 +3296,57 @@ async def get_vehicle_persona_status(
             en = en.replace(tzinfo=timezone.utc)
         if st:
             hours = (en - st).total_seconds() / 3600.0
-            if s.get("state") == "driving":
-                driving_hours += hours
-            else:
-                idle_hours += hours
+            state = s.get("state")
+            if state in ("asleep", "offline"):
+                asleep_offline_hours += hours
+            elif state == "online":
+                online_hours += hours
+
+    # idle = 休眠/离线 + (online - driving)；防止计算出负值
+    idle_hours = asleep_offline_hours + max(0.0, online_hours - driving_hours)
 
     # Clamp: if computed hours exceed total period, cap idle percentage at 100
     if idle_hours + driving_hours > total_period_hours:
-        idle_hours = total_period_hours - driving_hours
+        idle_hours = max(0.0, total_period_hours - driving_hours)
     idle_percentage = round(idle_hours / total_period_hours * 100, 1) if total_period_hours > 0 else 0.0
 
-    # -- Vampire drain: battery drop while not driving / not charging
+    # -- Vampire drain: battery drop between drive_end and next drive/charge (see tesla_vampire_drain for rationale)
     vampire_rows = _query(
         """
-        WITH ordered AS (
-            SELECT date, battery_level, id,
-                   LAG(battery_level) OVER (ORDER BY date) AS prev_level,
-                   LAG(date) OVER (ORDER BY date) AS prev_date
-            FROM positions
-            WHERE car_id = %s AND date >= %s AND battery_level IS NOT NULL
-            ORDER BY date
+        WITH events AS (
+            SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
+            FROM drives d
+            JOIN positions p ON p.id = d.end_position_id
+            WHERE d.car_id = %s AND d.end_date IS NOT NULL AND p.battery_level IS NOT NULL
+            UNION ALL
+            SELECT d.start_date AS ts, p.battery_level, 'drive_start' AS kind
+            FROM drives d
+            JOIN positions p ON p.id = d.start_position_id
+            WHERE d.car_id = %s AND p.battery_level IS NOT NULL
+            UNION ALL
+            SELECT start_date AS ts, start_battery_level AS battery_level, 'charge_start' AS kind
+            FROM charging_processes
+            WHERE car_id = %s AND start_battery_level IS NOT NULL
+        ),
+        ordered AS (
+            SELECT ts, battery_level, kind,
+                   LEAD(ts) OVER (ORDER BY ts) AS next_ts,
+                   LEAD(battery_level) OVER (ORDER BY ts) AS next_battery_level,
+                   LEAD(kind) OVER (ORDER BY ts) AS next_kind
+            FROM events
         )
-        SELECT battery_level, prev_level,
-               prev_level - battery_level AS drain,
-               EXTRACT(EPOCH FROM (date - prev_date)) / 3600 AS hours_gap
+        SELECT (battery_level - next_battery_level) AS drain,
+               EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 AS hours_gap
         FROM ordered
-        WHERE prev_level IS NOT NULL
-          AND prev_level - battery_level > 0
-          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
-          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
+        WHERE kind = 'drive_end'
+          AND next_kind IN ('drive_start', 'charge_start')
+          AND next_ts IS NOT NULL
+          AND ts >= %s
+          AND (battery_level - next_battery_level) > 0
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 3
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168
         """,
-        (effective_car_id, cutoff,),
+        (effective_car_id, effective_car_id, effective_car_id, cutoff),
     )
     vampire_drain_pct = 0.0
     if vampire_rows:
@@ -2980,7 +3396,7 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
 
     Detects three achievements:
       1. [极限续航幸存者] -- started a charge with <= 5% battery
-      2. [午夜幽灵] -- drove at least 3 times between 00:15 and 05:00
+      2. [午夜幽灵] -- drove at least 3 times between 00:00 and 05:00
       3. [冰雪勇士] -- drove > 20 km when outside temp was below 0 degC
 
     Args:
@@ -3019,23 +3435,19 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
             ),
         })
 
-    # Achievement 2:午夜幽灵 -- 3+ drives between 00:15 and 05:00 (in user's timezone)
-    # Double AT TIME ZONE ensures consistent behavior: first 'UTC' normalizes to naive UTC,
-    # then converts to target timezone (works correctly for both tz-aware and naive inputs)
+    # Achievement 2:午夜幽灵 -- 3+ drives between 00:00 and 05:00 (in user's timezone)
+    # AT TIME ZONE 'UTC' AT TIME ZONE %s ensures consistent behavior: first 'UTC' normalizes
+    # to naive UTC, then converts to target timezone (works for both tz-aware and naive inputs)
     midnight_drives = _query(
         """
         SELECT start_date, distance, duration_min,
                outside_temp_avg, end_address_id
         FROM drives
         WHERE car_id = %s AND start_date >= %s
-          AND (
-              EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) * 60
-              + EXTRACT(MINUTE FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s)
-          ) >= 15
           AND EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) < 5
         ORDER BY start_date DESC
         """,
-        (effective_car_id, cutoff, TIMEZONE, TIMEZONE, TIMEZONE),
+        (effective_car_id, cutoff, TIMEZONE),
     )
     # DEBUG: log ALL matched rows to diagnose false positives
     _log.debug(f"[MIDNIGHT GHOST] {len(midnight_drives)} drives matched, timezone={TIMEZONE}")
@@ -3049,7 +3461,7 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
             "first_midnight_drive": _format_dt(earliest["start_date"]),
             "total_midnight_drives": len(midnight_drives),
             "evidence": (
-                f"在凌晨 00:15~05:00 时段内共出行 {len(midnight_drives)} 次，"
+                f"在凌晨 00:00~05:00 时段内共出行 {len(midnight_drives)} 次，"
                 "是昼伏夜出的神秘驾驶员"
             ),
         })
@@ -3110,17 +3522,10 @@ async def get_charging_vintage_data(charge_id: int | None = None, car_id: int | 
                    cp.start_battery_level, cp.end_battery_level,
                    cp.outside_temp_avg, cp.charge_energy_added,
                    cp.cost,
-                   sa.display_name AS location
+                   COALESCE(gf.name, sa.display_name) AS location
             FROM charging_processes cp
-            LEFT JOIN positions p ON cp.position_id = p.id
-            LEFT JOIN LATERAL (
-                SELECT a2.display_name
-                FROM addresses a2
-                WHERE a2.latitude BETWEEN p.latitude - 0.005 AND p.latitude + 0.005
-                  AND a2.longitude BETWEEN p.longitude - 0.005 AND p.longitude + 0.005
-                ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
-                LIMIT 1
-            ) sa ON p.latitude IS NOT NULL
+            LEFT JOIN geofences gf ON cp.geofence_id = gf.id
+            LEFT JOIN addresses sa ON cp.address_id = sa.id
             WHERE cp.car_id = %s AND cp.id = %s
             """,
             (effective_car_id, charge_id,),
@@ -3132,17 +3537,10 @@ async def get_charging_vintage_data(charge_id: int | None = None, car_id: int | 
                    cp.start_battery_level, cp.end_battery_level,
                    cp.outside_temp_avg, cp.charge_energy_added,
                    cp.cost,
-                   sa.display_name AS location
+                   COALESCE(gf.name, sa.display_name) AS location
             FROM charging_processes cp
-            LEFT JOIN positions p ON cp.position_id = p.id
-            LEFT JOIN LATERAL (
-                SELECT a2.display_name
-                FROM addresses a2
-                WHERE a2.latitude BETWEEN p.latitude - 0.005 AND p.latitude + 0.005
-                  AND a2.longitude BETWEEN p.longitude - 0.005 AND p.longitude + 0.005
-                ORDER BY (a2.latitude - p.latitude)^2 + (a2.longitude - p.longitude)^2
-                LIMIT 1
-            ) sa ON p.latitude IS NOT NULL
+            LEFT JOIN geofences gf ON cp.geofence_id = gf.id
+            LEFT JOIN addresses sa ON cp.address_id = sa.id
             WHERE cp.car_id = %s AND cp.end_date IS NOT NULL
             ORDER BY cp.start_date DESC
             LIMIT 1
@@ -3322,11 +3720,12 @@ async def generate_monthly_driving_report(
             return f"❌ Invalid target_month format: '{target_month}'. Use 'YYYY-MM' (e.g., '2026-03')"
 
     year, month = map(int, target_month.split("-"))
-    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    # #14: 按用户时区界定月份边界，再转 UTC 查询，避免跨时区错位 8 小时
+    start = datetime(year, month, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
     if month == 12:
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        end = datetime(year + 1, 1, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
     else:
-        end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        end = datetime(year, month + 1, 1, tzinfo=USER_TZ).astimezone(timezone.utc)
 
     start_iso = start.isoformat()
     end_iso = end.isoformat()
@@ -3369,31 +3768,63 @@ async def generate_monthly_driving_report(
     charge_count = charge_r.get("charge_count") or 0
     total_kwh = charge_r.get("total_kwh") or 0.0
     total_cost = charge_r.get("total_cost") or 0.0
+    kwh_estimated = False
+
+    # Fallback: if no charge sessions recorded in month, estimate from ideal-range deltas
+    if total_kwh == 0 and total_km > 0:
+        est = _query_one(
+            """
+            SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                * %s), 0) AS total_kwh
+            FROM drives
+            WHERE car_id = %s AND distance > 0
+              AND start_date >= %s AND start_date < %s
+            """,
+            (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, start_iso, end_iso),
+        )
+        total_kwh = (est or {}).get("total_kwh") or 0.0
+        kwh_estimated = True
 
     if total_cost == 0 and total_kwh > 0:
         total_cost = round(total_kwh * electricity_price, 2)
 
-    # -- Vampire drain in the month (for penalty)
+    # -- Vampire drain in the month (for penalty). See tesla_vampire_drain for rationale.
     vampire_rows = _query(
         """
-        WITH ordered AS (
-            SELECT date, battery_level,
-                   LAG(battery_level) OVER (ORDER BY date) AS prev_level,
-                   LAG(date) OVER (ORDER BY date) AS prev_date
-            FROM positions
-            WHERE car_id = %s AND date >= %s AND date < %s
-              AND battery_level IS NOT NULL
-            ORDER BY date
+        WITH events AS (
+            SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
+            FROM drives d
+            JOIN positions p ON p.id = d.end_position_id
+            WHERE d.car_id = %s AND d.end_date IS NOT NULL AND p.battery_level IS NOT NULL
+            UNION ALL
+            SELECT d.start_date AS ts, p.battery_level, 'drive_start' AS kind
+            FROM drives d
+            JOIN positions p ON p.id = d.start_position_id
+            WHERE d.car_id = %s AND p.battery_level IS NOT NULL
+            UNION ALL
+            SELECT start_date AS ts, start_battery_level AS battery_level, 'charge_start' AS kind
+            FROM charging_processes
+            WHERE car_id = %s AND start_battery_level IS NOT NULL
+        ),
+        ordered AS (
+            SELECT ts, battery_level, kind,
+                   LEAD(ts) OVER (ORDER BY ts) AS next_ts,
+                   LEAD(battery_level) OVER (ORDER BY ts) AS next_battery_level,
+                   LEAD(kind) OVER (ORDER BY ts) AS next_kind
+            FROM events
         )
-        SELECT prev_level - battery_level AS drain,
-               EXTRACT(EPOCH FROM (date - prev_date)) / 3600 AS hours_gap
+        SELECT (battery_level - next_battery_level) AS drain,
+               EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 AS hours_gap
         FROM ordered
-        WHERE prev_level IS NOT NULL
-          AND prev_level - battery_level > 0
-          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 >= 3
-          AND EXTRACT(EPOCH FROM (date - prev_date)) / 3600 <= 72
+        WHERE kind = 'drive_end'
+          AND next_kind IN ('drive_start', 'charge_start')
+          AND next_ts IS NOT NULL
+          AND ts >= %s AND ts < %s
+          AND (battery_level - next_battery_level) > 0
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 3
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168
         """,
-        (effective_car_id, start_iso, end_iso),
+        (effective_car_id, effective_car_id, effective_car_id, start_iso, end_iso),
     )
     vampire_penalty = 0
     if vampire_rows:
@@ -3432,16 +3863,20 @@ async def generate_monthly_driving_report(
         "",
         "**⚡ 补能与消耗**",
         f"- 充电次数：[{charge_count}] 次",
-        f"- 累计充入：[{total_kwh:.1f}] kWh",
+        f"- 累计充入：[{total_kwh:.1f}] kWh" + ("（估算）" if kwh_estimated else ""),
         f"- 预估电费：¥[{total_cost:.2f}] (每公里仅需 ¥[{cost_per_km:.3f}])",
         f"- 平均能耗：[{avg_eff_wh_km:.0f}] Wh/km",
         "",
         "**🏆 驾驶档案**",
         f"- 综合评分：[{score}]/100",
         f"- 极客点评：{comment}",
+    ]
+    if kwh_estimated:
+        lines.append("> *注：当月无充电记录，能耗基于续航差值估算，实际值可能更高。*")
+    lines.extend([
         "---",
         "*Generated by TeslaMate MCP*",
-    ]
+    ])
 
     return "\n".join(lines)
 
@@ -3702,7 +4137,9 @@ async def get_longest_trip_on_single_charge(car_id: int | None = None) -> str:
             JOIN drives d
                 ON d.car_id = %s
                 AND d.start_date >= cw.charge_end
-                AND (cw.next_charge_start IS NULL OR d.start_date < cw.next_charge_start)
+                AND d.start_date < cw.next_charge_start
+            -- #18: 只看闭环窗口（有下一次充电）。排除"当前正在进行"的窗口，避免其数据不完整。
+            WHERE cw.next_charge_start IS NOT NULL
         )
         SELECT
             charge_id,
@@ -3725,7 +4162,7 @@ async def get_longest_trip_on_single_charge(car_id: int | None = None) -> str:
 
     distance = float(row["total_distance_km"])
     start_time = _format_dt(row["charge_end"])
-    end_time = _format_dt(row["next_charge_start"]) if row["next_charge_start"] else "至今"
+    end_time = _format_dt(row["next_charge_start"])
     start_battery = row["start_battery"]
     arrival_battery = row["arrival_battery"]
     battery_consumed = (start_battery or 0) - (arrival_battery or 0) if start_battery and arrival_battery else None
@@ -3774,7 +4211,7 @@ if __name__ == "__main__":
         access_handler = logging.StreamHandler(sys.stdout)
         access_handler.setFormatter(logging.Formatter(
             fmt="%(asctime)s %(client_addr)s - \"%(method)s %(path)s\" %(status_code)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
+            datefmt="%Y-%m-%d %H:%M:%S%z",
         ))
         access_logger.addHandler(access_handler)
         access_logger.setLevel(logging.DEBUG if MCP_DEBUG else logging.INFO)

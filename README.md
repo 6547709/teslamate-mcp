@@ -8,6 +8,23 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ---
 
+## ✨ What's New in v1.0.0
+
+> Major stability & accuracy overhaul — **30+ bugs fixed**, **9 statistics tools rewritten**, **35/35 tools validated** against a live TeslaMate database.
+
+- 🛡️ **Rock-solid reliability** — race-free cache locking, timezone-consistent math, no more midnight ghost reads, no more phantom 72h "trips" from orphaned drive rows.
+- 🎯 **Real-world accurate statistics** — range now reflects true battery degradation (362 → 329 km), driving score uses proper thresholds (100 kW accel / -50 kW brake / 135 km/h), Chinese venue keywords (万达/银泰/火锅) correctly classify "shopping" from 3% → 25%.
+- 🗺️ **Smarter location clustering** — 220 m grid + `MODE() WITHIN GROUP` merges repeated visits to the same place (e.g. "万达·天樾" 552 → 626 correct visits).
+- 🔋 **Vampire drain rewrite** — now derives idle windows from the event table (drive_end → next drive/charge) matching TeslaMate's own UI logic.
+- ⚡ **Performance** — 5 LATERAL subqueries replaced with direct JOINs (3-10× faster); `trips_by_category` collapsed from 5 queries to 1; full 35-tool suite runs in 4.4s (avg 126 ms/call).
+- 📊 **Transparency** — efficiency reports now show actual charging energy "（实际充电 X kWh）" from `charging_processes`, not battery-delta guesses.
+- 🧰 **Operational polish** — autocommit read-only connections, Nominatim rate-limit compliance, `%z` timezone-tagged logs, per-field config validation.
+- 📚 **`STATS_LOGIC_REVIEW.md`** — full audit of every tool's statistical validity (attached to this release).
+
+Full details in [CHANGELOG.md](CHANGELOG.md#100---2026-04-21).
+
+---
+
 ## Features
 
 **35 tools** across six categories — multi-vehicle support via optional `car_id` parameter
