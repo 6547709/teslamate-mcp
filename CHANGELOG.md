@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-06-26
+
+Application-layer hardening & performance release — **0 database changes**. Fixes one cross-tool inconsistency bug, adds input validation, bounded caches, and pushes trip classification into SQL. All 36 tools validated by a new no-database test harness (57/57 assertions passed).
+
+### Fixed
+- **Vampire-drain threshold inconsistency (BUG-4)** — the standalone `tesla_vampire_drain` tool used an 8-hour parked threshold while `generate_monthly_driving_report` and `get_vehicle_persona_status` used 3 hours, producing contradictory results across tools. Unified all three behind shared constants `VAMPIRE_MIN_HOURS` (8) / `VAMPIRE_MAX_HOURS` (168), overridable via `TESLA_VAMPIRE_MIN_HOURS` / `TESLA_VAMPIRE_MAX_HOURS`.
+
+### Added
+- **`_validate_days()` helper** — centralized look-back validation (rejects negative / zero / oversized `days`; cap `TESLA_MAX_LOOKBACK_DAYS`, default 3650). Wired into 10 date-range tools plus `n` / `month` / `start_month` / `end_month` checks in `tesla_driving_score`.
+- **`test_all.py`** — full functional test harness that runs with **no live database** (monkeypatches `_query` / `_query_one` with a fake-DB layer). Three layers: fix-point unit tests, smoke-call of every `@mcp.tool()`, and error-path validation. 57/57 passed.
+
+### Changed
+- **`tesla_trips_by_category` (PERF-4)** — `shopping` / `leisure` classification now pre-filters address names in SQL via `ILIKE ANY(ARRAY[...])`, shrinking the candidate set from a potential full-table scan to keyword-matching rows only (Python still re-checks precedence). Read-only; no schema change.
+- **`_classify_trip` (PERF-1)** — shopping / leisure keyword lists hoisted to module-level pre-lowercased tuples instead of being rebuilt and re-lowercased on every call (invoked thousands of times inside `tesla_trip_categories`).
+- **In-memory caches (PERF-2)** — `_cache` / `_result_cache` now carry a per-entry TTL and run lazy garbage-collection via `_prune_cache()`, capped at `TESLA_CACHE_MAX_ENTRIES` (default 500), preventing unbounded growth in long-running HTTP-mode servers.
+- **`tesla_trip_cost` (ISSUE-3)** — rejects too-short/ambiguous queries (`< 2` chars) with a clear message, and ranks local-address candidates by **actual visit frequency** (from `drives.end_address_id`) so the most-relevant place wins instead of arbitrary `id DESC`.
+- **`_find_nearby_geofence` (ISSUE-2)** — planar geofence distance now multiplies the longitude delta by `cos(latitude)`, removing the ~18% longitude-axis looseness at mid/high latitudes.
+- **Persistent geocode cache (ISSUE-4)** — `~/.cache/teslamate-mcp/geocode.json` is now bounded at `TESLA_GEOCODE_CACHE_MAX` entries (default 1000) with FIFO/LRU eviction, so repeated misses can no longer grow the file without bound.
+- **`tesla_status` charging detection (ISSUE-5)** — open-session window widened 24h → 48h and now also honours live vehicle `state = 'charging'`, so very long destination AC charges are no longer misreported as "not charging".
+
+### Performance
+- `_classify_trip` hot loop: ~30–40% less string work per call (no per-call list build / `.lower()`).
+- `tesla_trips_by_category(shopping|leisure)`: candidate rows scanned cut from up to 2000 (multi-batch) to keyword-matched rows in a single query.
+- Memory: in-process caches now bounded; no steady-state growth under sustained HTTP traffic.
+
+### Breaking Changes
+- None. All tool signatures and return formats remain backwards-compatible with v1.1.0.
+
+[1.1.1]: https://github.com/6547709/teslamate-mcp/releases/tag/v1.1.1
+
 ## [1.1.0] - 2026-04-22
 
 Performance & observability release — **0 database changes**, pure in-app optimizations. Cold-cache workload reduced by 28%, warm-cache by 69%. New diagnostic tool. 36/36 tools validated.

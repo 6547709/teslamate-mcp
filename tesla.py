@@ -99,7 +99,7 @@ import atexit
 # Source of truth for this release. Bump this constant when tagging a new
 # release. Overridable at runtime via env (Docker build-arg) or git describe
 # for development checkouts.
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 
 def _detect_version() -> str:
@@ -256,6 +256,23 @@ TPMS_MIN = float(os.environ.get("TESLA_TPMS_MIN_THRESHOLD", "2.5"))
 TPMS_MAX = float(os.environ.get("TESLA_TPMS_MAX_THRESHOLD", "3.5"))
 TPMS_WARN_DELTA = 0.2  # bar -- warn if any tire differs from average by this much
 
+# -- Vampire drain thresholds (shared by tesla_vampire_drain & monthly report) --
+# BUG-4 fix: previously the standalone tool used 8h while the monthly report
+# used 3h, producing contradictory results. Unify here so both agree.
+VAMPIRE_MIN_HOURS = float(os.environ.get("TESLA_VAMPIRE_MIN_HOURS", "8"))   # parked >= this many hours
+VAMPIRE_MAX_HOURS = float(os.environ.get("TESLA_VAMPIRE_MAX_HOURS", "168"))  # cap at 7 days
+
+# -- Trip classification thresholds & geocode tuning --------------------------
+# ISSUE-3: queries shorter than this are too ambiguous for fuzzy address match.
+TRIP_COST_MIN_QUERY_LEN = 2
+# ISSUE-4: cap the persistent geocode cache so the on-disk JSON cannot grow
+# without bound (each miss rewrites the whole file).
+GEOCODE_CACHE_MAX_ENTRIES = int(os.environ.get("TESLA_GEOCODE_CACHE_MAX", "1000"))
+# Generic in-memory cache entry cap (PERF-2) before pruning expired/oldest.
+CACHE_MAX_ENTRIES = int(os.environ.get("TESLA_CACHE_MAX_ENTRIES", "500"))
+# Max look-back days accepted by date-range tools (ISSUE-1).
+MAX_LOOKBACK_DAYS = int(os.environ.get("TESLA_MAX_LOOKBACK_DAYS", "3650"))  # 10 years
+
 # Backend availability
 HAS_TESLAMATE = bool(DB_HOST and DB_PASS)
 
@@ -334,6 +351,26 @@ def _parse_date(date_str: str | None, default: datetime | None = None) -> dateti
         raise ValueError(
             f"Invalid date format: '{date_str}'. Expected YYYY-MM-DD (e.g., '2024-01-01')."
         )
+
+
+def _validate_days(days: int | None, max_days: int = MAX_LOOKBACK_DAYS) -> int | None:
+    """ISSUE-1: Validate a look-back `days` parameter.
+
+    Returns the validated days value, or raises ValueError with a friendly
+    message for negative / zero / oversized inputs. None is passed through
+    (callers that allow "all time" handle None themselves).
+    """
+    if days is None:
+        return None
+    if not isinstance(days, int):
+        raise ValueError(f"days must be an integer, got {days!r}.")
+    if days <= 0:
+        raise ValueError(f"days must be a positive integer, got {days}.")
+    if days > max_days:
+        raise ValueError(
+            f"days too large ({days}); maximum is {max_days} (~{max_days // 365} years)."
+        )
+    return days
 
 
 def _format_dt(dt: datetime | None) -> str:
@@ -459,6 +496,32 @@ _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
 
 
+def _prune_cache(cache: dict[str, dict], now: float, max_entries: int = CACHE_MAX_ENTRIES) -> None:
+    """PERF-2: lazily evict expired/oldest entries from an in-memory cache.
+
+    Caller must hold the cache's lock. Strategy:
+      1. Drop entries whose own ttl has elapsed (entry carries its own "ttl").
+      2. If still over `max_entries`, evict the oldest by timestamp until within
+         the cap. This bounds memory for long-running HTTP-mode servers where
+         many (car_id, params) key combinations accumulate over time.
+    """
+    if len(cache) <= max_entries:
+        # Fast path: still drop clearly-expired entries to avoid stale buildup.
+        expired = [k for k, v in cache.items()
+                   if v.get("ttl") is not None and now - v["ts"] >= v["ttl"]]
+        for k in expired:
+            cache.pop(k, None)
+        return
+    # Over cap: first drop expired, then oldest-first until within the cap.
+    expired = [k for k, v in cache.items()
+               if v.get("ttl") is not None and now - v["ts"] >= v["ttl"]]
+    for k in expired:
+        cache.pop(k, None)
+    if len(cache) > max_entries:
+        for k, _ in sorted(cache.items(), key=lambda kv: kv[1]["ts"])[: len(cache) - max_entries]:
+            cache.pop(k, None)
+
+
 def _cached_query_one(key: str, sql: str, params: tuple = (), ttl: int = 300) -> dict | None:
     """Query with TTL cache — ideal for rarely-changing data (car info, sw version).
 
@@ -475,7 +538,8 @@ def _cached_query_one(key: str, sql: str, params: tuple = (), ttl: int = 300) ->
     # Run query outside the lock
     result = _query_one(sql, params)
     with _cache_lock:
-        _cache[key] = {"data": result, "ts": now}
+        _cache[key] = {"data": result, "ts": now, "ttl": ttl}
+        _prune_cache(_cache, now)
     return result
 
 
@@ -491,7 +555,8 @@ def _cached_query(key: str, sql: str, params: tuple = (), ttl: int = 300) -> lis
             return entry["data"]
     result = _query(sql, params)
     with _cache_lock:
-        _cache[key] = {"data": result, "ts": now}
+        _cache[key] = {"data": result, "ts": now, "ttl": ttl}
+        _prune_cache(_cache, now)
     return result
 
 
@@ -532,11 +597,24 @@ def _geocode_cache_get(query: str) -> tuple[float, float, str] | None:
 
 
 def _geocode_cache_put(query: str, lat: float, lon: float, name: str) -> None:
-    """Persist a geocoded destination to disk. Best-effort; no error on IO failure."""
+    """Persist a geocoded destination to disk. Best-effort; no error on IO failure.
+
+    ISSUE-4: bound the cache at GEOCODE_CACHE_MAX_ENTRIES with simple insertion-
+    order (FIFO/LRU-ish) eviction so the on-disk JSON cannot grow without bound.
+    Python dicts preserve insertion order, so re-inserting an existing key keeps
+    its old position; we delete-then-insert to refresh recency on overwrite.
+    """
     cache = _geocode_cache_load()
     key = query.strip().lower()
     with _geocode_cache_lock:
+        # Refresh recency: move/insert key to the end of insertion order.
+        if key in cache:
+            del cache[key]
         cache[key] = [lat, lon, name]
+        # Evict oldest entries until within the cap.
+        while len(cache) > GEOCODE_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(cache))
+            del cache[oldest_key]
         try:
             _GEOCODE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             _GEOCODE_CACHE_FILE.write_text(
@@ -571,7 +649,8 @@ async def _cached_result(key: str, ttl: int, fn) -> str:
             return entry["data"]
     result = await fn()
     with _result_cache_lock:
-        _result_cache[key] = {"data": result, "ts": now}
+        _result_cache[key] = {"data": result, "ts": now, "ttl": ttl}
+        _prune_cache(_result_cache, now)
     return result
 
 
@@ -584,9 +663,13 @@ def _find_nearby_geofence(lat: float, lon: float) -> str | None:
     )
     best_name = None
     best_dist = float("inf")
+    # ISSUE-2: a degree of longitude shrinks with latitude (× cos(lat)). Without
+    # this correction the longitude axis is judged ~18% too loose at 40°N. Scale
+    # the longitude delta so the planar distance approximates true ground distance.
+    cos_lat = math.cos(math.radians(lat))
     for gf in geofences:
         dlat = gf["latitude"] - lat
-        dlon = gf["longitude"] - lon
+        dlon = (gf["longitude"] - lon) * cos_lat
         dist_sq = dlat * dlat + dlon * dlon
         # Rough degree-to-meter: 1 degree ≈ 111km, so 0.01° ≈ 1.1km
         radius_deg = (gf.get("radius") or 50) / 111_000.0
@@ -816,15 +899,20 @@ async def tesla_status(car_id: int | None = None) -> str:
             range_km = car_cfg["range_km"] * bat / 100
         lines.append(f"Battery: {bat}% ({_format_distance(range_km)})")
 
-    # is_charging：要求 end_date 为空 AND start_date 在最近 24 小时内
+    # is_charging：要求 end_date 为空 AND start_date 在最近 48 小时内。
+    # ISSUE-5: 旧的 24h 窗口会把超长目的地慢充（7kW 充满 + 排队可能 > 24h）误判为未充电。
+    # 放宽到 48h，并结合最新车辆状态 state == 'charging' 双重确认（任一满足即视为充电中）。
     charge_start_dt = combined.get("charge_start")
     if charge_start_dt and charge_start_dt.tzinfo is None:
         charge_start_dt = charge_start_dt.replace(tzinfo=timezone.utc)
-    is_charging = (
+    _CHARGE_WINDOW_SEC = 172800  # 48h
+    _recent_open_session = (
         combined.get("charge_end") is None
         and charge_start_dt is not None
-        and (_utcnow() - charge_start_dt).total_seconds() < 86400  # 24h
+        and (_utcnow() - charge_start_dt).total_seconds() < _CHARGE_WINDOW_SEC
     )
+    _state_charging = (combined.get("vehicle_state") or "").lower() == "charging"
+    is_charging = _recent_open_session or _state_charging
     if is_charging:
         kwh = combined.get("charge_energy_added") or 0
         lines.append(f"Charging: Yes ({kwh:.1f} kWh added so far)")
@@ -902,9 +990,8 @@ async def tesla_charging_history(days: int = 30, start_date: str | None = None, 
     """
     _log.info(f"[TOOL] tesla_charging_history called")
     effective_car_id = car_id if car_id is not None else CAR_ID
-    if days <= 0 or days > 3650:
-        return "❌ days must be between 1 and 3650"
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
@@ -990,6 +1077,7 @@ async def tesla_charges(
         return "❌ limit must be between 1 and 1000 (use -1 for all)"
 
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
@@ -1068,6 +1156,7 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
     effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate date parameters
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
@@ -1263,6 +1352,21 @@ async def tesla_driving_score(
     _log.info(f"[TOOL] tesla_driving_score called with period={period}")
     effective_car_id = car_id if car_id is not None else CAR_ID
 
+    # ISSUE-1: validate numeric inputs up front (negative / zero / oversized).
+    try:
+        if days is not None:
+            days = _validate_days(days)
+        if n is not None and (not isinstance(n, int) or n <= 0 or n > 100000):
+            raise ValueError(f"n must be a positive integer <= 100000, got {n!r}.")
+        if month is not None and (month < 1 or month > 12):
+            raise ValueError(f"month must be between 1 and 12, got {month}.")
+        if start_month is not None and (start_month < 1 or start_month > 12):
+            raise ValueError(f"start_month must be between 1 and 12, got {start_month}.")
+        if end_month is not None and (end_month < 1 or end_month > 12):
+            raise ValueError(f"end_month must be between 1 and 12, got {end_month}.")
+    except ValueError as e:
+        return f"❌ {e}"
+
     if period == "recent_n":
         n = n or 10
         rows = _query(
@@ -1385,6 +1489,32 @@ COMMUTE_PAIRS = [
     ("work", "home"),
 ]
 
+# PERF-1: keyword lists hoisted to module scope and pre-lowercased once, instead
+# of rebuilding + re-lowercasing on every _classify_trip call (called 1000s of
+# times inside tesla_trip_categories). Stored as tuples (immutable, slightly
+# faster iteration). Also reused by PERF-4 to push filtering down into SQL.
+_SHOPPING_KEYWORDS = tuple(k.lower() for k in [
+    # 英文
+    "mall", "store", "shop", "market", "supermarket", "grocery",
+    # 中文通用
+    "商场", "购物", "超市", "百货", "奥特莱斯", "菜市场", "便利店", "购物中心",
+    # 常见品牌
+    "万达", "银泰", "龙湖", "天街", "华润万家", "家乐福", "沃尔玛", "盒马",
+    "永辉", "万象城", "SKP", "印象城", "爱琴海", "环宇城",
+])
+_LEISURE_KEYWORDS = tuple(k.lower() for k in [
+    # 英文
+    "park", "beach", "restaurant", "cafe", "movie", "gym", "playground",
+    # 中文通用
+    "公园", "景区", "体育", "健身", "运动",
+    # 餐饮
+    "餐厅", "饭店", "火锅", "烧烤", "咖啡", "茶馆", "酒吧", "夜市",
+    # 娱乐
+    "电影院", "影城", "KTV", "游乐", "博物馆", "图书馆", "游泳",
+    # 旅游住宿
+    "温泉", "民宿", "酒店",
+])
+
 # Simple in-memory cache for routine locations
 # Key: car_id, Value: (dict of ids, timestamp)
 ROUTINE_CACHE = {}
@@ -1462,33 +1592,12 @@ def _classify_trip(
         if (start_addr_id == h_id and end_addr_id == w_id) or (start_addr_id == w_id and end_addr_id == h_id):
             return "commute"
 
-    # Shopping keywords（含中文及常见品牌）
-    shopping_keywords = [
-        # 英文
-        "mall", "store", "shop", "market", "supermarket", "grocery",
-        # 中文通用
-        "商场", "购物", "超市", "百货", "奥特莱斯", "菜市场", "便利店", "购物中心",
-        # 常见品牌
-        "万达", "银泰", "龙湖", "天街", "华润万家", "家乐福", "沃尔玛", "盒马",
-        "永辉", "万象城", "SKP", "印象城", "爱琴海", "环宇城",
-    ]
-    if any(kw.lower() in start or kw.lower() in end for kw in shopping_keywords):
+    # Shopping keywords（含中文及常见品牌）— PERF-1: pre-lowered module constant
+    if any(kw in start or kw in end for kw in _SHOPPING_KEYWORDS):
         return "shopping"
 
-    # Leisure keywords（含中文：休闲 / 餐饮 / 运动 / 旅游 / 娱乐）
-    leisure_keywords = [
-        # 英文
-        "park", "beach", "restaurant", "cafe", "movie", "gym", "playground",
-        # 中文通用
-        "公园", "景区", "体育", "健身", "运动",
-        # 餐饮
-        "餐厅", "饭店", "火锅", "烧烤", "咖啡", "茶馆", "酒吧", "夜市",
-        # 娱乐
-        "电影院", "影城", "KTV", "游乐", "博物馆", "图书馆", "游泳",
-        # 旅游住宿
-        "温泉", "民宿", "酒店",
-    ]
-    if any(kw.lower() in start or kw.lower() in end for kw in leisure_keywords):
+    # Leisure keywords（含中文：休闲 / 餐饮 / 运动 / 旅游 / 娱乐）— PERF-1
+    if any(kw in start or kw in end for kw in _LEISURE_KEYWORDS):
         return "leisure"
 
     return "other"
@@ -1510,6 +1619,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
     effective_car_id = car_id if car_id is not None else CAR_ID
     # Validate date parameters
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days (None = all time, allowed)
         if start_date:
             start_dt = _parse_date(start_date)
         elif days:
@@ -1578,8 +1688,50 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
              limit),
         )
         classified = list(rows)
+    elif category in ("shopping", "leisure"):
+        # PERF-4: push keyword filtering down into SQL using ILIKE ANY(ARRAY[...]).
+        # We pre-filter drives whose start/end address contains a category keyword,
+        # then still run _classify_trip to honour precedence (long_trip/commute win).
+        # This shrinks the candidate set from potentially the whole table to just
+        # keyword-matching rows, eliminating the multi-batch Python scan.
+        kw_list = _SHOPPING_KEYWORDS if category == "shopping" else _LEISURE_KEYWORDS
+        like_patterns = [f"%{kw}%" for kw in kw_list]
+        rows = _query(
+            """
+            SELECT d.start_date, d.distance, d.duration_min,
+                   d.start_address_id, d.end_address_id,
+                   sa.display_name AS start_location,
+                   ea.display_name AS end_location
+            FROM drives d
+            LEFT JOIN addresses sa ON d.start_address_id = sa.id
+            LEFT JOIN addresses ea ON d.end_address_id = ea.id
+            WHERE d.car_id = %s AND d.distance > 0
+              AND d.start_date >= %s AND d.start_date < %s
+              AND (
+                  sa.display_name ILIKE ANY(%s)
+                  OR ea.display_name ILIKE ANY(%s)
+              )
+            ORDER BY d.start_date DESC
+            LIMIT %s
+            """,
+            (effective_car_id, start_iso, end_iso, like_patterns, like_patterns,
+             max(limit * 5, 100)),
+        )
+        for r in rows:
+            cat = _classify_trip(
+                r.get("start_location"),
+                r.get("end_location"),
+                r.get("distance") or 0,
+                start_addr_id=r.get("start_address_id"),
+                end_addr_id=r.get("end_address_id"),
+                routine_ids=routine_ids,
+            )
+            if cat == category:
+                classified.append(r)
+                if len(classified) >= limit:
+                    break
     else:
-        # 其他类别（shopping/leisure/other）或 commute 但没识别出 routine：循环拉取
+        # 其他类别（other / commute 但没识别出 routine）：循环拉取
         # 避免 limit*5 预拉时类别分布不均导致漏数据
         MAX_SCAN = min(max(limit * 50, 500), 2000)
         BATCH = max(limit * 5, 100)
@@ -1767,6 +1919,7 @@ async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_da
     _log.info(f"[TOOL] tesla_efficiency called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
@@ -1846,6 +1999,7 @@ async def tesla_location_history(days: int = 7, start_date: str | None = None, e
     _log.info(f"[TOOL] tesla_location_history called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
@@ -1918,6 +2072,7 @@ async def tesla_state_history(days: int = 7, start_date: str | None = None, end_
     _log.info(f"[TOOL] tesla_state_history called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
@@ -2351,31 +2506,52 @@ async def tesla_trip_cost(
     if not destination or not destination.strip():
         return "❌ destination cannot be empty. Please provide a city, address, or place name (e.g. '万达·天樾' or 'Atlanta, GA')."
     destination = destination.strip()
+    # ISSUE-3: queries shorter than TRIP_COST_MIN_QUERY_LEN are too ambiguous —
+    # a single character like "店" or "x" fuzzy-matches huge numbers of addresses
+    # and the result is essentially random. Ask for a more specific name instead.
+    if len(destination) < TRIP_COST_MIN_QUERY_LEN:
+        return (
+            f"❌ destination '{destination}' is too short/ambiguous. "
+            f"Please provide a more specific name (at least {TRIP_COST_MIN_QUERY_LEN} characters), "
+            f"e.g. '万达广场' or 'Atlanta, GA'."
+        )
     effective_car_id = car_id if car_id is not None else CAR_ID
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
     # PERF #1: try local TeslaMate addresses table first (1700+ visited places, FREE).
     # Falls back to Nominatim only if no local match.
+    # ISSUE-3: rank candidates by how often the car actually went there (visit
+    # frequency from drives.end_address_id) so the most-relevant place wins,
+    # instead of an arbitrary id DESC ordering. Match-quality (name > display_name)
+    # remains the primary sort key; visit frequency breaks ties.
     dest_lat: float | None = None
     dest_lon: float | None = None
     dest_name: str | None = None
     local_hit = _query_one(
         """
-        SELECT latitude, longitude,
-               COALESCE(name, display_name) AS label
-        FROM addresses
-        WHERE name        ILIKE %s
-           OR display_name ILIKE %s
-           OR city         ILIKE %s
+        SELECT a.latitude, a.longitude,
+               COALESCE(a.name, a.display_name) AS label
+        FROM addresses a
+        LEFT JOIN (
+            SELECT end_address_id AS addr_id, COUNT(*) AS visits
+            FROM drives
+            WHERE car_id = %s AND end_address_id IS NOT NULL
+            GROUP BY end_address_id
+        ) v ON v.addr_id = a.id
+        WHERE a.name        ILIKE %s
+           OR a.display_name ILIKE %s
+           OR a.city         ILIKE %s
         ORDER BY
-          (CASE WHEN name ILIKE %s THEN 0
-                WHEN display_name ILIKE %s THEN 1
+          (CASE WHEN a.name ILIKE %s THEN 0
+                WHEN a.display_name ILIKE %s THEN 1
                 ELSE 2 END),
-          id DESC
+          COALESCE(v.visits, 0) DESC,
+          a.id DESC
         LIMIT 1
         """,
         (
+            effective_car_id,
             f"%{destination}%", f"%{destination}%", f"%{destination}%",
             f"%{destination}%", f"%{destination}%",
         ),
@@ -3015,6 +3191,7 @@ async def tesla_tpms_history(days: int = 30, start_date: str | None = None, end_
     _log.info(f"[TOOL] tesla_tpms_history called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
@@ -3196,6 +3373,7 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
     _log.info(f"[TOOL] tesla_vampire_drain called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
+        days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
         date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
@@ -3249,8 +3427,8 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
           AND ts >= %s
           AND (ts < %s OR %s IS NULL)
           AND (battery_level - next_battery_level) > 0
-          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 8
-          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168  -- 最多 7 天内
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= {VAMPIRE_MIN_HOURS}
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= {VAMPIRE_MAX_HOURS}  -- 最多 7 天内
         ORDER BY drain DESC
         {_limit_sql(LIMIT_VAMPIRE_DRAIN)}
     """,
@@ -3616,8 +3794,9 @@ async def get_vehicle_persona_status(
     idle_percentage = round(idle_hours / total_period_hours * 100, 1) if total_period_hours > 0 else 0.0
 
     # -- Vampire drain: battery drop between drive_end and next drive/charge (see tesla_vampire_drain for rationale)
+    # BUG-4: use the shared VAMPIRE_MIN_HOURS/MAX_HOURS so this agrees with tesla_vampire_drain.
     vampire_rows = _query(
-        """
+        f"""
         WITH events AS (
             SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
             FROM drives d
@@ -3648,8 +3827,8 @@ async def get_vehicle_persona_status(
           AND next_ts IS NOT NULL
           AND ts >= %s
           AND (battery_level - next_battery_level) > 0
-          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 3
-          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= {VAMPIRE_MIN_HOURS}
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= {VAMPIRE_MAX_HOURS}
         """,
         (effective_car_id, effective_car_id, effective_car_id, cutoff),
     )
@@ -4094,8 +4273,11 @@ async def generate_monthly_driving_report(
         total_cost = round(total_kwh * electricity_price, 2)
 
     # -- Vampire drain in the month (for penalty). See tesla_vampire_drain for rationale.
+    # BUG-4: use the shared VAMPIRE_MIN_HOURS/MAX_HOURS so the monthly report's
+    # vampire penalty agrees with the standalone tesla_vampire_drain tool
+    # (previously this used 3h while the tool used 8h, giving contradictory results).
     vampire_rows = _query(
-        """
+        f"""
         WITH events AS (
             SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
             FROM drives d
@@ -4126,8 +4308,8 @@ async def generate_monthly_driving_report(
           AND next_ts IS NOT NULL
           AND ts >= %s AND ts < %s
           AND (battery_level - next_battery_level) > 0
-          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 3
-          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= {VAMPIRE_MIN_HOURS}
+          AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= {VAMPIRE_MAX_HOURS}
         """,
         (effective_car_id, effective_car_id, effective_car_id, start_iso, end_iso),
     )
