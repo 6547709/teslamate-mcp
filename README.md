@@ -8,26 +8,38 @@
 
 ---
 
-## ✨ v1.1.0 新特性
+## ✨ v1.2.1 新特性
 
-> 性能与可观测性大版本 —— **0 项数据库改动**，全部在程序层优化。冷启动延迟 ↓ 28%，热缓存 ↓ 69%。新增诊断工具。36/36 全部通过测试。
+> 天气增强大版本 —— **0 项数据库改动**，完全向后兼容。新增和风天气集成（2 个新工具）+ 高德地图地理编码，未配置 API Key 时全部静默关闭，其余功能不受影响。当前共 **38 个工具**，无数据库测试 **82/82 全部通过**。
 
-- 🔍 **新增诊断工具 `tesla_version()`** —— 返回服务端版本、工具数、Python / fastmcp / psycopg2 版本、时区、单位、**真实 DB 连通性检查**。部署后第一时间确认版本。
-- 🤝 **MCP 协议元数据** —— 服务端在握手阶段直接暴露 `name=teslamate-mcp` + `version=1.1.0` + `website_url`，无需调工具客户端就能识别。
-- ⚡ **SQL 查询合并（FILTER WHERE）** —— `tesla_savings` 4→2 次查询（27×）、`tesla_monthly_report` 4→2 次查询（60×），完全等价但 round-trip 减半。
-- 🗺️ **`tesla_trip_cost` 三级兜底** —— 先查 TeslaMate 本地 `addresses` 表（1700+ 常去地点），再查持久化文件缓存（`~/.cache/teslamate-mcp/geocode.json`），最后才打 Nominatim。本地命中 1296ms → **~15ms（86×）**。
-- 🚀 **结果级缓存框架** —— 6 个聚合慢工具加缓存：battery_health（1h）、efficiency_by_temp（30min）、charging_by_location（30min）、top_destinations（30min）、savings（10min）、monthly_report（历史月 1 天，当前月始终实时）。**缓存命中 8827× 加速！**
-- 📈 **`tesla_drives` 历史窗口 +88%** —— `LIMIT_DRIVES` 500 → 1000，`tesla_drives(365+)` 覆盖从 131 天提升到 **247 天**。`days=10000` 这种超大输入现在会显示真实数据范围而非误导性的 "last 10000 days"。
-- 🛡️ **Bug 修复** —— `tesla_trip_cost("")` 空串不再误命中任意地址（`ILIKE '%%'`），返回明确错误。
-- 📊 **性能实证** —— 36/36 工具全通过，6/6 缓存工具 hash 完全一致，15/15 边界场景零崩溃。测试过程见 `TEST_REPORT.md` + `PERFORMANCE_IMPLEMENTATION.md`（本次发布附件）。
+- 🌦️ **新增工具 `tesla_weather`** —— 基于车辆最新 GPS 位置，通过**和风天气（QWeather）**返回实时天气：温度、体感、湿度、风力、降水、能见度、天气状况，补足 TeslaMate 仅有的单一 `outside_temp` 传感器。
+- 📉 **新增工具 `tesla_efficiency_by_weather`** —— 按**真实天气**（晴 / 多云 / 雨 / 雪 / 雾 / 大风）而非仅按温度分组的能效分析。通过和风天气**历史 API**回填每段行程的天气，展示相对晴天的能耗偏差。同样 5°C，雨天 / 雪天能耗可能天差地别。
+- ⛅ **`tesla_trip_cost` 天气修正** —— 配置后，目的地实时天气会对成本估算施加能耗系数：雨 +15%、雪 +30%、雾 +10%、大风 +12%。
+- 🗺️ **高德地图（AMAP）地理编码** —— `tesla_trip_cost` 新增高德作为高优先级地理编码源，对中文地名（如 `腾讯滨海大厦`、`万达广场`）精度远胜 Nominatim，并内置 **GCJ-02 → WGS-84** 坐标转换消除 50–500 m 系统性偏移。兜底链：本地 `addresses` 表 → 文件缓存 → **高德** → Nominatim。
+- 🛡️ **优雅降级** —— 高德 / 和风的 Key 或 Host 未配置时，对应功能自动返回 `None` / 友好提示并透明回退，现有部署零影响。
+- 📊 **测试实证** —— `test_all.py` **82/82 全部通过**（含天气分类、host 归一化、坐标转换精度、禁用路径回退），全部 38 个工具冒烟测试通过。
 
-完整清单见 [CHANGELOG.md](CHANGELOG.md#110---2026-04-22)。
+> 📌 **如何启用高德 / 和风**：见下方 [第三方 API（可选）](#-第三方-api可选) 配置说明，Key 和 Host 需自行申请。
+
+完整清单见 [CHANGELOG.md](CHANGELOG.md)。
+
+<details>
+<summary>📜 v1.1.0 性能与可观测性（点击展开）</summary>
+
+- 🔍 **诊断工具 `tesla_version()`** —— 返回服务端版本、工具数、Python / fastmcp / psycopg2 版本、时区、单位、真实 DB 连通性检查。
+- 🤝 **MCP 协议元数据** —— 握手阶段直接暴露 `name=teslamate-mcp` + `version` + `website_url`。
+- ⚡ **SQL 查询合并（FILTER WHERE）** —— `tesla_savings`、`tesla_monthly_report` 各 4→2 次查询，round-trip 减半。
+- 🗺️ **`tesla_trip_cost` 三级兜底** —— 本地 `addresses` 表 → 文件缓存 → Nominatim，本地命中 1296ms → ~15ms（86×）。
+- 🚀 **结果级缓存框架** —— 6 个聚合慢工具加缓存，缓存命中最高 8827× 加速。
+- 📈 **`tesla_drives` 历史窗口 +88%** —— `LIMIT_DRIVES` 500 → 1000，覆盖 131 天 → 247 天。
+
+</details>
 
 ---
 
 ## 功能特性
 
-**36 个工具**，分为六大类 — 多车辆支持，所有工具都支持可选的 `car_id` 参数
+**38 个工具**，分为七大类 — 多车辆支持，所有工具都支持可选的 `car_id` 参数
 
 **多车辆支持：** 所有工具都支持可选的 `car_id` 参数来查询特定车辆。使用 `tesla_cars()` 列出所有已注册的车辆。
 
@@ -70,8 +82,18 @@
 |------|------|
 | `tesla_efficiency` | 能耗趋势（Wh/km 每周平均） |
 | `tesla_efficiency_by_temp` | 不同温度下的能耗曲线 |
+| `tesla_efficiency_by_weather` | **按真实天气（晴/雨/雪/雾/大风）分组的能耗对比 · 需和风天气** |
 | `tesla_monthly_report` | 月度驾驶报告（含上月对比） |
 | `tesla_monthly_summary` | 月度汇总表（里程/kWh/费用/能耗） |
+
+### 🌦️ 天气增强（需和风天气 API）
+
+| 工具 | 说明 |
+|------|------|
+| `tesla_weather` | **车辆当前位置的实时天气（温度/体感/湿度/风力/降水/能见度/状况）** |
+| `tesla_efficiency_by_weather` | **按真实天气分组的能效分析（回填历史天气，展示相对晴天偏差）** |
+
+> 💡 天气功能需配置 `QWEATHER_API_KEY` + `QWEATHER_API_HOST`（需自行申请，见下方配置）。未配置时这两个工具返回友好提示，其余功能不受影响。此外，配置后 `tesla_trip_cost` 会按目的地实时天气自动修正电费估算（雨 +15% / 雪 +30% / 雾 +10% / 大风 +12%）。
 
 ### 💰 省钱 & 环保
 
@@ -159,6 +181,19 @@ services:
       # - TESLA_TPMS_MIN_THRESHOLD=2.5  # 低压警告阈值（bar）
       # - TESLA_TPMS_MAX_THRESHOLD=3.5  # 高压警告阈值（bar）
 
+      # ── 第三方 API（可选）⚠️ 占位符，必须替换成自己申请的！────
+      # 高德地图 / AMAP：提升中文地址地理编码精度（tesla_trip_cost）
+      #   申请：https://lbs.amap.com → 创建应用 → 选「Web服务」类型 Key
+      # - AMAP_API_KEY=xxx***                          # 你的高德 Web服务 Key
+      # - TESLA_AMAP_TIMEOUT=8                          # 可选，请求超时（秒）
+      # 和风天气 / QWeather：启用 tesla_weather、tesla_efficiency_by_weather、行程成本天气修正
+      #   申请：https://dev.qweather.com → 控制台 → 创建项目，获取 API Key + 账号专属 Host
+      #   注意：必须用账号专属 Host（形如 xxxx.re.qweatherapi.com），旧公共域名返回 403
+      # - QWEATHER_API_KEY=xxx***                       # 你的和风天气 API Key
+      # - QWEATHER_API_HOST=xxx***.re.qweatherapi.com   # 你的专属 Host
+      # - TESLA_QWEATHER_TIMEOUT=8                       # 可选，请求超时（秒）
+      # - TESLA_WEATHER_SAMPLE_MAX=60                    # 可选，天气能效分析采样行程数
+
       # ── 查询限制（可选，设 -1 为不限制）────────────────
       # - TESLA_LIMIT_DRIVES=500             # tesla_drives 最大返回条数
       # - TESLA_LIMIT_CHARGING=500           # tesla_charging_history 最大返回条数
@@ -176,6 +211,17 @@ services:
 ```
 
 > 💡 注释掉的变量（`#`）显示的是默认值，只需取消注释并修改你需要的即可。
+
+#### 🔑 第三方 API（可选）
+
+以下功能需要你**自行申请** API Key / Host。配置文件中的 `xxx***` 均为占位符，**必须替换成你自己的**。不配置则对应功能自动关闭，其余功能不受影响。
+
+| 服务 | 启用的功能 | 需要的环境变量 | 申请地址 |
+|------|-----------|---------------|----------|
+| **高德地图 / AMAP** | 中文地址地理编码（`tesla_trip_cost` 更精准） | `AMAP_API_KEY` | [lbs.amap.com](https://lbs.amap.com) → 创建应用 → 选「**Web服务**」类型 Key |
+| **和风天气 / QWeather** | `tesla_weather`、`tesla_efficiency_by_weather`、行程成本天气修正 | `QWEATHER_API_KEY` + `QWEATHER_API_HOST` | [dev.qweather.com](https://dev.qweather.com) → 控制台 → 创建项目 |
+
+> ⚠️ **和风天气特别注意**：自 2024 年起必须使用账号**专属 API Host**（形如 `xxxx.re.qweatherapi.com`）；旧版公共域名 `devapi/api.qweather.com` 现已返回 `403 Invalid Host`。Host 可带或不带协议头 / 末尾斜杠，程序会自动归一化。
 
 **车型参考（中国）：**
 
@@ -260,7 +306,7 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 
 ## 工作原理
 
-单文件 Python 服务器（~3700 行），使用 **FastMCP** 框架。直接从 TeslaMate PostgreSQL 数据库读取所有数据：
+单文件 Python 服务器，使用 **FastMCP** 框架。直接从 TeslaMate PostgreSQL 数据库读取所有数据（可选接入高德地图 / 和风天气 API 做地理编码与天气增强）：
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌───────────┐     ┌────────────┐

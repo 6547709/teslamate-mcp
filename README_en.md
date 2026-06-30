@@ -8,26 +8,38 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ---
 
-## ✨ What's New in v1.1.0
+## ✨ What's New in v1.2.1
 
-> Performance & observability release — **0 database changes**, pure in-app optimizations. Cold-cache workload ↓ 28%, warm-cache ↓ 69%. New diagnostic tool. **36/36 tools validated**.
+> Weather enrichment release — **0 database changes**, fully backward compatible. Adds QWeather (和风天气) integration (2 new tools) + AMAP (高德) geocoding. When the API keys are not configured, every new feature is silently disabled and nothing else changes. **38 tools** total, no-database test suite **82/82 passing**.
 
-- 🔍 **New diagnostic tool `tesla_version()`** — returns server version, tool count, Python / fastmcp / psycopg2 versions, timezone, units, and a **live TeslaMate DB health check**. First thing to call to confirm your deployment.
-- 🤝 **MCP protocol metadata** — server now advertises `name=teslamate-mcp` + `version=1.1.0` + `website_url` during handshake. MCP-compliant clients see it without any tool call.
-- ⚡ **SQL query consolidation (FILTER WHERE)** — `tesla_savings` 4→2 queries (27×), `tesla_monthly_report` 4→2 queries (60×), semantically identical but round-trips halved.
-- 🗺️ **`tesla_trip_cost` 3-stage fallback** — first search local TeslaMate `addresses` table (1,700+ visited places), then persistent file cache (`~/.cache/teslamate-mcp/geocode.json`), finally Nominatim. Local hits drop from 1296ms → **~15ms (86×)**.
-- 🚀 **Result-level cache framework** — 6 slow aggregate tools now cached: battery_health (1h), efficiency_by_temp (30min), charging_by_location (30min), top_destinations (30min), savings (10min), monthly_report (historical months 1 day, current month always live). **Cache hits achieve 8827× speedup!**
-- 📈 **`tesla_drives` history window +88%** — `LIMIT_DRIVES` 500 → 1000. `tesla_drives(365+)` now covers **247 days** of history instead of 131. Oversized inputs like `days=10000` now show actual data range instead of a misleading "last 10000 days".
-- 🛡️ **Bug fix** — `tesla_trip_cost("")` empty string no longer matches arbitrary addresses via `ILIKE '%%'`; returns a clear error instead.
-- 📊 **Full test evidence** — 36/36 tools pass, 6/6 cached tools hash-identical across calls, 15/15 edge cases zero-crash. See `TEST_REPORT.md` + `PERFORMANCE_IMPLEMENTATION.md` (attached to this release).
+- 🌦️ **New tool `tesla_weather`** — real-time weather at the car's latest GPS position via **QWeather (和风天气)**: temperature, feels-like, humidity, wind, precipitation, visibility and conditions. Complements TeslaMate's single `outside_temp` sensor.
+- 📉 **New tool `tesla_efficiency_by_weather`** — efficiency grouped by *actual weather* (clear / cloudy / rain / snow / fog / wind), not just temperature. Back-fills each drive's weather from QWeather's **historical** API and shows the delta vs clear conditions. The same 5°C day can mean wildly different consumption in rain or snow.
+- ⛅ **`tesla_trip_cost` weather correction** — when configured, the destination's current weather applies an energy multiplier: rain +15%, snow +30%, fog +10%, wind +12%.
+- 🗺️ **AMAP (高德) geocoding** — `tesla_trip_cost` gains AMAP as a higher-priority geocoding source for Chinese place names (e.g. `腾讯滨海大厦`, `万达广场`), far more accurate than Nominatim, with built-in **GCJ-02 → WGS-84** conversion to remove the 50–500 m systematic offset. Fallback chain: local `addresses` table → file cache → **AMAP** → Nominatim.
+- 🛡️ **Graceful degradation** — when AMAP/QWeather keys or host are unset, the relevant feature returns `None` / a friendly hint and transparently falls back. Existing deployments are unaffected.
+- 📊 **Test evidence** — `test_all.py` **82/82 passing** (weather classification, host normalisation, coordinate-conversion accuracy, disabled-path fallback), all 38 tools smoke-tested.
 
-Full details in [CHANGELOG.md](CHANGELOG.md#110---2026-04-22).
+> 📌 **How to enable AMAP / QWeather**: see [Third-party APIs (optional)](#-third-party-apis-optional) below. You must apply for your own Key and Host.
+
+Full details in [CHANGELOG.md](CHANGELOG.md).
+
+<details>
+<summary>📜 v1.1.0 — Performance & observability (click to expand)</summary>
+
+- 🔍 **Diagnostic tool `tesla_version()`** — server version, tool count, Python / fastmcp / psycopg2 versions, timezone, units, live DB health check.
+- 🤝 **MCP protocol metadata** — advertises `name=teslamate-mcp` + `version` + `website_url` during handshake.
+- ⚡ **SQL query consolidation (FILTER WHERE)** — `tesla_savings`, `tesla_monthly_report` each 4→2 queries.
+- 🗺️ **`tesla_trip_cost` 3-stage fallback** — local `addresses` table → file cache → Nominatim, local hits 1296ms → ~15ms (86×).
+- 🚀 **Result-level cache framework** — 6 slow aggregate tools cached, up to 8827× on cache hits.
+- 📈 **`tesla_drives` history window +88%** — `LIMIT_DRIVES` 500 → 1000, 131 → 247 days covered.
+
+</details>
 
 ---
 
 ## Features
 
-**36 tools** across six categories — multi-vehicle support via optional `car_id` parameter
+**38 tools** across seven categories — multi-vehicle support via optional `car_id` parameter
 
 **Multi-vehicle:** All tools accept an optional `car_id` parameter to query a specific vehicle. Use `tesla_cars()` to list all registered vehicles.
 
@@ -70,8 +82,18 @@ Full details in [CHANGELOG.md](CHANGELOG.md#110---2026-04-22).
 |------|-------------|
 | `tesla_efficiency` | Energy consumption trends (Wh/km weekly averages) |
 | `tesla_efficiency_by_temp` | Efficiency curve by outside temperature |
+| `tesla_efficiency_by_weather` | **Efficiency grouped by actual weather (clear/rain/snow/fog/wind) · requires QWeather** |
 | `tesla_monthly_report` | Monthly driving report with comparison to previous month |
 | `tesla_monthly_summary` | Monthly summary table (distance / kWh / cost / efficiency) |
+
+### 🌦️ Weather (requires QWeather API)
+
+| Tool | Description |
+|------|-------------|
+| `tesla_weather` | **Real-time weather at the car's location (temp / feels-like / humidity / wind / precipitation / visibility / conditions)** |
+| `tesla_efficiency_by_weather` | **Efficiency grouped by actual weather (back-fills historical weather, shows delta vs clear)** |
+
+> 💡 Weather features require `QWEATHER_API_KEY` + `QWEATHER_API_HOST` (apply for your own — see config below). When unset, these two tools return a friendly hint and nothing else changes. Once configured, `tesla_trip_cost` also auto-corrects its electricity estimate by the destination's current weather (rain +15% / snow +30% / fog +10% / wind +12%).
 
 ### 💰 Savings & Eco
 
@@ -159,6 +181,20 @@ services:
       # - TESLA_TPMS_MIN_THRESHOLD=2.5  # Low pressure warning (bar)
       # - TESLA_TPMS_MAX_THRESHOLD=3.5  # High pressure warning (bar)
 
+      # ── Third-party APIs (Optional) ⚠️ PLACEHOLDERS — use YOUR OWN! ──
+      # AMAP (高德): better Chinese-address geocoding for tesla_trip_cost
+      #   Apply: https://lbs.amap.com -> Create app -> generate a "Web服务 / Web Service" key
+      # - AMAP_API_KEY=xxx***                          # your AMAP Web-Service key
+      # - TESLA_AMAP_TIMEOUT=8                          # optional, request timeout (s)
+      # QWeather (和风天气): enables tesla_weather, tesla_efficiency_by_weather, trip-cost weather correction
+      #   Apply: https://dev.qweather.com -> Console -> create a project -> get API Key + dedicated Host
+      #   Note: you MUST use your account's dedicated host (e.g. xxxx.re.qweatherapi.com);
+      #         the legacy public devapi/api.qweather.com now returns 403.
+      # - QWEATHER_API_KEY=xxx***                       # your QWeather API key
+      # - QWEATHER_API_HOST=xxx***.re.qweatherapi.com   # your dedicated host
+      # - TESLA_QWEATHER_TIMEOUT=8                       # optional, request timeout (s)
+      # - TESLA_WEATHER_SAMPLE_MAX=60                    # optional, drives sampled by weather efficiency
+
       # ── Query Limits (Optional, set -1 for unlimited) ─────
       # - TESLA_LIMIT_DRIVES=500             # tesla_drives max rows
       # - TESLA_LIMIT_CHARGING=500           # tesla_charging_history max rows
@@ -176,6 +212,17 @@ services:
 ```
 
 > 💡 Commented-out variables (`#`) show default values. Uncomment and change only what you need.
+
+#### 🔑 Third-party APIs (optional)
+
+The features below require you to **apply for your own** API key / host. The `xxx***` values in the config are placeholders — **replace them with your own**. If left unset, the corresponding feature is disabled and everything else still works.
+
+| Service | Enables | Required env vars | Apply at |
+|---------|---------|-------------------|----------|
+| **AMAP (高德)** | Chinese-address geocoding (more accurate `tesla_trip_cost`) | `AMAP_API_KEY` | [lbs.amap.com](https://lbs.amap.com) → Create app → **Web服务 / Web Service** key |
+| **QWeather (和风天气)** | `tesla_weather`, `tesla_efficiency_by_weather`, trip-cost weather correction | `QWEATHER_API_KEY` + `QWEATHER_API_HOST` | [dev.qweather.com](https://dev.qweather.com) → Console → create a project |
+
+> ⚠️ **QWeather note:** since 2024 you must use your account's **dedicated API host** (e.g. `xxxx.re.qweatherapi.com`); the legacy public `devapi/api.qweather.com` now returns `403 Invalid Host`. The host may include or omit the scheme / trailing slash — it's normalised automatically.
 
 **Battery capacity reference (China):**
 
@@ -253,7 +300,7 @@ In your OpenClaw settings, add a new MCP server:
 
 ## Architecture
 
-Single-file Python server (~2700 lines) using **FastMCP**. All data comes directly from TeslaMate PostgreSQL:
+Single-file Python server using **FastMCP**. All data comes directly from TeslaMate PostgreSQL (with optional AMAP / QWeather APIs for geocoding and weather enrichment):
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌───────────┐     ┌────────────┐
