@@ -284,6 +284,36 @@ def test_unit():
     )
     tesla.AMAP_GEOCODE_ENABLED = saved_enabled
 
+    # ---- v1.2.1: QWeather weather integration --------------------------------
+    # Condition classification buckets (Chinese + case-insensitive English).
+    check("v1.2.1 classify_weather 晴→clear", tesla._classify_weather("晴") == "clear")
+    check("v1.2.1 classify_weather 多云→cloudy", tesla._classify_weather("多云") == "cloudy")
+    check("v1.2.1 classify_weather 小雨→rain", tesla._classify_weather("小雨") == "rain")
+    check("v1.2.1 classify_weather 暴雪→snow", tesla._classify_weather("暴雪") == "snow")
+    # snow precedence over rain (雨夹雪 must be snow, not rain).
+    check("v1.2.1 classify_weather 雨夹雪→snow", tesla._classify_weather("雨夹雪") == "snow")
+    check("v1.2.1 classify_weather 大雾→fog", tesla._classify_weather("大雾") == "fog")
+    check("v1.2.1 classify_weather 霾→fog", tesla._classify_weather("霾") == "fog")
+    check("v1.2.1 classify_weather 大风→wind", tesla._classify_weather("大风") == "wind")
+    check("v1.2.1 classify_weather case-insensitive 'Clear'→clear", tesla._classify_weather("Clear") == "clear")
+    check("v1.2.1 classify_weather 'Heavy Rain'→rain", tesla._classify_weather("Heavy Rain") == "rain")
+    check("v1.2.1 classify_weather None→other", tesla._classify_weather(None) == "other")
+    # Energy-correction factor table.
+    check("v1.2.1 weather factor snow=1.30", tesla.WEATHER_ENERGY_FACTOR["snow"] == 1.30)
+    check("v1.2.1 weather factor rain=1.15", tesla.WEATHER_ENERGY_FACTOR["rain"] == 1.15)
+    check("v1.2.1 weather factor clear=1.00", tesla.WEATHER_ENERGY_FACTOR["clear"] == 1.00)
+    # Host normalisation: scheme + trailing slash stripped to a bare host.
+    saved_host = tesla.QWEATHER_API_HOST
+    norm = "https://abc.re.qweatherapi.com/".replace("https://", "").replace("http://", "").rstrip("/")
+    check("v1.2.1 host normalisation strips scheme/slash", norm == "abc.re.qweatherapi.com")
+    # No QWeather config in test env ⇒ disabled and helpers return None.
+    saved_qw = tesla.QWEATHER_ENABLED
+    tesla.QWEATHER_ENABLED = False
+    check("v1.2.1 _qweather_now disabled → None", asyncio.run(tesla._qweather_now(39.9, 116.4)) is None)
+    check("v1.2.1 _qweather_locationid disabled → None", asyncio.run(tesla._qweather_locationid(39.9, 116.4)) is None)
+    check("v1.2.1 _qweather_historical disabled → None", asyncio.run(tesla._qweather_historical("101010100", "20260101")) is None)
+    tesla.QWEATHER_ENABLED = saved_qw
+
 
 # =====================================================================
 # Layer 2 — smoke-call every MCP tool
@@ -303,6 +333,7 @@ TOOL_ARGS = {
     "tesla_tpms_history": {"days": 30},
     "tesla_monthly_summary": {"months": 6},
     "tesla_top_destinations": {"limit": 10},
+    "tesla_efficiency_by_weather": {"days": 30},
     "calculate_eco_savings_vs_icev": {"days": 30},
     "generate_monthly_driving_report": {"target_month": "2025-05"},
     "tesla_monthly_report": {"year": 2025, "month": 5},

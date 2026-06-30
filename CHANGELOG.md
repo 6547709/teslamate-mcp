@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-06-30
+
+Weather integration release — **0 database changes**. Adds optional weather enrichment via QWeather (和风天气): a real-time weather tool, a weather-bucketed efficiency analysis backed by QWeather's *historical* API, and a destination-weather correction for trip-cost estimates. Fully backward compatible: when `QWEATHER_API_KEY` / `QWEATHER_API_HOST` are unset, all weather features are silently disabled and nothing else changes.
+
+### Added
+
+- **`tesla_weather`** — current weather (temperature, feels-like, humidity,
+  wind, precipitation, visibility, conditions) at the vehicle's latest GPS
+  position. Complements TeslaMate's single `outside_temp` sensor reading.
+- **`tesla_efficiency_by_weather`** — efficiency grouped by actual weather
+  condition (clear/cloudy/rain/snow/fog/wind), not just temperature. Back-fills
+  each drive's weather from QWeather's historical API using the drive's midpoint
+  coordinate + date, then aggregates kWh/distance per condition and shows the
+  delta vs clear weather. Samples the most recent drives (default 60, via
+  `TESLA_WEATHER_SAMPLE_MAX`) to stay within API limits; result cached 6h.
+- **`tesla_trip_cost` weather correction** — when QWeather is configured, the
+  destination's current weather applies an energy multiplier to the estimate
+  (rain +15%, snow +30%, fog +10%, wind +12%; clear/cloudy unchanged).
+- New env vars: `QWEATHER_API_KEY`, `QWEATHER_API_HOST` (dedicated host, e.g.
+  `xxxx.re.qweatherapi.com`), `TESLA_QWEATHER_TIMEOUT` (default 8s),
+  `TESLA_WEATHER_SAMPLE_MAX` (default 60).
+
+### Technical notes
+
+- **Dedicated API host** — QWeather (2024+) rejects the legacy public
+  `devapi/api.qweather.com` hosts with `403 Invalid Host`; each account now has
+  a private `*.re.qweatherapi.com` host. `QWEATHER_API_HOST` accepts a value
+  with or without scheme/trailing slash and is normalised to a bare host.
+- **Coordinates vs LocationID** — realtime weather accepts raw WGS-84 `lon,lat`
+  directly; historical weather requires a QWeather LocationID, so coordinates
+  are resolved to the nearest LocationID via GeoAPI (grid-snapped ~5km cache to
+  minimise calls).
+- **Historical condition bucketing** — the daily summary has no condition text,
+  so the bucket is derived from the most-severe hourly sample (with a
+  precipitation fallback ⇒ rain).
+- **Graceful degradation** — every weather helper returns `None` on disabled /
+  network / parse / API error, and the new tools return a friendly hint, so
+  existing deployments are completely unaffected.
+
+### Testing
+
+- `test_all.py`: weather classification (incl. case-insensitive English and
+  snow-before-rain precedence), disabled-path returns, host normalisation, and
+  energy-factor table. All tools still smoke-tested.
+
 ## [1.2.0] - 2026-06-30
 
 Geocoding accuracy release — **0 database changes**. Adds optional AMAP (高德地图) as a higher-priority geocoding source for Chinese addresses, with built-in GCJ-02 → WGS-84 coordinate conversion. Fully backward compatible: when `AMAP_API_KEY` is unset the behaviour is identical to before (Nominatim only).

@@ -83,6 +83,16 @@ Environment variables:
                             GCJ-02→WGS-84 converted) before Nominatim fallback.
                             Unset = behave exactly as before (Nominatim only).
   TESLA_AMAP_TIMEOUT     -- AMAP request timeout seconds (default: 8)
+
+  # Weather (optional, v1.2.1) — QWeather 和风天气
+  QWEATHER_API_KEY       -- QWeather API KEY (classic auth). Enables tesla_weather,
+                            tesla_efficiency_by_weather and trip_cost weather
+                            correction. Unset = weather features disabled, no
+                            other behaviour changes.
+  QWEATHER_API_HOST      -- Your dedicated API host, e.g. xxxx.re.qweatherapi.com
+                            (required since QWeather moved off public devapi).
+  TESLA_QWEATHER_TIMEOUT -- QWeather request timeout seconds (default: 8)
+  TESLA_WEATHER_SAMPLE_MAX -- Max drives sampled by efficiency_by_weather (default: 60)
 """
 
 from __future__ import annotations
@@ -106,7 +116,7 @@ import atexit
 # Source of truth for this release. Bump this constant when tagging a new
 # release. Overridable at runtime via env (Docker build-arg) or git describe
 # for development checkouts.
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 
 def _detect_version() -> str:
@@ -290,6 +300,72 @@ AMAP_API_KEY = os.environ.get("AMAP_API_KEY", "").strip()
 AMAP_GEOCODE_ENABLED = bool(AMAP_API_KEY)
 AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 AMAP_TIMEOUT = float(os.environ.get("TESLA_AMAP_TIMEOUT", "8"))
+
+# -- QWeather (和风天气) integration (v1.2.1) ---------------------------------
+# Optional weather enrichment. TeslaMate only records `outside_temp` (a single
+# sensor value, captured only while the car is awake). QWeather adds humidity,
+# wind, precipitation, conditions and — crucially — HISTORICAL weather, which
+# lets us back-fill the weather of past drives for efficiency analysis.
+#
+# Auth: classic API KEY + the account's dedicated API Host (since 2024 QWeather
+# moved every account to a private host like `xxxx.re.qweatherapi.com`; the old
+# public devapi/api.qweather.com are rejected with 403 "Invalid Host").
+# When key OR host is unset the whole weather path is skipped → existing
+# deployments behave exactly as before. NEVER stored in source; env only.
+#
+# IMPORTANT — coordinates & location IDs:
+#   * Real-time weather (/v7/weather/now) accepts raw WGS-84 "lon,lat" directly.
+#   * Historical weather (/v7/historical/weather) needs a QWeather LocationID,
+#     so we resolve coords → nearest LocationID via GeoAPI first (cached).
+QWEATHER_API_KEY = os.environ.get("QWEATHER_API_KEY", "").strip()
+# Accept host with or without scheme/trailing slash; normalise to bare host.
+_qw_host_raw = os.environ.get("QWEATHER_API_HOST", "").strip()
+_qw_host_raw = _qw_host_raw.replace("https://", "").replace("http://", "").rstrip("/")
+QWEATHER_API_HOST = _qw_host_raw
+QWEATHER_ENABLED = bool(QWEATHER_API_KEY and QWEATHER_API_HOST)
+QWEATHER_TIMEOUT = float(os.environ.get("TESLA_QWEATHER_TIMEOUT", "8"))
+
+# Map QWeather condition text (Chinese, returned in `text`) to a coarse bucket
+# used by efficiency analysis & trip-cost correction. QWeather also returns a
+# numeric `icon` code; we classify on the human text because it is stable and
+# self-documenting. Buckets: clear / cloudy / rain / snow / fog / wind / other.
+def _classify_weather(text: str | None) -> str:
+    """Bucket a QWeather condition string into clear/cloudy/rain/snow/fog/wind/other."""
+    if not text:
+        return "other"
+    t = str(text).lower()  # case-insensitive for English; Chinese unaffected
+    # Order matters: snow before rain (雨夹雪 → snow), specific before generic.
+    if any(k in t for k in ("雪", "霰", "snow", "sleet")):
+        return "snow"
+    if any(k in t for k in ("雨", "rain", "drizzle", "shower", "thunder", "雷")):
+        return "rain"
+    if any(k in t for k in ("雾", "霾", "fog", "haze", "mist", "沙", "尘", "dust", "sand")):
+        return "fog"
+    if any(k in t for k in ("风", "wind", "飑", "gale", "台风", "龙卷")):
+        return "wind"
+    if any(k in t for k in ("晴", "clear", "sunny")):
+        return "clear"
+    if any(k in t for k in ("云", "阴", "cloud", "overcast")):
+        return "cloudy"
+    return "other"
+
+
+# Energy-consumption correction factors by weather bucket (applied to baseline
+# Wh/km in trip_cost). Conservative, literature-informed multipliers:
+#   rain  +15% (rolling resistance + denser air + lights/wipers)
+#   snow  +30% (cold battery + cabin heater + traction losses)
+#   fog   +10% (lights + reduced regen confidence)
+#   wind  +12% (aero drag, headwind average)
+#   clear/cloudy/other: no weather penalty (temperature handled separately)
+WEATHER_ENERGY_FACTOR = {
+    "rain": 1.15,
+    "snow": 1.30,
+    "fog": 1.10,
+    "wind": 1.12,
+    "clear": 1.00,
+    "cloudy": 1.00,
+    "other": 1.00,
+}
 # Generic in-memory cache entry cap (PERF-2) before pruning expired/oldest.
 CACHE_MAX_ENTRIES = int(os.environ.get("TESLA_CACHE_MAX_ENTRIES", "500"))
 # Max look-back days accepted by date-range tools (ISSUE-1).
@@ -753,6 +829,158 @@ async def _amap_geocode(query: str) -> tuple[float, float, str] | None:
         name = query
     _log.info(f"[GEOCODE] AMAP hit '{query}' → GCJ({gcj_lat:.5f},{gcj_lon:.5f}) → WGS({wgs_lat:.5f},{wgs_lon:.5f})")
     return wgs_lat, wgs_lon, name
+
+
+# -- QWeather (和风天气) async helpers (v1.2.1) -------------------------------
+# All return None on any failure (disabled / network / parse / API error) so
+# callers degrade gracefully. QWeather accepts WGS-84 lon,lat for realtime.
+
+# Process-local LocationID cache: grid-snapped (lat,lon) → LocationID string.
+# Snapping to ~0.05° (~5km) means nearby drive midpoints reuse the same lookup,
+# keeping GeoAPI calls minimal. Bounded with simple eviction.
+_qw_locid_cache: dict[str, str] = {}
+_qw_locid_lock = threading.Lock()
+_QW_LOCID_GRID = 0.05  # ~5km snapping for LocationID reuse
+_QW_LOCID_MAX = 2000
+
+
+def _qw_url(path: str) -> str:
+    """Build a full QWeather URL on the account's dedicated host."""
+    return f"https://{QWEATHER_API_HOST}{path}"
+
+
+async def _qweather_now(lat: float, lon: float) -> dict | None:
+    """Real-time weather at a WGS-84 coordinate.
+
+    Returns a dict {temp, feelsLike, humidity, windDir, windScale, windSpeed,
+    precip, text, bucket, pressure, vis} or None.
+    """
+    if not QWEATHER_ENABLED:
+        return None
+    # QWeather expects "lon,lat" with <=2 decimals for the free tier.
+    loc = f"{lon:.2f},{lat:.2f}"
+    try:
+        async with httpx.AsyncClient(timeout=QWEATHER_TIMEOUT) as client:
+            resp = await client.get(
+                _qw_url("/v7/weather/now"),
+                params={"location": loc, "key": QWEATHER_API_KEY},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        _log.warning(f"[WEATHER] QWeather now failed for {loc}: {e}")
+        return None
+    if str(data.get("code")) != "200":
+        _log.warning(f"[WEATHER] QWeather now error for {loc}: code={data.get('code')}")
+        return None
+    now = data.get("now") or {}
+    if not now:
+        return None
+    text = now.get("text")
+    return {
+        "temp": now.get("temp"),
+        "feelsLike": now.get("feelsLike"),
+        "humidity": now.get("humidity"),
+        "windDir": now.get("windDir"),
+        "windScale": now.get("windScale"),
+        "windSpeed": now.get("windSpeed"),
+        "precip": now.get("precip"),
+        "pressure": now.get("pressure"),
+        "vis": now.get("vis"),
+        "text": text,
+        "bucket": _classify_weather(text),
+    }
+
+
+async def _qweather_locationid(lat: float, lon: float) -> str | None:
+    """Resolve a WGS-84 coordinate to the nearest QWeather LocationID (cached).
+
+    Historical weather requires a LocationID rather than raw coordinates.
+    """
+    if not QWEATHER_ENABLED:
+        return None
+    # Grid-snap for cache reuse.
+    gkey = f"{round(lat / _QW_LOCID_GRID) * _QW_LOCID_GRID:.3f},{round(lon / _QW_LOCID_GRID) * _QW_LOCID_GRID:.3f}"
+    with _qw_locid_lock:
+        hit = _qw_locid_cache.get(gkey)
+    if hit is not None:
+        return hit or None  # "" sentinel means "looked up, not found"
+    loc = f"{lon:.2f},{lat:.2f}"
+    location_id = ""
+    try:
+        async with httpx.AsyncClient(timeout=QWEATHER_TIMEOUT) as client:
+            resp = await client.get(
+                _qw_url("/geo/v2/city/lookup"),
+                params={"location": loc, "key": QWEATHER_API_KEY, "number": "1"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        if str(data.get("code")) == "200":
+            locs = data.get("location") or []
+            if locs:
+                location_id = str(locs[0].get("id") or "")
+    except (httpx.HTTPError, ValueError) as e:
+        _log.warning(f"[WEATHER] QWeather GeoAPI failed for {loc}: {e}")
+        return None  # transient: don't cache a failure
+    with _qw_locid_lock:
+        if len(_qw_locid_cache) >= _QW_LOCID_MAX:
+            # drop oldest insertion
+            _qw_locid_cache.pop(next(iter(_qw_locid_cache)), None)
+        _qw_locid_cache[gkey] = location_id  # cache "" to avoid re-looking-up misses
+    return location_id or None
+
+
+async def _qweather_historical(location_id: str, date_yyyymmdd: str) -> dict | None:
+    """Daily historical weather for a LocationID on a given date (YYYYMMDD).
+
+    Returns {tempMax, tempMin, humidity, precip, pressure, text, bucket} or None.
+    The daily summary lacks a condition text, so the bucket is derived from the
+    hourly samples (the most frequent non-clear bucket wins; precip>0 ⇒ rain).
+    """
+    if not QWEATHER_ENABLED or not location_id:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=QWEATHER_TIMEOUT) as client:
+            resp = await client.get(
+                _qw_url("/v7/historical/weather"),
+                params={"location": location_id, "date": date_yyyymmdd, "key": QWEATHER_API_KEY},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        _log.warning(f"[WEATHER] QWeather historical failed for {location_id}/{date_yyyymmdd}: {e}")
+        return None
+    if str(data.get("code")) != "200":
+        return None
+    daily = data.get("weatherDaily") or {}
+    if not daily:
+        return None
+    hourly = data.get("weatherHourly") or []
+    # Derive a condition bucket from hourly text (most severe wins).
+    severity = {"snow": 5, "rain": 4, "fog": 3, "wind": 2, "cloudy": 1, "clear": 0, "other": 0}
+    best_bucket = "clear"
+    best_sev = -1
+    rep_text = None
+    for h in hourly:
+        b = _classify_weather(h.get("text"))
+        s = severity.get(b, 0)
+        if s > best_sev:
+            best_sev, best_bucket, rep_text = s, b, h.get("text")
+    # Fallback: precipitation on the day implies at least rain.
+    try:
+        if best_bucket in ("clear", "cloudy", "other") and float(daily.get("precip") or 0) > 0.5:
+            best_bucket, rep_text = "rain", rep_text or "降水"
+    except (TypeError, ValueError):
+        pass
+    return {
+        "tempMax": daily.get("tempMax"),
+        "tempMin": daily.get("tempMin"),
+        "humidity": daily.get("humidity"),
+        "precip": daily.get("precip"),
+        "pressure": daily.get("pressure"),
+        "text": rep_text,
+        "bucket": best_bucket,
+    }
 
 
 # -- Result-level cache for slow aggregate tools --------------------------------
@@ -2766,13 +2994,30 @@ async def tesla_trip_cost(
           AND start_date >= NOW() - INTERVAL '30 days' AND distance > 0
     """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
 
+    # v1.2.1: optional weather correction at the destination. When QWeather is
+    # configured, fetch the destination's current weather and apply an energy
+    # multiplier (rain/snow/fog/wind raise consumption). Skipped entirely (factor
+    # = 1.0, no note) when weather is disabled or unavailable — zero impact on
+    # existing behaviour.
+    weather_factor = 1.0
+    weather_note = None
+    if QWEATHER_ENABLED:
+        dest_w = await _qweather_now(dest_lat, dest_lon)
+        if dest_w is not None:
+            weather_factor = WEATHER_ENERGY_FACTOR.get(dest_w.get("bucket"), 1.0)
+            if weather_factor > 1.0:
+                weather_note = (
+                    f"🌦️ Weather at {dest_name}: {dest_w.get('text') or dest_w.get('bucket')} "
+                    f"→ energy estimate adjusted +{round((weather_factor - 1) * 100)}%."
+                )
+
     if USE_METRIC_UNITS:
         wh_per_km = 180  # default Wh/km
         if eff and eff["km"] > 0:
             wh_per_km = round(eff["kwh"] * 1000 / eff["km"])
         road_km = round(straight_mi * 1.60934 * 1.3, 1)
         round_trip_km = round(road_km * 2, 1)
-        kwh_round = round(round_trip_km * wh_per_km / 1000, 1)
+        kwh_round = round(round_trip_km * wh_per_km / 1000 * weather_factor, 1)
         cost_round = round(kwh_round * ELECTRICITY_RATE_RMB, 2)
 
         bat = pos.get("battery_level", 0) or 0
@@ -2807,7 +3052,7 @@ async def tesla_trip_cost(
         if eff and eff["km"] > 0:
             wh_per_mi = round(eff["kwh"] * 1000 / (eff["km"] * 0.621371))
 
-        kwh_round = round(round_trip * wh_per_mi / 1000, 1)
+        kwh_round = round(round_trip * wh_per_mi / 1000 * weather_factor, 1)
         cost_round = round(kwh_round * ELECTRICITY_RATE, 2)
         gas_equiv = round(round_trip / _mpg * _gas, 2)
 
@@ -2838,6 +3083,97 @@ async def tesla_trip_cost(
                 lines.append(
                     f"Range: NOT sufficient -- charge to {pct_needed}%+ before departure"
                 )
+
+    if weather_note:
+        lines.append(f"\n{weather_note}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_weather(car_id: int | None = None) -> str:
+    """Current weather at the car's location (via QWeather 和风天气).
+
+    Uses the vehicle's latest GPS position to fetch real-time weather —
+    temperature, feels-like, humidity, wind, precipitation, visibility,
+    conditions. Complements TeslaMate's single `outside_temp` sensor.
+
+    Requires QWEATHER_API_KEY + QWEATHER_API_HOST env vars; otherwise returns
+    a friendly hint and changes nothing else.
+
+    Args:
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
+    """
+    _log.info("[TOOL] tesla_weather called")
+    if not QWEATHER_ENABLED:
+        return (
+            "❌ Weather is not configured. Set QWEATHER_API_KEY and "
+            "QWEATHER_API_HOST (e.g. xxxx.re.qweatherapi.com) to enable. "
+            "TeslaMate's outside_temp sensor is unaffected."
+        )
+    effective_car_id = car_id if car_id is not None else CAR_ID
+    pos = _query_one(
+        """
+        SELECT latitude, longitude, battery_level
+        FROM positions WHERE car_id = %s
+        ORDER BY id DESC LIMIT 1
+        """,
+        (effective_car_id,),
+    )
+    if not pos or pos.get("latitude") is None or pos.get("longitude") is None:
+        return "No current GPS position (vehicle may be asleep). Cannot fetch weather."
+
+    lat = float(pos["latitude"])
+    lon = float(pos["longitude"])
+    w = await _qweather_now(lat, lon)
+    if w is None:
+        return "❌ Weather service unavailable right now. Try again later."
+
+    # Units: QWeather returns metric (°C, km/h, mm). Convert for imperial display.
+    temp_c = w.get("temp")
+    feels_c = w.get("feelsLike")
+    bucket_emoji = {
+        "clear": "☀️", "cloudy": "⛅", "rain": "🌧️",
+        "snow": "❄️", "fog": "🌫️", "wind": "💨", "other": "🌡️",
+    }.get(w.get("bucket"), "🌡️")
+
+    lines = [f"**Current Weather** {bucket_emoji} {w.get('text') or ''}\n"]
+    if USE_METRIC_UNITS:
+        lines.append(f"Temperature: {temp_c}°C (feels {feels_c}°C)")
+        if w.get("windSpeed") is not None:
+            lines.append(f"Wind: {w.get('windDir') or ''} {w.get('windSpeed')} km/h (force {w.get('windScale')})")
+        if w.get("vis") is not None:
+            lines.append(f"Visibility: {w.get('vis')} km")
+    else:
+        def _c2f(c):
+            try:
+                return round(float(c) * 9 / 5 + 32)
+            except (TypeError, ValueError):
+                return c
+        lines.append(f"Temperature: {_c2f(temp_c)}°F (feels {_c2f(feels_c)}°F)")
+        if w.get("windSpeed") is not None:
+            try:
+                mph = round(float(w["windSpeed"]) * 0.621371)
+            except (TypeError, ValueError):
+                mph = w.get("windSpeed")
+            lines.append(f"Wind: {w.get('windDir') or ''} {mph} mph (force {w.get('windScale')})")
+        if w.get("vis") is not None:
+            try:
+                vis_mi = round(float(w["vis"]) * 0.621371, 1)
+            except (TypeError, ValueError):
+                vis_mi = w.get("vis")
+            lines.append(f"Visibility: {vis_mi} mi")
+    if w.get("humidity") is not None:
+        lines.append(f"Humidity: {w.get('humidity')}%")
+    if w.get("precip") is not None:
+        lines.append(f"Precipitation: {w.get('precip')} mm")
+    if w.get("pressure") is not None:
+        lines.append(f"Pressure: {w.get('pressure')} hPa")
+
+    # Driving impact hint based on the weather bucket.
+    factor = WEATHER_ENERGY_FACTOR.get(w.get("bucket"), 1.0)
+    if factor > 1.0:
+        lines.append(f"\n⚡ Expected energy use ~+{round((factor - 1) * 100)}% vs ideal due to {w.get('bucket')}.")
 
     return "\n".join(lines)
 
@@ -2926,6 +3262,180 @@ async def _efficiency_by_temp_compute(effective_car_id: int) -> str:
             )
 
     lines.append("\n*注：能耗基于续航差值估算，实际充电量可能更高。*")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def tesla_efficiency_by_weather(days: int = 90, car_id: int | None = None) -> str:
+    """Efficiency grouped by weather condition (via QWeather historical data).
+
+    Unlike tesla_efficiency_by_temp (which only buckets by outside_temp), this
+    back-fills each drive's *actual weather* (clear/rain/snow/fog/wind) from
+    QWeather's historical API and shows how conditions — not just temperature —
+    affect consumption. Same 5°C day can differ hugely: dry-clear vs rain/snow.
+
+    Method (no database writes):
+      1. Pull recent drives with start/end coords, time, and ideal-range delta.
+      2. For each drive use its midpoint coordinate + mid-time to resolve a
+         QWeather LocationID (cached) then daily historical weather (cached).
+      3. Bucket the drive by weather and aggregate kWh / distance per bucket.
+
+    To stay within API limits only the most recent drives are sampled
+    (TESLA_WEATHER_SAMPLE_MAX, default 60). Requires QWEATHER_API_KEY +
+    QWEATHER_API_HOST; otherwise returns a friendly hint.
+
+    Args:
+        days: Look-back window in days (default: 90)
+        car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
+    """
+    _log.info("[TOOL] tesla_efficiency_by_weather called")
+    if not QWEATHER_ENABLED:
+        return (
+            "❌ Weather analysis needs QWEATHER_API_KEY + QWEATHER_API_HOST "
+            "(e.g. xxxx.re.qweatherapi.com). Use tesla_efficiency_by_temp for "
+            "the temperature-only curve, which needs no weather API."
+        )
+    try:
+        days = _validate_days(days)
+    except ValueError as e:
+        return f"❌ {e}"
+    effective_car_id = car_id if car_id is not None else CAR_ID
+    # Cache the whole computed result 6h — historical weather never changes and
+    # the API calls are the expensive part.
+    return await _cached_result(
+        f"efw:{effective_car_id}:{days}",
+        ttl=21600,
+        fn=lambda: _efficiency_by_weather_compute(effective_car_id, days),
+    )
+
+
+async def _efficiency_by_weather_compute(effective_car_id: int, days: int) -> str:
+    sample_max = int(os.environ.get("TESLA_WEATHER_SAMPLE_MAX", "60"))
+    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    kwh_per_km = _get_car_config(effective_car_id)["kwh_per_km"]
+    rows = _query(
+        """
+        SELECT d.start_date,
+               GREATEST(d.start_ideal_range_km - d.end_ideal_range_km, 0) * %s AS kwh,
+               d.distance AS km,
+               sp.latitude  AS slat, sp.longitude AS slon,
+               ep.latitude  AS elat, ep.longitude AS elon
+        FROM drives d
+        LEFT JOIN positions sp ON sp.id = d.start_position_id
+        LEFT JOIN positions ep ON ep.id = d.end_position_id
+        WHERE d.car_id = %s AND d.distance > 1
+          AND (d.start_ideal_range_km - d.end_ideal_range_km) > 0
+          AND d.start_date >= %s
+        ORDER BY d.start_date DESC
+        LIMIT %s
+        """,
+        (kwh_per_km, effective_car_id, cutoff, sample_max),
+    )
+    if not rows:
+        return "Not enough driving data in this period for weather analysis."
+
+    # Aggregate per weather bucket.
+    buckets: dict[str, dict] = {}
+    sampled = 0
+    geocoded = 0
+    # Per-(locid,date) historical cache for this run (avoid repeat API calls).
+    hist_cache: dict[str, dict | None] = {}
+
+    for r in rows:
+        slat, slon = r.get("slat"), r.get("slon")
+        elat, elon = r.get("elat"), r.get("elon")
+        # Prefer a true midpoint; fall back to whichever endpoint exists.
+        pts = [(a, b) for a, b in ((slat, slon), (elat, elon)) if a is not None and b is not None]
+        if not pts:
+            continue
+        if len(pts) == 2:
+            mlat = (float(pts[0][0]) + float(pts[1][0])) / 2
+            mlon = (float(pts[0][1]) + float(pts[1][1])) / 2
+        else:
+            mlat, mlon = float(pts[0][0]), float(pts[0][1])
+
+        sd = r.get("start_date")
+        if sd is None:
+            continue
+        if isinstance(sd, str):
+            try:
+                sd = datetime.fromisoformat(sd)
+            except ValueError:
+                continue
+        date_str = sd.strftime("%Y%m%d")
+
+        loc_id = await _qweather_locationid(mlat, mlon)
+        if not loc_id:
+            continue
+        geocoded += 1
+        hkey = f"{loc_id}:{date_str}"
+        if hkey not in hist_cache:
+            hist_cache[hkey] = await _qweather_historical(loc_id, date_str)
+        hist = hist_cache[hkey]
+        if hist is None:
+            continue
+        bucket = hist.get("bucket") or "other"
+        sampled += 1
+
+        agg = buckets.setdefault(bucket, {"trips": 0, "km": 0.0, "kwh": 0.0})
+        agg["trips"] += 1
+        agg["km"] += float(r.get("km") or 0)
+        agg["kwh"] += float(r.get("kwh") or 0)
+
+    if not buckets:
+        return (
+            "Could not back-fill weather for the sampled drives "
+            "(no LocationID/historical match or API limit). Try a shorter period."
+        )
+
+    label = {
+        "clear": "☀️ Clear", "cloudy": "⛅ Cloudy", "rain": "🌧️ Rain",
+        "snow": "❄️ Snow", "fog": "🌫️ Fog/Haze", "wind": "💨 Windy", "other": "🌡️ Other",
+    }
+    # Order by severity (most impactful first), then by trips.
+    order = ["snow", "rain", "fog", "wind", "cloudy", "clear", "other"]
+    sorted_buckets = sorted(
+        buckets.items(),
+        key=lambda kv: (order.index(kv[0]) if kv[0] in order else 99),
+    )
+
+    unit_e = "Wh/km" if USE_METRIC_UNITS else "Wh/mi"
+    unit_d = "km" if USE_METRIC_UNITS else "Miles"
+    lines = ["**Efficiency by Weather** (QWeather historical)\n"]
+    lines.append(f"{'Condition':<14} {'Trips':>6} {unit_e:>8} {unit_d:>10}")
+    lines.append("-" * 42)
+    # Compute a clear-weather baseline for relative comparison.
+    baseline = None
+    rows_out = []
+    for bkt, agg in sorted_buckets:
+        km = agg["km"]
+        kwh = agg["kwh"]
+        if USE_METRIC_UNITS:
+            dist = km
+            wh = round(kwh * 1000 / km) if km > 0 else 0
+        else:
+            dist = km * 0.621371
+            wh = round(kwh * 1000 / dist) if dist > 0 else 0
+        rows_out.append((bkt, agg["trips"], wh, dist))
+        if bkt == "clear" and wh > 0:
+            baseline = wh
+    for bkt, trips, wh, dist in rows_out:
+        lines.append(f"{label.get(bkt, bkt):<14} {trips:>6} {wh:>7} {round(dist):>9,}")
+
+    if baseline:
+        deltas = []
+        for bkt, trips, wh, dist in rows_out:
+            if bkt != "clear" and wh > 0:
+                pct = round((wh - baseline) / baseline * 100)
+                if pct != 0:
+                    deltas.append(f"{label.get(bkt, bkt).split()[0]} {'+' if pct > 0 else ''}{pct}%")
+        if deltas:
+            lines.append("\nvs clear: " + ", ".join(deltas))
+
+    lines.append(
+        f"\n*采样 {sampled} 段行程（最多 {sample_max}）；能耗基于续航差值估算。"
+        f"天气来自和风历史数据，按行程中点坐标+日期回填。*"
+    )
     return "\n".join(lines)
 
 
