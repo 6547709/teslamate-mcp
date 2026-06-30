@@ -259,6 +259,31 @@ def test_unit():
     check("classify leisure", tesla._classify_trip("home", "中央公园", 10) == "leisure")
     check("classify other", tesla._classify_trip("x", "y", 5) == "other")
 
+    # v1.2.0: GCJ-02 → WGS-84 conversion (AMAP geocoding)
+    # Tiananmen Square: GCJ(39.90919,116.39746) should map to WGS ≈ (39.9078,116.3912).
+    wgs_lat, wgs_lon = tesla.gcj02_to_wgs84(39.90919, 116.39746)
+    check(
+        "v1.2.0 gcj02_to_wgs84 Beijing within ~50m",
+        abs(wgs_lat - 39.9078) < 0.0008 and abs(wgs_lon - 116.3912) < 0.0008,
+    )
+    # Outside mainland China: transform must be a no-op (GCJ == WGS).
+    us_lat, us_lon = tesla.gcj02_to_wgs84(33.749, -84.388)  # Atlanta, GA
+    check(
+        "v1.2.0 gcj02_to_wgs84 out-of-china passthrough",
+        us_lat == 33.749 and us_lon == -84.388,
+    )
+    check("v1.2.0 _gcj02_out_of_china US=True", tesla._gcj02_out_of_china(33.749, -84.388) is True)
+    check("v1.2.0 _gcj02_out_of_china Beijing=False", tesla._gcj02_out_of_china(39.9, 116.4) is False)
+    # No AMAP key in test env ⇒ AMAP disabled and _amap_geocode returns None
+    # (transparent fallback to Nominatim, zero impact on existing users).
+    saved_enabled = tesla.AMAP_GEOCODE_ENABLED
+    tesla.AMAP_GEOCODE_ENABLED = False
+    check(
+        "v1.2.0 _amap_geocode disabled → None",
+        asyncio.run(tesla._amap_geocode("北京天安门")) is None,
+    )
+    tesla.AMAP_GEOCODE_ENABLED = saved_enabled
+
 
 # =====================================================================
 # Layer 2 — smoke-call every MCP tool

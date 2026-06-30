@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-30
+
+Geocoding accuracy release — **0 database changes**. Adds optional AMAP (高德地图) as a higher-priority geocoding source for Chinese addresses, with built-in GCJ-02 → WGS-84 coordinate conversion. Fully backward compatible: when `AMAP_API_KEY` is unset the behaviour is identical to before (Nominatim only).
+
+### Added
+
+- **AMAP (高德) geocoding** for `tesla_trip_cost`. New fallback chain after the
+  local addresses table and file cache: **AMAP → Nominatim**. AMAP gives far
+  better accuracy for Chinese place names (e.g. "腾讯滨海大厦", "万达广场").
+- **`gcj02_to_wgs84()` coordinate conversion** (community-standard transform,
+  ~1-2 m accuracy). AMAP returns GCJ-02 ("Mars") coordinates while TeslaMate
+  stores WGS-84; every AMAP result is converted back to WGS-84 before caching
+  and distance math, eliminating the 50-500 m systematic offset.
+- New env vars: `AMAP_API_KEY` (enable AMAP), `TESLA_AMAP_TIMEOUT` (default 8s).
+
+### Notes
+
+- **Graceful degradation**: no key, network error, rate limit, or no-match →
+  `_amap_geocode()` returns `None` and the tool transparently falls back to
+  Nominatim. Existing deployments are unaffected.
+- **Coordinate safety**: outside mainland China GCJ-02 == WGS-84, so the
+  transform is a no-op there (verified for US coordinates).
+- AMAP results share the existing bounded persistent geocode cache (LRU,
+  default 1000 entries), so repeat lookups stay free.
+
 ## [1.1.1] - 2026-06-26
 
 Application-layer hardening & performance release — **0 database changes**. Fixes one cross-tool inconsistency bug, adds input validation, bounded caches, and pushes trip classification into SQL. All 36 tools validated by a new no-database test harness (57/57 assertions passed).

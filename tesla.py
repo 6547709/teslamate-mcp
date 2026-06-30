@@ -76,6 +76,13 @@ Environment variables:
 
   # Units (metric)
   USE_METRIC_UNITS       -- Set "true" for km, degC, kWh/100km, RMB (default: false/imperial)
+
+  # Geocoding (optional, v1.2.0)
+  AMAP_API_KEY           -- 高德地图 Web服务 Key. When set, trip_cost geocoding
+                            prefers AMAP (high accuracy for Chinese addresses,
+                            GCJ-02→WGS-84 converted) before Nominatim fallback.
+                            Unset = behave exactly as before (Nominatim only).
+  TESLA_AMAP_TIMEOUT     -- AMAP request timeout seconds (default: 8)
 """
 
 from __future__ import annotations
@@ -99,7 +106,7 @@ import atexit
 # Source of truth for this release. Bump this constant when tagging a new
 # release. Overridable at runtime via env (Docker build-arg) or git describe
 # for development checkouts.
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 
 def _detect_version() -> str:
@@ -268,6 +275,21 @@ TRIP_COST_MIN_QUERY_LEN = 2
 # ISSUE-4: cap the persistent geocode cache so the on-disk JSON cannot grow
 # without bound (each miss rewrites the whole file).
 GEOCODE_CACHE_MAX_ENTRIES = int(os.environ.get("TESLA_GEOCODE_CACHE_MAX", "1000"))
+
+# -- AMAP (高德地图) geocoding (v1.2.0) ---------------------------------------
+# Optional higher-accuracy geocoding source for Chinese addresses, tried BEFORE
+# the international Nominatim fallback. When AMAP_API_KEY is unset the whole
+# AMAP path is skipped, so existing deployments behave exactly as before.
+#
+# IMPORTANT — coordinate systems:
+#   * TeslaMate stores raw GPS coordinates in WGS-84.
+#   * AMAP returns GCJ-02 ("Mars") coordinates, offset ~50-500m from WGS-84.
+# We therefore convert every AMAP result back to WGS-84 (gcj02_to_wgs84) before
+# caching / distance math, otherwise the Haversine distance would be wrong.
+AMAP_API_KEY = os.environ.get("AMAP_API_KEY", "").strip()
+AMAP_GEOCODE_ENABLED = bool(AMAP_API_KEY)
+AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
+AMAP_TIMEOUT = float(os.environ.get("TESLA_AMAP_TIMEOUT", "8"))
 # Generic in-memory cache entry cap (PERF-2) before pruning expired/oldest.
 CACHE_MAX_ENTRIES = int(os.environ.get("TESLA_CACHE_MAX_ENTRIES", "500"))
 # Max look-back days accepted by date-range tools (ISSUE-1).
@@ -623,6 +645,114 @@ def _geocode_cache_put(query: str, lat: float, lon: float, name: str) -> None:
             )
         except OSError as e:
             _log.warning(f"[CACHE] geocode cache save failed: {e}")
+
+
+# -- AMAP geocoding: coordinate conversion + lookup (v1.2.0) -------------------
+# China's published map data uses the GCJ-02 datum, an intentional obfuscation
+# of WGS-84. AMAP returns GCJ-02; TeslaMate stores WGS-84. Converting back is
+# required for correct distance math. The transform below is the de-facto
+# community implementation (accurate to ~1-2m, well within geocoding error).
+_GCJ_A = 6378245.0            # semi-major axis of the Krasovsky 1940 ellipsoid
+_GCJ_EE = 0.00669342162296594323  # eccentricity squared
+
+
+def _gcj02_out_of_china(lat: float, lon: float) -> bool:
+    """GCJ-02 offset only applies inside mainland China; outside, GCJ == WGS."""
+    return not (72.004 <= lon <= 137.8347 and 0.8293 <= lat <= 55.8271)
+
+
+def _gcj02_transform_lat(x: float, y: float) -> float:
+    ret = (
+        -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y
+        + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    )
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _gcj02_transform_lon(x: float, y: float) -> float:
+    ret = (
+        300.0 + x + 2.0 * y + 0.1 * x * x
+        + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    )
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
+def gcj02_to_wgs84(gcj_lat: float, gcj_lon: float) -> tuple[float, float]:
+    """Convert a GCJ-02 (AMAP/Mars) coordinate to WGS-84 (raw GPS).
+
+    Returns (wgs_lat, wgs_lon). Outside mainland China the input is returned
+    unchanged (no GCJ offset is applied there).
+    """
+    if _gcj02_out_of_china(gcj_lat, gcj_lon):
+        return gcj_lat, gcj_lon
+    dlat = _gcj02_transform_lat(gcj_lon - 105.0, gcj_lat - 35.0)
+    dlon = _gcj02_transform_lon(gcj_lon - 105.0, gcj_lat - 35.0)
+    rad_lat = gcj_lat / 180.0 * math.pi
+    magic = math.sin(rad_lat)
+    magic = 1 - _GCJ_EE * magic * magic
+    sqrt_magic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((_GCJ_A * (1 - _GCJ_EE)) / (magic * sqrt_magic) * math.pi)
+    dlon = (dlon * 180.0) / (_GCJ_A / sqrt_magic * math.cos(rad_lat) * math.pi)
+    # GCJ = WGS + delta  ⇒  WGS = GCJ - delta
+    return gcj_lat - dlat, gcj_lon - dlon
+
+
+async def _amap_geocode(query: str) -> tuple[float, float, str] | None:
+    """Geocode an address via AMAP (高德). Returns (wgs_lat, wgs_lon, name) or None.
+
+    - Returns None when AMAP is disabled (no key), on any network/parse error,
+      or when AMAP finds no match, so callers can transparently fall back to
+      Nominatim.
+    - The returned coordinate is already converted to WGS-84 to match TeslaMate.
+    """
+    if not AMAP_GEOCODE_ENABLED:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=AMAP_TIMEOUT) as client:
+            resp = await client.get(
+                AMAP_GEOCODE_URL,
+                params={"key": AMAP_API_KEY, "address": query, "output": "json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        _log.warning(f"[GEOCODE] AMAP request failed for '{query}': {e}")
+        return None
+
+    # AMAP success response: status == "1" and geocodes is a non-empty list.
+    if str(data.get("status")) != "1":
+        _log.warning(f"[GEOCODE] AMAP error for '{query}': {data.get('info')}")
+        return None
+    geocodes = data.get("geocodes") or []
+    if not geocodes:
+        return None
+    first = geocodes[0]
+    location = (first.get("location") or "").strip()  # "lon,lat" in GCJ-02
+    if "," not in location:
+        return None
+    try:
+        gcj_lon_str, gcj_lat_str = location.split(",", 1)
+        gcj_lon, gcj_lat = float(gcj_lon_str), float(gcj_lat_str)
+    except ValueError:
+        return None
+    wgs_lat, wgs_lon = gcj02_to_wgs84(gcj_lat, gcj_lon)
+    name = (
+        first.get("formatted_address")
+        or first.get("district")
+        or query
+    )
+    if isinstance(name, str):
+        name = name.split(",")[0].strip()
+    else:
+        name = query
+    _log.info(f"[GEOCODE] AMAP hit '{query}' → GCJ({gcj_lat:.5f},{gcj_lon:.5f}) → WGS({wgs_lat:.5f},{wgs_lon:.5f})")
+    return wgs_lat, wgs_lon, name
 
 
 # -- Result-level cache for slow aggregate tools --------------------------------
@@ -2563,40 +2693,48 @@ async def tesla_trip_cost(
         dest_name = full_label.split(",")[0].strip()
         _log.info(f"[PERF] trip_cost: addresses cache hit for '{destination}' → ({dest_lat:.4f}, {dest_lon:.4f})")
     else:
-        # PERF #2: persistent Nominatim cache (cross-process, ~/.cache/teslamate-mcp/geocode.json).
+        # PERF #2: persistent geocode cache (cross-process, ~/.cache/teslamate-mcp/geocode.json).
         cached = _geocode_cache_get(destination)
         if cached is not None:
             dest_lat, dest_lon, dest_name = cached
-            _log.info(f"[PERF] trip_cost: nominatim file-cache hit for '{destination}'")
+            _log.info(f"[PERF] trip_cost: geocode file-cache hit for '{destination}'")
         else:
-            # #7: Nominatim requires a valid User-Agent with contact info (https://operations.osmfoundation.org/policies/nominatim/)
-            # Wrap the request in try/except so network/service failures don't crash the tool.
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        "https://nominatim.openstreetmap.org/search",
-                        params={"q": destination, "format": "json", "limit": "1"},
-                        headers={
-                            "User-Agent": "teslamate-mcp/1.0 (https://github.com/6547709/teslamate-mcp)"
-                        },
-                    )
-                    resp.raise_for_status()
-                    results = resp.json()
-            except httpx.TimeoutException:
-                return f"❌ Geocoding timeout for '{destination}'. Try again later."
-            except httpx.HTTPError as e:
-                return f"❌ Geocoding service error: {e}. Try again later."
-            except (ValueError, KeyError):
-                return f"❌ Geocoding service returned invalid response for '{destination}'."
+            # v1.2.0: geocoding fallback chain after cache miss:
+            #   3) AMAP (高德) — high accuracy for Chinese addresses, skipped if no key
+            #   4) Nominatim   — international fallback (always available)
+            amap_hit = await _amap_geocode(destination)
+            if amap_hit is not None:
+                dest_lat, dest_lon, dest_name = amap_hit
+                _geocode_cache_put(destination, dest_lat, dest_lon, dest_name)
+            else:
+                # #7: Nominatim requires a valid User-Agent with contact info (https://operations.osmfoundation.org/policies/nominatim/)
+                # Wrap the request in try/except so network/service failures don't crash the tool.
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.get(
+                            "https://nominatim.openstreetmap.org/search",
+                            params={"q": destination, "format": "json", "limit": "1"},
+                            headers={
+                                "User-Agent": "teslamate-mcp/1.0 (https://github.com/6547709/teslamate-mcp)"
+                            },
+                        )
+                        resp.raise_for_status()
+                        results = resp.json()
+                except httpx.TimeoutException:
+                    return f"❌ Geocoding timeout for '{destination}'. Try again later."
+                except httpx.HTTPError as e:
+                    return f"❌ Geocoding service error: {e}. Try again later."
+                except (ValueError, KeyError):
+                    return f"❌ Geocoding service returned invalid response for '{destination}'."
 
-            if not results:
-                return f"Could not geocode '{destination}'."
+                if not results:
+                    return f"Could not geocode '{destination}'."
 
-            dest_lat = float(results[0]["lat"])
-            dest_lon = float(results[0]["lon"])
-            dest_name = results[0].get("display_name", destination).split(",")[0]
-            # Persist for next time (cross-process cache).
-            _geocode_cache_put(destination, dest_lat, dest_lon, dest_name)
+                dest_lat = float(results[0]["lat"])
+                dest_lon = float(results[0]["lon"])
+                dest_name = results[0].get("display_name", destination).split(",")[0]
+                # Persist for next time (cross-process cache).
+                _geocode_cache_put(destination, dest_lat, dest_lon, dest_name)
 
     pos = _query_one("""
         SELECT latitude, longitude, battery_level
