@@ -38,5 +38,29 @@ services:
       # - TESLA_LIMIT_BATTERY_HEALTH=24
       # - TESLA_LIMIT_STATE_HISTORY=100
       # - TESLA_LIMIT_VAMPIRE_DRAIN=20
+
+      # ============================================================
+      # 第三方 API（可选）/ Third-party APIs (optional)
+      # ⚠️ 下面的 Key 和 Host 都是占位符，必须替换成你自己申请的！
+      # ⚠️ The Key/Host below are PLACEHOLDERS — replace with YOUR OWN!
+      #    不填写则对应功能自动关闭，其余功能不受影响。
+      #    Leave unset to silently disable the feature; everything else still works.
+      # ============================================================
+
+      # --- 高德地图 / AMAP geocoding（中文地址精度更高 / better Chinese-address accuracy）---
+      # 申请 / Apply: https://lbs.amap.com → 创建应用 → 选「Web服务」类型的 Key
+      #   (Console → Create app → generate a "Web服务 / Web Service" key)
+      # - AMAP_API_KEY=xxx***            # 你的高德 Web服务 Key / your AMAP Web-Service key
+      # - TESLA_AMAP_TIMEOUT=8           # 可选 / optional, request timeout in seconds
+
+      # --- 和风天气 / QWeather（天气增强 / weather enrichment）---
+      # 申请 / Apply: https://dev.qweather.com → 控制台 → 创建项目获取 API Key
+      #   和你账号专属的 API Host（形如 xxxx.re.qweatherapi.com）
+      #   (Console → create a project → get the API Key AND your account's dedicated API Host,
+      #    e.g. xxxx.re.qweatherapi.com — the legacy public devapi/api.qweather.com returns 403)
+      # - QWEATHER_API_KEY=xxx***                  # 你的和风天气 API Key / your QWeather API key
+      # - QWEATHER_API_HOST=xxx***.re.qweatherapi.com   # 你的专属 Host / your dedicated host
+      # - TESLA_QWEATHER_TIMEOUT=8                  # 可选 / optional, request timeout in seconds
+      # - TESLA_WEATHER_SAMPLE_MAX=60              # 可选 / optional, drives sampled by weather efficiency
     depends_on:
       - database
