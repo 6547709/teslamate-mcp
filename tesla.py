@@ -561,8 +561,10 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
             return [dict(row) for row in cur.fetchall()]
     except Exception as e:
         _log.error(f"Query failed: {e} | SQL: {sql[:200]}... | Params: {params}")
-        if conn is not None:
-            conn.rollback()
+        # P0-3: connections run in autocommit mode (see _get_conn), so there is
+        # no open transaction to roll back. Calling rollback() here is a no-op
+        # at best and can raise on some psycopg2 versions, masking the original
+        # error. We simply re-raise the real exception.
         raise
     finally:
         if conn is not None:
@@ -580,8 +582,7 @@ def _query_one(sql: str, params: tuple = ()) -> dict | None:
             return dict(row) if row else None
     except Exception as e:
         _log.error(f"Query failed: {e} | SQL: {sql[:200]}... | Params: {params}")
-        if conn is not None:
-            conn.rollback()
+        # P0-3: autocommit mode — no transaction to roll back; re-raise cleanly.
         raise
     finally:
         if conn is not None:
@@ -702,9 +703,12 @@ def _geocode_cache_put(query: str, lat: float, lon: float, name: str) -> None:
     Python dicts preserve insertion order, so re-inserting an existing key keeps
     its old position; we delete-then-insert to refresh recency on overwrite.
     """
-    cache = _geocode_cache_load()
+    # P0-1: keep the whole load→mutate→persist sequence inside the lock so a
+    # concurrent reader/writer can never see or serialize a half-updated dict.
+    _geocode_cache_load()  # ensure loaded (also guarded by the same lock)
     key = query.strip().lower()
     with _geocode_cache_lock:
+        cache = _geocode_cache
         # Refresh recency: move/insert key to the end of insertion order.
         if key in cache:
             del cache[key]
@@ -713,14 +717,24 @@ def _geocode_cache_put(query: str, lat: float, lon: float, name: str) -> None:
         while len(cache) > GEOCODE_CACHE_MAX_ENTRIES:
             oldest_key = next(iter(cache))
             del cache[oldest_key]
+        # P0-1: atomic write — serialize to a temp file in the same directory
+        # then os.replace() (atomic rename on POSIX/Windows). A crash or a
+        # concurrent write can never leave a truncated/partial JSON on disk.
+        tmp_path = _GEOCODE_CACHE_FILE.with_suffix(
+            _GEOCODE_CACHE_FILE.suffix + f".tmp.{os.getpid()}"
+        )
         try:
             _GEOCODE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _GEOCODE_CACHE_FILE.write_text(
-                json.dumps(cache, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            payload = json.dumps(cache, ensure_ascii=False, indent=2)
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, _GEOCODE_CACHE_FILE)
         except OSError as e:
             _log.warning(f"[CACHE] geocode cache save failed: {e}")
+            # Best-effort cleanup of a stray temp file.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # -- AMAP geocoding: coordinate conversion + lookup (v1.2.0) -------------------
@@ -2951,7 +2965,11 @@ async def tesla_trip_cost(
                 except httpx.TimeoutException:
                     return f"❌ Geocoding timeout for '{destination}'. Try again later."
                 except httpx.HTTPError as e:
-                    return f"❌ Geocoding service error: {e}. Try again later."
+                    # P1-1: log the raw error, but return a generic message so we
+                    # never echo internal request details back to the caller
+                    # (keeps parity with the AMAP/QWeather helpers).
+                    _log.warning(f"[GEOCODE] Nominatim request failed for '{destination}': {e}")
+                    return f"❌ Geocoding service error for '{destination}'. Try again later."
                 except (ValueError, KeyError):
                     return f"❌ Geocoding service returned invalid response for '{destination}'."
 

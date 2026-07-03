@@ -176,6 +176,10 @@ def _fake_query_one(sql: str, params: tuple = ()):
     return None
 
 
+# Preserve the REAL _query implementation before patching, so the Layer 4
+# regression test can exercise the genuine error-handling branch (P0-3).
+_REAL_QUERY = tesla._query
+
 # Install fakes
 tesla._query = _fake_query
 tesla._query_one = _fake_query_one
@@ -389,10 +393,111 @@ async def test_error_paths():
     check("monthly_summary 0 → error", r.startswith("❌"))
 
 
+# =====================================================================
+# Layer 4 — regression tests for the v1.2.1 code-review fixes
+#   P0-1: geocode file-cache atomic write + lock-held load/mutate/persist
+#   P0-3: no rollback() on autocommit connections (error re-raised cleanly)
+# =====================================================================
+
+def test_review_fixes():
+    print("\n[Layer 4] Code-review regression tests (P0-1 / P0-3)")
+    import json as _json
+    import tempfile
+    import threading
+    import pathlib
+
+    # ---- P0-1: concurrent geocode-cache writes never corrupt the JSON ----
+    tmpdir = pathlib.Path(tempfile.mkdtemp(prefix="tesla_cache_test_"))
+    orig_file = tesla._GEOCODE_CACHE_FILE
+    orig_cache = tesla._geocode_cache
+    orig_loaded = tesla._geocode_cache_loaded
+    try:
+        tesla._GEOCODE_CACHE_FILE = tmpdir / "geocode.json"
+        tesla._geocode_cache = {}
+        tesla._geocode_cache_loaded = True  # skip disk load; start empty
+
+        errors: list[str] = []
+
+        def _writer(n: int):
+            try:
+                for i in range(40):
+                    tesla._geocode_cache_put(f"addr-{n}-{i}", 39.9 + i * 1e-4,
+                                             116.4 + i * 1e-4, f"place {n}-{i}")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=_writer, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        check("P0-1 concurrent writes raised nothing", not errors, "; ".join(errors))
+
+        # File must exist and be valid JSON (never truncated/partial).
+        raw = tesla._GEOCODE_CACHE_FILE.read_text(encoding="utf-8")
+        parsed = None
+        try:
+            parsed = _json.loads(raw)
+        except Exception as e:  # noqa: BLE001
+            check("P0-1 on-disk cache is valid JSON", False, str(e))
+        if parsed is not None:
+            check("P0-1 on-disk cache is valid JSON", True)
+            # Bounded by the cap (no unbounded growth).
+            check("P0-1 cache within cap",
+                  len(parsed) <= tesla.GEOCODE_CACHE_MAX_ENTRIES,
+                  f"{len(parsed)} > {tesla.GEOCODE_CACHE_MAX_ENTRIES}")
+            # No leftover temp files in the dir.
+            leftovers = list(tmpdir.glob("*.tmp.*"))
+            check("P0-1 no leftover temp files", not leftovers,
+                  ", ".join(p.name for p in leftovers))
+    finally:
+        tesla._GEOCODE_CACHE_FILE = orig_file
+        tesla._geocode_cache = orig_cache
+        tesla._geocode_cache_loaded = orig_loaded
+
+    # ---- P0-3: a failing query re-raises the ORIGINAL error, no rollback ----
+    # Temporarily point _get_conn at a fake conn whose cursor raises; assert the
+    # original error propagates and rollback() is never invoked.
+    class _FakeCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **k):
+            raise RuntimeError("boom-original")
+        def fetchall(self): return []
+        def fetchone(self): return None
+
+    class _FakeConn:
+        def __init__(self): self.rollback_called = False
+        def cursor(self): return _FakeCursor()
+        def rollback(self): self.rollback_called = True
+
+    fake = _FakeConn()
+    orig_get = tesla._get_conn
+    orig_put = tesla._put_conn
+    try:
+        tesla._get_conn = lambda: fake
+        tesla._put_conn = lambda conn: None
+        raised = None
+        try:
+            _REAL_QUERY("SELECT 1")  # the genuine implementation, not the fake
+        except Exception as e:  # noqa: BLE001
+            raised = e
+        check("P0-3 original error re-raised",
+              isinstance(raised, RuntimeError) and "boom-original" in str(raised),
+              repr(raised))
+        check("P0-3 rollback() never called on autocommit conn",
+              fake.rollback_called is False)
+    finally:
+        tesla._get_conn = orig_get
+        tesla._put_conn = orig_put
+
+
 def main():
     test_unit()
     asyncio.run(test_tools())
     asyncio.run(test_error_paths())
+    test_review_fixes()
     print("\n" + "=" * 60)
     print(f"RESULT: {PASS} passed, {FAIL} failed")
     if FAILURES:
