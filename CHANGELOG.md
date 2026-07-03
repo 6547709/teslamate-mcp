@@ -1,62 +1,81 @@
-# Changelog
+# 更新日志 / Changelog
 
-All notable changes to this project will be documented in this file.
+> **语言 / Language**: 默认中文（Default: 中文）。每个版本条目先列中文，再列英文。
+> Each release entry lists **中文 first, English second**. 历史版本（v1.2.2 及之前）仅英文，v1.2.3 起转为双语。
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+所有重要变更都会记录在此文件。
+
+格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。
+
+All notable changes are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.2.3] - 2026-07-03
 
-Energy-categorisation release — **0 database changes**. Splits the previously entangled power-consumption metric into three independent categories so they are computed from their primary sources, displayed side-by-side, and never mixed in calculations. Also adds a "camping mode" detector on vampire drain.
+### 中文
 
-### Added
+能耗分类大版本 —— **0 项数据库改动**。把原本纠缠在一起的功耗指标拆分成**三种独立类别**（行驶 / 充电 / 停车），各自从原始数据源独立计算、并列展示、永不混入运算。同时新增 **露营模式** 检测。
 
-- **Camping mode flag in `tesla_vampire_drain`** — parked periods averaging more
-  than `TESLA_CAMPING_KWH_PER_DAY` (default 10) kWh/day of battery loss are
-  tagged `🏕️ 露营模式` (active use: A/C while sleeping, heavy sentry, third-party
-  polling — not idle drain). Camping events always receive parking-location
-  weather regardless of drain rank, so the cause is visible at a glance.
-- **Three independent kWh columns in `tesla_monthly_summary`** — Drive kWh
-  (range-drop estimate), Charge kWh (sessions), Vampire kWh (parked drain),
-  each aggregated from its primary table. `Wh/km` now uses driving kWh only
-  and is never contaminated by charging losses or vampire drain.
-- **Three energy lines in `tesla_monthly_report`** — Driving / Charging /
-  Vampire energy shown separately, each with its own prev-month delta in the
-  comparison line.
+#### 新增
 
-### Changed
+- **`tesla_vampire_drain` 露营模式标记** —— 停车期间平均每日耗电超过 `TESLA_CAMPING_KWH_PER_DAY`（默认 **10**）kWh/day 的事件自动标记为 `🏕️ 露营模式`（多半是睡眠开空调、哨兵模式狂写、第三方 app 频繁唤醒 —— 不是单纯闲置漏电）。所有露营事件**保证附带停车点天气**，根因一眼可见。
+- **`tesla_monthly_summary` 三列分立** —— 新增 `Drive kWh`（行驶，续航差值估算）/ `Charge kWh`（充电，会话汇总）/ `Vampire kWh`（停车，事件表聚合）三列独立展示。`Wh/km` **只用行驶 kWh**，不再被充电损耗和停车耗电污染。
+- **`tesla_monthly_report` 三种能量分开** —— 行驶 / 充电 / 停车耗电各自一行，与上月对比也按类别分别给出 delta。
 
-- `tesla_efficiency` weekly output now labels the two metrics as
-  `行驶 X kWh` (driving) and `充电 Y kWh` (charging) instead of
-  `估算 / 实际充电`, and the top-of-output note states they are
-  independent metrics — never mixed.
-- `tesla_vampire_drain` docstring updated to describe the camping-mode
-  behaviour and the parking-weather guarantee for camping events.
+#### 变更
 
-### Bug fixes
+- `tesla_efficiency` 周报标签改清楚 —— `估算 X kWh` → `行驶 X kWh`，`实际充电 Y kWh` → `充电 Y kWh`，顶部加注 "Two independent metrics — never mixed"。
+- `tesla_vampire_drain` 文档说明露营模式行为以及天气保证。
+- `tesla_trip_cost` 继续 v1.2.3 行为：天气只在输出末尾 `🌦️ Current weather` 段呈现，**绝不参与 cost 公式**。
 
-- `tesla_vampire_drain` weather-fetch targets list crashed with
-  `TypeError: unhashable type: 'dict'` when more than one event qualified
-  (top-N or camping). Replaced `dict.fromkeys(...)` (which hashes by value)
-  with explicit `id(r)`-keyed dedup, keeping first-seen order. Two regression
-  tests added so this path is covered.
+#### Bug 修复
 
-### Testing
+- `tesla_vampire_drain` 多事件路径下 `dict.fromkeys(...)` 抛 `TypeError: unhashable type: \'dict\'` —— 改为基于 `id(r)` 的显式去重，保留首次出现顺序。
 
-- `test_all.py` **110 passed / 0 failed** (was 92). New: 8 camping-mode tests
-  (default threshold, high/low drain, disabled, multi-row + weather grid
-  dedup), 7 three-category separation tests (column presence, value presence,
-  Wh/km purity), and the two regression tests mentioned above.
+#### 测试
 
-### Notes
+- `test_all.py` **110 通过 / 0 失败**（was 92）。新增 8 个露营模式用例 + 7 个三类分立用例 + 2 个 `dict.fromkeys` 回归用例。
 
-- Database access remains strictly read-only. All three categories are
-  computed from existing `drives` / `charging_processes` / `positions` tables
-  via a `LEAD()`-based events CTE — no schema changes, no writes.
-- Configuration knobs added: `TESLA_CAMPING_KWH_PER_DAY` (default 10; set
-  ≤ 0 to disable). Existing `VAMPIRE_WEATHER_MAX` now also covers camping
-  events.
+#### 配置
 
+- 新增 `TESLA_CAMPING_KWH_PER_DAY`（默认 `10`；设 ≤ 0 关闭）。现有 `TESLA_VAMPIRE_WEATHER_MAX` 现在也覆盖露营事件。
+
+#### 备注
+
+- 数据库访问**仍然只读**。三种 kWh 全部由现有 `drives` / `charging_processes` / `positions` 表通过 `LEAD()` 事件 CTE 聚合 —— 无 schema 变更、无写入。
+
+---
+
+### English
+
+Energy-categorisation release — **0 database changes**. Splits the previously entangled power-consumption metric into **three independent categories** so each is computed from its primary source, displayed side-by-side, and never mixed in calculations. Also adds a "camping mode" detector on vampire drain.
+
+#### Added
+
+- **Camping mode flag in `tesla_vampire_drain`** — parked periods averaging more than `TESLA_CAMPING_KWH_PER_DAY` (default **10**) kWh/day of battery loss are tagged `🏕️ 露营模式` (active use: A/C while sleeping, heavy sentry, third-party polling — not idle drain). Camping events always receive parking-location weather regardless of drain rank, so the cause is visible at a glance.
+- **Three independent kWh columns in `tesla_monthly_summary`** — `Drive kWh` (range-drop estimate), `Charge kWh` (sessions), `Vampire kWh` (parked drain), each aggregated from its primary table. `Wh/km` now uses **driving kWh only** and is never contaminated by charging losses or vampire drain.
+- **Three energy lines in `tesla_monthly_report`** — Driving / Charging / Vampire energy each on its own line, with per-category prev-month delta in the comparison line.
+
+#### Changed
+
+- `tesla_efficiency` weekly output relabels `估算 X kWh` → `行驶 X kWh` and `实际充电 Y kWh` → `充电 Y kWh`, with top-of-output note "Two independent metrics — never mixed".
+- `tesla_vampire_drain` docstring updated to describe camping-mode behaviour and the parking-weather guarantee for camping events.
+- `tesla_trip_cost` retains the v1.2.3 behaviour: weather shown only at the end as a `🌦️ Current weather` block; **never participates in the cost formula**.
+
+#### Bug fixes
+
+- `tesla_vampire_drain` weather-fetch targets list crashed with `TypeError: unhashable type: \'dict\'` when more than one event qualified (top-N or camping). Replaced `dict.fromkeys(...)` (which hashes by value) with explicit `id(r)`-keyed dedup, keeping first-seen order.
+
+#### Testing
+
+- `test_all.py` **110 passed / 0 failed** (was 92). New coverage: 8 camping-mode tests, 7 three-category separation tests, 2 `dict.fromkeys` regression tests.
+
+#### Configuration
+
+- New env var: `TESLA_CAMPING_KWH_PER_DAY` (default `10`; set ≤ 0 to disable). Existing `TESLA_VAMPIRE_WEATHER_MAX` now also covers camping events.
+
+#### Notes
+
+- Database access remains strictly read-only. All three categories are computed from existing `drives` / `charging_processes` / `positions` tables via a `LEAD()`-based events CTE — no schema changes, no writes.
 ---
 
 ## [1.2.2] - 2026-07-03

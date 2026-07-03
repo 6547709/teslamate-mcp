@@ -8,33 +8,30 @@
 
 ---
 
-## ✨ v1.2.1 新特性
+## ✨ v1.2.3 新特性
 
-> 天气增强大版本 —— **0 项数据库改动**，完全向后兼容。新增和风天气集成（2 个新工具）+ 高德地图地理编码，未配置 API Key 时全部静默关闭，其余功能不受影响。当前共 **38 个工具**，无数据库测试 **82/82 全部通过**。
+> 能耗分类大版本 —— **0 项数据库改动**。把原本纠缠在一起的功耗指标拆分成**三种独立类别**（行驶 / 充电 / 停车），各自从原始数据源独立计算、并列展示、永不混入运算。同时新增 **露营模式** 检测。当前共 **38 个工具**，无数据库测试 **110/110 全部通过**。
 
-- 🌦️ **新增工具 `tesla_weather`** —— 基于车辆最新 GPS 位置，通过**和风天气（QWeather）**返回实时天气：温度、体感、湿度、风力、降水、能见度、天气状况，补足 TeslaMate 仅有的单一 `outside_temp` 传感器。
-- 📉 **新增工具 `tesla_efficiency_by_weather`** —— 按**真实天气**（晴 / 多云 / 雨 / 雪 / 雾 / 大风）而非仅按温度分组的能效分析。通过和风天气**历史 API**回填每段行程的天气，展示相对晴天的能耗偏差。同样 5°C，雨天 / 雪天能耗可能天差地别。
-- ⛅ **`tesla_trip_cost` 天气修正** —— 配置后，目的地实时天气会对成本估算施加能耗系数：雨 +15%、雪 +30%、雾 +10%、大风 +12%。
-- 🗺️ **高德地图（AMAP）地理编码** —— `tesla_trip_cost` 新增高德作为高优先级地理编码源，对中文地名（如 `腾讯滨海大厦`、`万达广场`）精度远胜 Nominatim，并内置 **GCJ-02 → WGS-84** 坐标转换消除 50–500 m 系统性偏移。兜底链：本地 `addresses` 表 → 文件缓存 → **高德** → Nominatim。
-- 🛡️ **优雅降级** —— 高德 / 和风的 Key 或 Host 未配置时，对应功能自动返回 `None` / 友好提示并透明回退，现有部署零影响。
-- 📊 **测试实证** —— `test_all.py` **82/82 全部通过**（含天气分类、host 归一化、坐标转换精度、禁用路径回退），全部 38 个工具冒烟测试通过。
-
-> 📌 **如何启用高德 / 和风**：见下方 [第三方 API（可选）](#-第三方-api可选) 配置说明，Key 和 Host 需自行申请。
-
-完整清单见 [CHANGELOG.md](CHANGELOG.md)。
+- 🏕️ **`tesla_vampire_drain` 露营模式** —— 停车期间平均每日耗电超过 `TESLA_CAMPING_KWH_PER_DAY`（默认 **10** kWh/day）的事件，自动标记为 `🏕️ 露营模式`（多半是睡眠开空调、哨兵模式狂写、第三方 app 频繁唤醒 —— 不是单纯闲置漏电）。所有露营事件**保证附带停车点天气**，根因一眼可见。
+- 📊 **`tesla_monthly_summary` 三列分立** —— `Drive kWh`（行驶，续航差值估算）/ `Charge kWh`（充电，会话汇总）/ `Vampire kWh`（停车，事件表聚合），三种 kWh **完全独立计算、并列展示**。`Wh/km` 现在**只用行驶 kWh**，不再被充电损耗和停车耗电污染。
+- 📈 **`tesla_monthly_report` 三种能量分开** —— 行驶 / 充电 / 停车耗电各自一行，与上月对比也按类别分别给出 delta。
+- 🔁 **`tesla_vampire_drain` 天气去重 bug 修复** —— 多事件路径下 `dict.fromkeys(...)` 抛 `TypeError: unhashable type: \'dict\'`，已改为基于 `id(r)` 的去重，保留首次出现顺序。
+- 🏷️ **`tesla_efficiency` 标签改清楚** —— 周报的 `估算 X kWh` 改成 `行驶 X kWh`，`实际充电 Y kWh` 改成 `充电 Y kWh`，顶部加注 "Two independent metrics — never mixed"。
+- 🛡️ **零天气修正已就位** — `tesla_trip_cost` 在 v1.2.3 继续保留 v1.2.3 起的行为：天气只在输出末尾以 `🌦️ Current weather` 段呈现，**绝不参与 cost 公式**（cost = kWh × 电价）。
+- 📊 **测试实证** —— `test_all.py` **110/110 全部通过**（was 92）。新增 8 个露营模式用例 + 7 个三类分立用例 + 2 个 `dict.fromkeys` 回归用例。
 
 <details>
-<summary>📜 v1.1.0 性能与可观测性（点击展开）</summary>
+<summary>📜 v1.2.1 天气与高德（点击展开）</summary>
 
-- 🔍 **诊断工具 `tesla_version()`** —— 返回服务端版本、工具数、Python / fastmcp / psycopg2 版本、时区、单位、真实 DB 连通性检查。
-- 🤝 **MCP 协议元数据** —— 握手阶段直接暴露 `name=teslamate-mcp` + `version` + `website_url`。
-- ⚡ **SQL 查询合并（FILTER WHERE）** —— `tesla_savings`、`tesla_monthly_report` 各 4→2 次查询，round-trip 减半。
-- 🗺️ **`tesla_trip_cost` 三级兜底** —— 本地 `addresses` 表 → 文件缓存 → Nominatim，本地命中 1296ms → ~15ms（86×）。
-- 🚀 **结果级缓存框架** —— 6 个聚合慢工具加缓存，缓存命中最高 8827× 加速。
-- 📈 **`tesla_drives` 历史窗口 +88%** —— `LIMIT_DRIVES` 500 → 1000，覆盖 131 天 → 247 天。
+- 🌦️ **新增工具 `tesla_weather`** —— 基于车辆最新 GPS 位置，通过**和风天气（QWeather）**返回实时天气：温度、体感、湿度、风力、降水、能见度、天气状况。
+- 📉 **新增工具 `tesla_efficiency_by_weather`** —— 按真实天气分桶的能效分析。
+- 🗺️ **高德地图（AMAP）地理编码** —— 中文地址精度远胜 Nominatim，内置 GCJ-02 → WGS-84 转换。
+- 🛡️ **优雅降级** —— Key 未配置时对应功能自动关闭。
 
 </details>
 
+> 📌 **完整清单与历史版本**：见 [CHANGELOG.md](CHANGELOG.md)（中英双语）。
+> 📌 **如何启用和风天气**：见下方 [第三方 API（可选）](#-第三方-api可选) 配置说明。
 ---
 
 ## 功能特性

@@ -8,33 +8,30 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ---
 
-## ✨ What's New in v1.2.1
+## ✨ What\'s New in v1.2.3
 
-> Weather enrichment release — **0 database changes**, fully backward compatible. Adds QWeather (和风天气) integration (2 new tools) + AMAP (高德) geocoding. When the API keys are not configured, every new feature is silently disabled and nothing else changes. **38 tools** total, no-database test suite **82/82 passing**.
+> Energy-categorisation release — **0 database changes**. Splits the previously entangled power-consumption metric into **three independent categories** (driving / charging / parking), each computed from its primary source, displayed side-by-side, and never mixed in calculations. Also adds a "camping mode" detector. **38 tools** total, no-database test suite **110/110 passing**.
 
-- 🌦️ **New tool `tesla_weather`** — real-time weather at the car's latest GPS position via **QWeather (和风天气)**: temperature, feels-like, humidity, wind, precipitation, visibility and conditions. Complements TeslaMate's single `outside_temp` sensor.
-- 📉 **New tool `tesla_efficiency_by_weather`** — efficiency grouped by *actual weather* (clear / cloudy / rain / snow / fog / wind), not just temperature. Back-fills each drive's weather from QWeather's **historical** API and shows the delta vs clear conditions. The same 5°C day can mean wildly different consumption in rain or snow.
-- ⛅ **`tesla_trip_cost` weather correction** — when configured, the destination's current weather applies an energy multiplier: rain +15%, snow +30%, fog +10%, wind +12%.
-- 🗺️ **AMAP (高德) geocoding** — `tesla_trip_cost` gains AMAP as a higher-priority geocoding source for Chinese place names (e.g. `腾讯滨海大厦`, `万达广场`), far more accurate than Nominatim, with built-in **GCJ-02 → WGS-84** conversion to remove the 50–500 m systematic offset. Fallback chain: local `addresses` table → file cache → **AMAP** → Nominatim.
-- 🛡️ **Graceful degradation** — when AMAP/QWeather keys or host are unset, the relevant feature returns `None` / a friendly hint and transparently falls back. Existing deployments are unaffected.
-- 📊 **Test evidence** — `test_all.py` **82/82 passing** (weather classification, host normalisation, coordinate-conversion accuracy, disabled-path fallback), all 38 tools smoke-tested.
-
-> 📌 **How to enable AMAP / QWeather**: see [Third-party APIs (optional)](#-third-party-apis-optional) below. You must apply for your own Key and Host.
-
-Full details in [CHANGELOG.md](CHANGELOG.md).
+- 🏕️ **Camping mode flag in `tesla_vampire_drain`** — parked periods averaging more than `TESLA_CAMPING_KWH_PER_DAY` (default **10** kWh/day) are tagged `🏕️ 露营模式` (active use: A/C while sleeping, heavy sentry, third-party polling — not idle drain). Camping events always receive parking-location weather regardless of drain rank, so the cause is visible at a glance.
+- 📊 **Three independent kWh columns in `tesla_monthly_summary`** — `Drive kWh` (range-drop estimate) / `Charge kWh` (sessions) / `Vampire kWh` (parked drain). Three kWh values are computed independently and shown side-by-side. `Wh/km` now uses **driving kWh only** — no longer contaminated by charging losses or vampire drain.
+- 📈 **Three energy lines in `tesla_monthly_report`** — driving / charging / vampire energy each on its own line, with per-category prev-month delta in the comparison line.
+- 🔁 **`tesla_vampire_drain` weather-dedup bug fix** — multi-event path crashed with `TypeError: unhashable type: \'dict\'` from `dict.fromkeys(...)`. Replaced with `id(r)`-keyed dedup, preserving first-seen order.
+- 🏷️ **`tesla_efficiency` labels clarified** — weekly output relabels `估算 X kWh` → `行驶 X kWh` and `实际充电 Y kWh` → `充电 Y kWh`, with top-of-output note "Two independent metrics — never mixed".
+- 🛡️ **Zero weather correction retained** — `tesla_trip_cost` continues the v1.2.3 behaviour: weather only shown at the end as a `🌦️ Current weather` block; **never participates in the cost formula** (cost = kWh × rate).
+- 📊 **Test evidence** — `test_all.py` **110/110 passing** (was 92). New: 8 camping-mode tests + 7 three-category separation tests + 2 `dict.fromkeys` regression tests.
 
 <details>
-<summary>📜 v1.1.0 — Performance & observability (click to expand)</summary>
+<summary>📜 v1.2.1 weather & AMAP (click to expand)</summary>
 
-- 🔍 **Diagnostic tool `tesla_version()`** — server version, tool count, Python / fastmcp / psycopg2 versions, timezone, units, live DB health check.
-- 🤝 **MCP protocol metadata** — advertises `name=teslamate-mcp` + `version` + `website_url` during handshake.
-- ⚡ **SQL query consolidation (FILTER WHERE)** — `tesla_savings`, `tesla_monthly_report` each 4→2 queries.
-- 🗺️ **`tesla_trip_cost` 3-stage fallback** — local `addresses` table → file cache → Nominatim, local hits 1296ms → ~15ms (86×).
-- 🚀 **Result-level cache framework** — 6 slow aggregate tools cached, up to 8827× on cache hits.
-- 📈 **`tesla_drives` history window +88%** — `LIMIT_DRIVES` 500 → 1000, 131 → 247 days covered.
+- 🌦️ **New tool `tesla_weather`** — real-time weather at the car\'s latest GPS via QWeather.
+- 📉 **New tool `tesla_efficiency_by_weather`** — efficiency grouped by actual weather.
+- 🗺️ **AMAP (高德) geocoding** — better Chinese-address accuracy with built-in GCJ-02 → WGS-84 conversion.
+- 🛡️ **Graceful degradation** — features auto-disable when keys are unset.
 
 </details>
 
+> 📌 **Full changelog & history**: see [CHANGELOG.md](CHANGELOG.md) (bilingual).
+> 📌 **How to enable QWeather**: see [Third-party APIs (optional)](#-third-party-apis-optional) below.
 ---
 
 ## Features
