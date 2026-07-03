@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-07-03
+
+Energy-categorisation release — **0 database changes**. Splits the previously entangled power-consumption metric into three independent categories so they are computed from their primary sources, displayed side-by-side, and never mixed in calculations. Also adds a "camping mode" detector on vampire drain.
+
+### Added
+
+- **Camping mode flag in `tesla_vampire_drain`** — parked periods averaging more
+  than `TESLA_CAMPING_KWH_PER_DAY` (default 10) kWh/day of battery loss are
+  tagged `🏕️ 露营模式` (active use: A/C while sleeping, heavy sentry, third-party
+  polling — not idle drain). Camping events always receive parking-location
+  weather regardless of drain rank, so the cause is visible at a glance.
+- **Three independent kWh columns in `tesla_monthly_summary`** — Drive kWh
+  (range-drop estimate), Charge kWh (sessions), Vampire kWh (parked drain),
+  each aggregated from its primary table. `Wh/km` now uses driving kWh only
+  and is never contaminated by charging losses or vampire drain.
+- **Three energy lines in `tesla_monthly_report`** — Driving / Charging /
+  Vampire energy shown separately, each with its own prev-month delta in the
+  comparison line.
+
+### Changed
+
+- `tesla_efficiency` weekly output now labels the two metrics as
+  `行驶 X kWh` (driving) and `充电 Y kWh` (charging) instead of
+  `估算 / 实际充电`, and the top-of-output note states they are
+  independent metrics — never mixed.
+- `tesla_vampire_drain` docstring updated to describe the camping-mode
+  behaviour and the parking-weather guarantee for camping events.
+
+### Bug fixes
+
+- `tesla_vampire_drain` weather-fetch targets list crashed with
+  `TypeError: unhashable type: 'dict'` when more than one event qualified
+  (top-N or camping). Replaced `dict.fromkeys(...)` (which hashes by value)
+  with explicit `id(r)`-keyed dedup, keeping first-seen order. Two regression
+  tests added so this path is covered.
+
+### Testing
+
+- `test_all.py` **110 passed / 0 failed** (was 92). New: 8 camping-mode tests
+  (default threshold, high/low drain, disabled, multi-row + weather grid
+  dedup), 7 three-category separation tests (column presence, value presence,
+  Wh/km purity), and the two regression tests mentioned above.
+
+### Notes
+
+- Database access remains strictly read-only. All three categories are
+  computed from existing `drives` / `charging_processes` / `positions` tables
+  via a `LEAD()`-based events CTE — no schema changes, no writes.
+- Configuration knobs added: `TESLA_CAMPING_KWH_PER_DAY` (default 10; set
+  ≤ 0 to disable). Existing `VAMPIRE_WEATHER_MAX` now also covers camping
+  events.
+
+---
+
 ## [1.2.2] - 2026-07-03
 
 Patch release — **0 database changes**. Eliminates redundant (billed) QWeather GeoAPI calls under concurrency. Purely an in-app reliability/cost fix; no API surface, tool count, or behaviour changes for callers.

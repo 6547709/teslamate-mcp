@@ -55,6 +55,30 @@ _NOW = datetime.now(timezone.utc)
 
 def _fake_query(sql: str, params: tuple = ()):  # noqa: C901
     s = " ".join(sql.lower().split())
+    # ---- monthly_summary (CTE joining drives + charging + vampire) ---------
+    # Must be matched BEFORE the generic "lead(ts)" and "from drives" checks
+    # because the joined SQL contains both patterns.
+    if "with vampire_m" in s and "with drives_m" in s:
+        return [{
+            "month": _NOW.replace(day=1),
+            "trips": 42, "total_km": 1250.0, "total_min": 1500,
+            "drive_kwh": 180.0, "charge_kwh": 210.0, "vampire_kwh": 12.0,
+            "total_cost": 120.0,
+        }]
+    # ---- monthly_report drive CTE (FILTER aggregate) ------------------------
+    if "cur_drive_kwh" in s:
+        return [{
+            "cur_trips": 42, "cur_km": 1250.0, "cur_min": 1500,
+            "prev_km": 1100.0, "cur_drive_kwh": 180.0, "prev_drive_kwh": 165.0,
+        }]
+    # ---- monthly_report charging CTE ----------------------------------------
+    if "cur_charge_kwh" in s:
+        return [{
+            "cur_cost": 120.0, "cur_charge_kwh": 210.0, "prev_charge_kwh": 195.0,
+        }]
+    # ---- monthly_report vampire CTE ----------------------------------------
+    if "cur_vampire_pct" in s:
+        return [{"cur_vampire_pct": 16.0, "prev_vampire_pct": 14.0}]
     # cars
     if "from cars" in s:
         return [{"id": 1, "name": "Model 3", "model": "3", "vin": "LRWABC123456", "efficiency": 0.153,
@@ -302,10 +326,19 @@ def test_unit():
     check("v1.2.1 classify_weather case-insensitive 'Clear'→clear", tesla._classify_weather("Clear") == "clear")
     check("v1.2.1 classify_weather 'Heavy Rain'→rain", tesla._classify_weather("Heavy Rain") == "rain")
     check("v1.2.1 classify_weather None→other", tesla._classify_weather(None) == "other")
-    # Energy-correction factor table.
-    check("v1.2.1 weather factor snow=1.30", tesla.WEATHER_ENERGY_FACTOR["snow"] == 1.30)
-    check("v1.2.1 weather factor rain=1.15", tesla.WEATHER_ENERGY_FACTOR["rain"] == 1.15)
-    check("v1.2.1 weather factor clear=1.00", tesla.WEATHER_ENERGY_FACTOR["clear"] == 1.00)
+    # v1.2.3: weather no longer corrects energy — the factor table is gone.
+    check("v1.2.3 WEATHER_ENERGY_FACTOR removed (weather is display-only)",
+          not hasattr(tesla, "WEATHER_ENERGY_FACTOR"))
+    # _format_current_weather renders a compact display-only summary.
+    _w = {"text": "Rain", "temp": "18", "feelsLike": "16", "windDir": "NE",
+          "windScale": "3", "humidity": "90", "precip": "2.4", "bucket": "rain"}
+    _fmt = tesla._format_current_weather(_w)
+    check("v1.2.3 _format_current_weather includes condition + temp",
+          "Rain" in _fmt and "18°C" in _fmt, _fmt)
+    check("v1.2.3 _format_current_weather includes precip when >0",
+          "precip 2.4mm" in _fmt, _fmt)
+    check("v1.2.3 _format_current_weather omits precip when 0",
+          "precip" not in tesla._format_current_weather({"text": "Clear", "temp": "25", "precip": "0"}))
     # Host normalisation: scheme + trailing slash stripped to a bare host.
     saved_host = tesla.QWEATHER_API_HOST
     norm = "https://abc.re.qweatherapi.com/".replace("https://", "").replace("http://", "").rstrip("/")
@@ -317,6 +350,139 @@ def test_unit():
     check("_qweather_locationid disabled → None", asyncio.run(tesla._qweather_locationid(39.9, 116.4)) is None)
     check("v1.2.1 _qweather_historical disabled → None", asyncio.run(tesla._qweather_historical("101010100", "20260101")) is None)
     tesla.QWEATHER_ENABLED = saved_qw
+
+    # ---- v1.2.3: camping-mode flag in tesla_vampire_drain --------------------
+    # Threshold default + env override both honoured.
+    check("v1.2.3 CAMPING_KWH_PER_DAY default == 10",
+          tesla.CAMPING_KWH_PER_DAY == 10, f"got {tesla.CAMPING_KWH_PER_DAY}")
+    # End-to-end: a row whose drain%/hours imply > 10 kWh/day must be tagged
+    # 露营模式. Default car is 75 kWh → kWh per 1% battery = 0.75. Row of
+    # drain=15%, hours=20 → 15 * 0.75 / (20/24) = 13.5 kWh/day → camping.
+    _high_drain_row = {
+        "prev_date": _NOW - timedelta(days=1),
+        "date": _NOW - timedelta(days=1) + timedelta(hours=20),
+        "prev_level": 90, "battery_level": 75, "drain": 15, "hours_parked": 20.0,
+        "hours_gap": 20.0, "park_lat": 31.23, "park_lon": 121.47,
+    }
+    saved_q = tesla._query
+    saved_q1 = tesla._query_one
+    tesla._query = lambda sql, params=(): [_high_drain_row]
+    tesla._query_one = lambda sql, params=(): None
+    try:
+        out = asyncio.run(tesla.tesla_vampire_drain(days=14))
+        check("v1.2.3 vampire_drain tags high-drain event as 露营模式",
+              "露营模式" in out, out[:200])
+        # Negative case: drain=2%, hours=20 → 2*0.75/(20/24) = 1.8 kWh/day → not camping
+        _low_drain_row = dict(_high_drain_row, drain=2, hours_parked=20.0)
+        tesla._query = lambda sql, params=(): [_low_drain_row]
+        out2 = asyncio.run(tesla.tesla_vampire_drain(days=14))
+        check("v1.2.3 vampire_drain does NOT tag low-drain event as 露营模式",
+              "露营模式" not in out2, out2[:200])
+        # Disabled: setting threshold to 0 must skip the flag entirely.
+        _saved_threshold = tesla.CAMPING_KWH_PER_DAY
+        tesla.CAMPING_KWH_PER_DAY = 0
+        tesla._query = lambda sql, params=(): [_high_drain_row]
+        out3 = asyncio.run(tesla.tesla_vampire_drain(days=14))
+        check("v1.2.3 camping disabled (threshold=0) → no tag",
+              "露营模式" not in out3, out3[:200])
+        tesla.CAMPING_KWH_PER_DAY = _saved_threshold
+    finally:
+        tesla._query = saved_q
+        tesla._query_one = saved_q1
+
+    # Regression: when QWeather is enabled AND there are multiple rows
+    # (incl. camping events), the dedupe path must not crash with
+    # `unhashable type: 'dict'`. Exercises the full targets-combine loop.
+    _rows = [_high_drain_row, {**_high_drain_row, "park_lat": 31.30, "park_lon": 121.55,
+                                "drain": 18, "prev_level": 92, "battery_level": 74}]
+    saved_q = tesla._query
+    saved_q1 = tesla._query_one
+    saved_qw = tesla.QWEATHER_ENABLED
+    saved_qwf = tesla._qweather_now
+    calls = []
+    async def _stub_qw(lat, lon):
+        calls.append((round(lat, 2), round(lon, 2)))
+        return {"text": "Clear", "temp": "25", "feelsLike": "25",
+                "windDir": "N", "windScale": "1", "humidity": "60",
+                "precip": "0", "bucket": "clear"}
+    tesla.QWEATHER_ENABLED = True
+    tesla._qweather_now = _stub_qw
+    tesla._query = lambda sql, params=(): _rows
+    tesla._query_one = lambda sql, params=(): None
+    try:
+        out = asyncio.run(tesla.tesla_vampire_drain(days=14))
+        check("v1.2.3 vampire_drain handles multi-row + camping + weather",
+              "露营模式" in out and out.count("🏕️ 露营模式") == 2, out[:200])
+        check("v1.2.3 multi-row weather fetch dedupes by grid key",
+              len(calls) == 2, f"expected 2 grid cells, got {len(calls)}: {calls}")
+    finally:
+        tesla._query = saved_q
+        tesla._query_one = saved_q1
+        tesla.QWEATHER_ENABLED = saved_qw
+        tesla._qweather_now = saved_qwf
+
+    # ---- v1.2.3: three-category separation in monthly views ----------------
+    # Mocked rows: drive_kwh=180, charge_kwh=210, vampire_kwh=12. With 1250 km
+    # driven, Wh/km (driving) = 180*1000/1250 = 144 — should NOT use charging.
+    _mock_summary_row = {
+        "month": _NOW.replace(day=1),
+        "trips": 42, "total_km": 1250.0, "total_min": 1500,
+        "drive_kwh": 180.0, "charge_kwh": 210.0, "vampire_kwh": 12.0,
+        "total_cost": 120.0,
+    }
+    saved_q = tesla._query
+    saved_q1 = tesla._query_one
+    tesla._query = lambda sql, params=(): [_mock_summary_row]
+    try:
+        out = asyncio.run(tesla.tesla_monthly_summary(months=1))
+        # All three columns present and labeled
+        check("monthly_summary shows Drive kWh column",
+              "Drive kWh" in out, out[:300])
+        check("monthly_summary shows Charge kWh column",
+              "Charge kWh" in out, out[:300])
+        check("monthly_summary shows Vampire kWh column",
+              "Vampire kWh" in out, out[:300])
+        # Wh/km uses driving kWh (180) → 144 Wh/km, NOT charging (210) → 168
+        check("monthly_summary Wh/km uses driving kWh only (144, not 168)",
+              "144" in out and "168" not in out, out[:600])
+        # All three kWh values present
+        check("monthly_summary shows driving kWh value (180.0)",
+              "180.0" in out, out[:600])
+        check("monthly_summary shows charging kWh value (210.0)",
+              "210.0" in out, out[:600])
+        check("monthly_summary shows vampire kWh value (12.0)",
+              "12.0" in out, out[:600])
+    finally:
+        tesla._query = saved_q
+
+    # monthly_report: 3 separate _query_one calls (drives, charging, vampire)
+    def _fake_qo_split(sql, params=()):
+        s = " ".join(sql.lower().split())
+        if "cur_drive_kwh" in s:
+            return {"cur_trips": 42, "cur_km": 1250.0, "cur_min": 1500,
+                    "prev_km": 1100.0, "cur_drive_kwh": 180.0,
+                    "prev_drive_kwh": 165.0}
+        if "cur_charge_kwh" in s:
+            return {"cur_cost": 120.0, "cur_charge_kwh": 210.0,
+                    "prev_charge_kwh": 195.0}
+        if "cur_vampire_pct" in s:
+            return {"cur_vampire_pct": 16.0, "prev_vampire_pct": 14.0}
+        return None
+    tesla._query_one = _fake_qo_split
+    try:
+        # Use a past month to avoid the cache fast-path's "current month" branch
+        out = asyncio.run(tesla.tesla_monthly_report(year=2025, month=6))
+        check("monthly_report shows driving energy label",
+              "Driving energy" in out, out[:600])
+        check("monthly_report shows charging energy label",
+              "Charging energy" in out, out[:600])
+        check("monthly_report shows vampire drain label",
+              "Vampire drain" in out, out[:600])
+        check("monthly_report shows three kWh values",
+              "180.0" in out and "210.0" in out and "12.0" in out,
+              out[:800])
+    finally:
+        tesla._query_one = saved_q1
 
 
 # =====================================================================

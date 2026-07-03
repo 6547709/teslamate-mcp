@@ -117,7 +117,7 @@ import atexit
 # Source of truth for this release. Bump this constant when tagging a new
 # release. Overridable at runtime via env (Docker build-arg) or git describe
 # for development checkouts.
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 
 def _detect_version() -> str:
@@ -279,6 +279,15 @@ TPMS_WARN_DELTA = 0.2  # bar -- warn if any tire differs from average by this mu
 # used 3h, producing contradictory results. Unify here so both agree.
 VAMPIRE_MIN_HOURS = float(os.environ.get("TESLA_VAMPIRE_MIN_HOURS", "8"))   # parked >= this many hours
 VAMPIRE_MAX_HOURS = float(os.environ.get("TESLA_VAMPIRE_MAX_HOURS", "168"))  # cap at 7 days
+# v1.2.3: how many top drain events get parking-location weather (display-only).
+# Bounded so a long list doesn't fan out into many QWeather calls; grid-dedup
+# means repeated spots cost nothing extra.
+VAMPIRE_WEATHER_MAX = int(os.environ.get("TESLA_VAMPIRE_WEATHER_MAX", "5"))
+# v1.2.3: "camping mode" flag. When a parked period's energy loss (converted from
+# the battery-% drop via the car's usable kWh) averages above this many kWh PER
+# DAY, it's almost certainly active use (A/C while sleeping in the car, etc.)
+# rather than idle vampire drain, so we tag it. Configurable; 0/negative disables.
+CAMPING_KWH_PER_DAY = float(os.environ.get("TESLA_CAMPING_KWH_PER_DAY", "10"))
 
 # -- Trip classification thresholds & geocode tuning --------------------------
 # ISSUE-3: queries shorter than this are too ambiguous for fuzzy address match.
@@ -351,22 +360,43 @@ def _classify_weather(text: str | None) -> str:
     return "other"
 
 
-# Energy-consumption correction factors by weather bucket (applied to baseline
-# Wh/km in trip_cost). Conservative, literature-informed multipliers:
-#   rain  +15% (rolling resistance + denser air + lights/wipers)
-#   snow  +30% (cold battery + cabin heater + traction losses)
-#   fog   +10% (lights + reduced regen confidence)
-#   wind  +12% (aero drag, headwind average)
-#   clear/cloudy/other: no weather penalty (temperature handled separately)
-WEATHER_ENERGY_FACTOR = {
-    "rain": 1.15,
-    "snow": 1.30,
-    "fog": 1.10,
-    "wind": 1.12,
-    "clear": 1.00,
-    "cloudy": 1.00,
-    "other": 1.00,
-}
+# NOTE (v1.2.3): weather no longer corrects the energy/cost estimate. It used to
+# apply per-bucket multipliers to the baseline Wh/km in trip_cost, but that was
+# removed by design — weather is now shown for reference only (origin +
+# destination current conditions). The energy estimate is based solely on the
+# 30-day average efficiency.
+
+
+def _format_current_weather(w: dict) -> str:
+    """Render a QWeather 'now' dict as a compact one-line summary for display.
+
+    Purely informational — used by trip_cost (origin/destination) and any other
+    place that wants a human-readable current-weather string. Missing fields are
+    skipped gracefully.
+    """
+    text = w.get("text") or (w.get("bucket") or "unknown").capitalize()
+    parts = [str(text)]
+    temp = w.get("temp")
+    if temp is not None and str(temp) != "":
+        feels = w.get("feelsLike")
+        if feels is not None and str(feels) != "" and str(feels) != str(temp):
+            parts.append(f"{temp}°C (feels {feels}°C)")
+        else:
+            parts.append(f"{temp}°C")
+    wind_dir = w.get("windDir")
+    wind_scale = w.get("windScale")
+    if wind_dir and wind_scale is not None and str(wind_scale) != "":
+        parts.append(f"{wind_dir} force {wind_scale}")
+    humidity = w.get("humidity")
+    if humidity is not None and str(humidity) != "":
+        parts.append(f"humidity {humidity}%")
+    precip = w.get("precip")
+    try:
+        if precip is not None and float(precip) > 0:
+            parts.append(f"precip {precip}mm")
+    except (TypeError, ValueError):
+        pass
+    return ", ".join(parts)
 # Generic in-memory cache entry cap (PERF-2) before pruning expired/oldest.
 CACHE_MAX_ENTRIES = int(os.environ.get("TESLA_CACHE_MAX_ENTRIES", "500"))
 # Max look-back days accepted by date-range tools (ISSUE-1).
@@ -2374,7 +2404,10 @@ async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_da
     if not rows:
         return f"No driving data ({date_range})."
 
-    lines = [f"**Efficiency** ({date_range}, weekly)\n"]
+    lines = [
+        f"**Efficiency** ({date_range}, weekly)",
+        "*Two independent metrics per week — never mixed:*\n",
+    ]
     for r in rows:
         km = r.get("total_km") or 0
         kwh = r.get("estimated_kwh") or 0
@@ -2385,13 +2418,16 @@ async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_da
         temp_str = f", avg {_format_temp(temp)}" if temp is not None else ""
 
         eff_str = ", " + _format_efficiency(kwh, km) if km > 0 and kwh > 0 else ""
-        charged_note = f"（实际充电 {charged:.1f} kWh）" if charged > 0 else ""
+        charged_note = f" | 充电 {charged:.1f} kWh" if charged > 0 else ""
 
         lines.append(
-            f"- {week}: {_format_distance(km)}, 估算 {kwh:.1f} kWh, {trips} trips{eff_str}{temp_str}{charged_note}"
+            f"- {week}: {_format_distance(km)}, 行驶 {kwh:.1f} kWh, {trips} trips{eff_str}{temp_str}{charged_note}"
         )
 
-    lines.append("\n*注：能耗基于续航差值估算（每周独立计算）；实际充电量作参考，二者时间边界未严格对齐（可能跨周充电）。*")
+    lines.append(
+        "\n*注：行驶能耗基于续航差值估算；充电能耗来自 charging_processes 表。两类独立计算、互不混用；"
+        "时间边界未严格对齐（充电可能跨周）。*"
+    )
     return "\n".join(lines)
 
 
@@ -2904,6 +2940,9 @@ async def tesla_trip_cost(
     """Estimate trip cost to a destination -- kWh, cost, range check.
 
     Uses your personal 30-day average efficiency and current battery level.
+    If QWeather is configured, the current weather at the origin and the
+    destination is shown for reference only — it does NOT change the energy or
+    cost estimate.
 
     Args:
         destination: City, address, or place name (e.g. "Atlanta, GA")
@@ -3051,22 +3090,28 @@ async def tesla_trip_cost(
           AND start_date >= NOW() - INTERVAL '30 days' AND distance > 0
     """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
 
-    # v1.2.1: optional weather correction at the destination. When QWeather is
-    # configured, fetch the destination's current weather and apply an energy
-    # multiplier (rain/snow/fog/wind raise consumption). Skipped entirely (factor
-    # = 1.0, no note) when weather is disabled or unavailable — zero impact on
-    # existing behaviour.
-    weather_factor = 1.0
+    # v1.2.3: weather is INFORMATIONAL ONLY — it no longer alters the energy or
+    # cost estimate. When QWeather is configured, show the current weather at
+    # both the origin (current vehicle position) and the destination, purely for
+    # the driver's awareness. Skipped entirely (no note) when weather is disabled
+    # or unavailable — zero impact on the estimate either way.
     weather_note = None
     if QWEATHER_ENABLED:
-        dest_w = await _qweather_now(dest_lat, dest_lon)
+        origin_w, dest_w = await asyncio.gather(
+            _qweather_now(pos["latitude"], pos["longitude"]),
+            _qweather_now(dest_lat, dest_lon),
+        )
+        w_lines = []
+        if origin_w is not None:
+            w_lines.append(
+                f"  • Origin: {_format_current_weather(origin_w)}"
+            )
         if dest_w is not None:
-            weather_factor = WEATHER_ENERGY_FACTOR.get(dest_w.get("bucket"), 1.0)
-            if weather_factor > 1.0:
-                weather_note = (
-                    f"🌦️ Weather at {dest_name}: {dest_w.get('text') or dest_w.get('bucket')} "
-                    f"→ energy estimate adjusted +{round((weather_factor - 1) * 100)}%."
-                )
+            w_lines.append(
+                f"  • {dest_name}: {_format_current_weather(dest_w)}"
+            )
+        if w_lines:
+            weather_note = "🌦️ Current weather (for reference only):\n" + "\n".join(w_lines)
 
     if USE_METRIC_UNITS:
         wh_per_km = 180  # default Wh/km
@@ -3074,7 +3119,7 @@ async def tesla_trip_cost(
             wh_per_km = round(eff["kwh"] * 1000 / eff["km"])
         road_km = round(straight_mi * 1.60934 * 1.3, 1)
         round_trip_km = round(road_km * 2, 1)
-        kwh_round = round(round_trip_km * wh_per_km / 1000 * weather_factor, 1)
+        kwh_round = round(round_trip_km * wh_per_km / 1000, 1)
         cost_round = round(kwh_round * ELECTRICITY_RATE_RMB, 2)
 
         bat = pos.get("battery_level", 0) or 0
@@ -3109,7 +3154,7 @@ async def tesla_trip_cost(
         if eff and eff["km"] > 0:
             wh_per_mi = round(eff["kwh"] * 1000 / (eff["km"] * 0.621371))
 
-        kwh_round = round(round_trip * wh_per_mi / 1000 * weather_factor, 1)
+        kwh_round = round(round_trip * wh_per_mi / 1000, 1)
         cost_round = round(kwh_round * ELECTRICITY_RATE, 2)
         gas_equiv = round(round_trip / _mpg * _gas, 2)
 
@@ -3227,11 +3272,7 @@ async def tesla_weather(car_id: int | None = None) -> str:
     if w.get("pressure") is not None:
         lines.append(f"Pressure: {w.get('pressure')} hPa")
 
-    # Driving impact hint based on the weather bucket.
-    factor = WEATHER_ENERGY_FACTOR.get(w.get("bucket"), 1.0)
-    if factor > 1.0:
-        lines.append(f"\n⚡ Expected energy use ~+{round((factor - 1) * 100)}% vs ideal due to {w.get('bucket')}.")
-
+    # v1.2.3: weather is informational only — no energy-impact estimate here.
     return "\n".join(lines)
 
 
@@ -3705,15 +3746,22 @@ async def _monthly_report_compute(effective_car_id: int, year: int, month: int) 
     else:
         prev_start = datetime(year, month - 1, 1)
 
-    # PERF: 4 queries → 2 queries via FILTER (WHERE).
-    # Drives: trips/km/min for current month + km for prev month, single scan.
+    car_cfg = _get_car_config(effective_car_id)
+    kwh_per_km = car_cfg["kwh_per_km"]
+    pct_to_kwh = car_cfg["kwh"] / 100.0  # 1% battery -> kWh (vampire column)
+
+    # PERF: 4 queries -> 2 queries via FILTER (WHERE).
+    # Drives: trips/km/min/drive_kwh for current month + km/drive_kwh for prev
+    # month, single scan.
     drive_row = _query_one(
         """
         SELECT
             COUNT(*) FILTER (WHERE start_date >= %s AND start_date < %s)               AS cur_trips,
             COALESCE(SUM(distance) FILTER (WHERE start_date >= %s AND start_date < %s), 0)     AS cur_km,
             COALESCE(SUM(duration_min) FILTER (WHERE start_date >= %s AND start_date < %s), 0) AS cur_min,
-            COALESCE(SUM(distance) FILTER (WHERE start_date >= %s AND start_date < %s), 0)     AS prev_km
+            COALESCE(SUM(distance) FILTER (WHERE start_date >= %s AND start_date < %s), 0)     AS prev_km,
+            COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0) * %s) FILTER (WHERE start_date >= %s AND start_date < %s), 0) AS cur_drive_kwh,
+            COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0) * %s) FILTER (WHERE start_date >= %s AND start_date < %s), 0) AS prev_drive_kwh
         FROM drives
         WHERE car_id = %s AND distance > 0
           AND start_date >= %s AND start_date < %s
@@ -3723,85 +3771,133 @@ async def _monthly_report_compute(effective_car_id: int, year: int, month: int) 
             start.isoformat(), next_start.isoformat(),       # cur_km
             start.isoformat(), next_start.isoformat(),       # cur_min
             prev_start.isoformat(), start.isoformat(),       # prev_km
+            kwh_per_km, start.isoformat(), next_start.isoformat(),  # cur_drive_kwh
+            kwh_per_km, prev_start.isoformat(), start.isoformat(),  # prev_drive_kwh
             effective_car_id,
-            prev_start.isoformat(), next_start.isoformat(),  # window guard (prev..next)
+            prev_start.isoformat(), next_start.isoformat(),  # window guard
         ),
     )
     drive_row = drive_row or {}
-    trips   = drive_row.get("cur_trips") or 0
-    km      = drive_row.get("cur_km") or 0
-    minutes = drive_row.get("cur_min") or 0
-    prev_km = drive_row.get("prev_km") or 0
+    trips         = drive_row.get("cur_trips") or 0
+    km            = drive_row.get("cur_km") or 0
+    minutes       = drive_row.get("cur_min") or 0
+    prev_km       = drive_row.get("prev_km") or 0
+    drive_kwh     = drive_row.get("cur_drive_kwh") or 0
+    prev_drive_kwh = drive_row.get("prev_drive_kwh") or 0
 
     # Charging: cost + actual kWh for current month + prev kWh, single scan.
     charge_row = _query_one(
         """
         SELECT
             COALESCE(SUM(cost) FILTER (WHERE start_date >= %s AND start_date < %s), 0)                  AS cur_cost,
-            COALESCE(SUM(charge_energy_added) FILTER (WHERE start_date >= %s AND start_date < %s), 0)   AS cur_kwh,
-            COALESCE(SUM(charge_energy_added) FILTER (WHERE start_date >= %s AND start_date < %s), 0)   AS prev_kwh
+            COALESCE(SUM(charge_energy_added) FILTER (WHERE start_date >= %s AND start_date < %s), 0)   AS cur_charge_kwh,
+            COALESCE(SUM(charge_energy_added) FILTER (WHERE start_date >= %s AND start_date < %s), 0)   AS prev_charge_kwh
         FROM charging_processes
         WHERE car_id = %s AND end_date IS NOT NULL
           AND start_date >= %s AND start_date < %s
         """,
         (
             start.isoformat(), next_start.isoformat(),       # cur_cost
-            start.isoformat(), next_start.isoformat(),       # cur_kwh
-            prev_start.isoformat(), start.isoformat(),       # prev_kwh
+            start.isoformat(), next_start.isoformat(),       # cur_charge_kwh
+            prev_start.isoformat(), start.isoformat(),       # prev_charge_kwh
             effective_car_id,
             prev_start.isoformat(), next_start.isoformat(),  # window guard
         ),
     )
     charge_row = charge_row or {}
-    total_cost = charge_row.get("cur_cost") or 0
-    kwh        = charge_row.get("cur_kwh") or 0
-    prev_kwh   = charge_row.get("prev_kwh") or 0
+    total_cost    = charge_row.get("cur_cost") or 0
+    charge_kwh    = charge_row.get("cur_charge_kwh") or 0
+    prev_charge_kwh = charge_row.get("prev_charge_kwh") or 0
 
-    # Fallback: estimate energy from ideal-range deltas if no charging sessions recorded
-    kwh_estimated = False
-    if km > 0 and kwh == 0:
-        est = _query_one(
-            """
-            SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                * %s), 0) AS total_kwh
-            FROM drives
-            WHERE car_id = %s AND distance > 0
-              AND start_date >= %s AND start_date < %s
-            """,
-            (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id,
-             start.isoformat(), next_start.isoformat()),
+    # Vampire drain: parked battery% drop (drive_end -> next event) per month.
+    # Returns pct sums for current and prev month; multiplied by pct_to_kwh.
+    vampire_row = _query_one(
+        """
+        WITH events AS (
+            SELECT d.end_date AS ts, p.battery_level
+            FROM drives d JOIN positions p ON p.id = d.end_position_id
+            WHERE d.car_id = %s AND d.end_date IS NOT NULL AND p.battery_level IS NOT NULL
+            UNION ALL
+            SELECT d.start_date AS ts, p.battery_level
+            FROM drives d JOIN positions p ON p.id = d.start_position_id
+            WHERE d.car_id = %s AND d.battery_level IS NOT NULL
+            UNION ALL
+            SELECT start_date AS ts, start_battery_level AS battery_level
+            FROM charging_processes
+            WHERE car_id = %s AND start_battery_level IS NOT NULL
+        ),
+        ordered AS (
+            SELECT ts, battery_level,
+                   LEAD(ts) OVER (ORDER BY ts) AS next_ts,
+                   LEAD(battery_level) OVER (ORDER BY ts) AS next_battery_level
+            FROM events
+        ),
+        matches AS (
+            SELECT ts, battery_level, next_battery_level, next_ts
+            FROM ordered
+            WHERE next_ts IS NOT NULL
+              AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 8
+              AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168
+              AND (battery_level - next_battery_level) > 0
         )
-        kwh = (est or {}).get("total_kwh") or 0
-        kwh_estimated = True
+        SELECT
+            COALESCE(SUM(GREATEST(battery_level - next_battery_level, 0)) FILTER (WHERE ts >= %s AND ts < %s), 0) AS cur_vampire_pct,
+            COALESCE(SUM(GREATEST(battery_level - next_battery_level, 0)) FILTER (WHERE ts >= %s AND ts < %s), 0) AS prev_vampire_pct
+        FROM matches
+        """,
+        (effective_car_id, effective_car_id, effective_car_id,
+         start.isoformat(), next_start.isoformat(),
+         prev_start.isoformat(), start.isoformat()),
+    )
+    vampire_row = vampire_row or {}
+    vampire_kwh     = (vampire_row.get("cur_vampire_pct") or 0) * pct_to_kwh
+    prev_vampire_kwh = (vampire_row.get("prev_vampire_pct") or 0) * pct_to_kwh
 
-    # PERF: prev_km / prev_kwh already computed above via FILTER aggregate.
+    # Backwards-compat: legacy "kwh" used in vs-prev comparison. Prefer
+    # charge_kwh (what you actually paid for) when available; otherwise fall
+    # back to drive_kwh so the line still makes sense.
+    kwh = charge_kwh if charge_kwh > 0 else drive_kwh
+    prev_kwh = prev_charge_kwh if prev_charge_kwh > 0 else prev_drive_kwh
 
     if USE_METRIC_UNITS:
-        lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]
+        lines = [
+            f"**Monthly Report -- {year}-{month:02d}**",
+            "*Energy split into three independent categories — never mixed:*\n",
+        ]
         lines.append(f"Trips: {trips}")
         lines.append(f"Distance: {km:.1f} km")
-        lines.append(f"Energy: {kwh:.1f} kWh")
-        lines.append(f"Avg efficiency: {_format_efficiency(kwh, km)}")
+        lines.append(f"Driving energy (行驶能耗, range-drop est.): {drive_kwh:.1f} kWh")
+        lines.append(f"Charging energy (充电能耗, sessions): {charge_kwh:.1f} kWh")
+        lines.append(f"Vampire drain (停车耗电, parked): {vampire_kwh:.1f} kWh")
+        # Wh/km uses ONLY driving kWh — charging losses & vampire drain excluded
+        lines.append(f"Avg efficiency (driving): {_format_efficiency(drive_kwh, km)}")
         lines.append(f"Charging cost: RMB{total_cost:.2f}" if total_cost else "Charging cost: N/A")
         lines.append(f"Time driving: {minutes} min")
     else:
         mi = round(km * 0.621371)
-        wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
-        lines = [f"**Monthly Report -- {year}-{month:02d}**\n"]
+        wh_mi = round(drive_kwh * 1000 / mi) if mi > 0 else 0
+        lines = [
+            f"**Monthly Report -- {year}-{month:02d}**",
+            "*Energy split into three independent categories — never mixed:*\n",
+        ]
         lines.append(f"Trips: {trips}")
         lines.append(f"Distance: {mi} mi ({km:.1f} km)")
-        lines.append(f"Energy: {kwh:.1f} kWh")
-        lines.append(f"Avg efficiency: {wh_mi} Wh/mi")
+        lines.append(f"Driving energy (range-drop est.): {drive_kwh:.1f} kWh")
+        lines.append(f"Charging energy (sessions): {charge_kwh:.1f} kWh")
+        lines.append(f"Vampire drain (parked): {vampire_kwh:.1f} kWh")
+        lines.append(f"Avg efficiency (driving): {wh_mi} Wh/mi")
         lines.append(f"Charging cost: ${total_cost:.2f}" if total_cost else "Charging cost: N/A")
         lines.append(f"Time driving: {minutes} min")
 
     if prev_km > 0:
         dist_delta = round((km - prev_km) / prev_km * 100)
-        eff_delta = round((kwh - prev_kwh) / prev_kwh * 100) if prev_kwh > 0 else 0
-        lines.append(f"\nvs prev month: distance {dist_delta:+d}%, energy {eff_delta:+d}%")
-
-    if kwh_estimated:
-        lines.append("\n*注：当月无充电记录，能耗基于续航差值估算，实际值可能更高。*")
+        drive_delta = round((drive_kwh - prev_drive_kwh) / prev_drive_kwh * 100) if prev_drive_kwh > 0 else 0
+        charge_delta = round((charge_kwh - prev_charge_kwh) / prev_charge_kwh * 100) if prev_charge_kwh > 0 else 0
+        vampire_delta = round((vampire_kwh - prev_vampire_kwh) / prev_vampire_kwh * 100) if prev_vampire_kwh > 0 else 0
+        lines.append(
+            f"\nvs prev month: distance {dist_delta:+d}%, "
+            f"drive {drive_delta:+d}%, charge {charge_delta:+d}%, vampire {vampire_delta:+d}%"
+        )
 
     return "\n".join(lines)
 
@@ -3977,7 +4073,15 @@ async def tesla_tpms_history(days: int = 30, start_date: str | None = None, end_
 
 @mcp.tool()
 async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> str:
-    """Monthly driving summary -- miles, kWh, cost, efficiency.
+    """Monthly driving summary -- splits energy into three independent categories:
+
+      * Drive kWh   -- estimated from drive range-drop (行驶能耗)
+      * Charge kWh  -- energy added during charging sessions (充电能耗)
+      * Vampire kWh -- parked drain between drive_end and next event (停车耗电)
+
+    Wh/km uses ONLY driving kWh so efficiency is not contaminated by charging
+    losses or vampire drain. The three categories are summed independently
+    from their respective primary sources and never mixed in calculations.
 
     Args:
         months: Number of months to show (default: 6, max: 120)
@@ -3987,76 +4091,139 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
     effective_car_id = car_id if car_id is not None else CAR_ID
     if months <= 0 or months > 120:
         return "❌ months must be between 1 and 120"
+    car_cfg = _get_car_config(effective_car_id)
+    kwh_per_km = car_cfg["kwh_per_km"]
+    pct_to_kwh = car_cfg["kwh"] / 100.0  # 1% battery -> kWh (vampire column)
     rows = _query(
         """
-        SELECT d.month,
-               d.trips,
-               d.total_km,
-               d.total_min,
-               COALESCE(c.total_kwh, 0) AS total_kwh,
-               COALESCE(c.total_cost, 0) AS total_cost
-        FROM (
+        WITH drives_m AS (
             SELECT date_trunc('month', start_date) AS month,
                    COUNT(id) AS trips,
                    COALESCE(SUM(distance), 0) AS total_km,
-                   COALESCE(SUM(duration_min), 0) AS total_min
+                   COALESCE(SUM(duration_min), 0) AS total_min,
+                   COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0) * %s), 0) AS drive_kwh
             FROM drives
             WHERE car_id = %s AND distance > 0
             GROUP BY date_trunc('month', start_date)
-        ) d
-        LEFT JOIN (
+        ),
+        charging_m AS (
             SELECT date_trunc('month', start_date) AS month,
-                   SUM(charge_energy_added) AS total_kwh,
+                   SUM(charge_energy_added) AS charge_kwh,
                    SUM(cost) AS total_cost
             FROM charging_processes
             WHERE car_id = %s AND end_date IS NOT NULL
             GROUP BY date_trunc('month', start_date)
-        ) c ON d.month = c.month
+        ),
+        events AS (
+            SELECT d.end_date AS ts, p.battery_level
+            FROM drives d JOIN positions p ON p.id = d.end_position_id
+            WHERE d.car_id = %s AND d.end_date IS NOT NULL AND p.battery_level IS NOT NULL
+            UNION ALL
+            SELECT d.start_date AS ts, p.battery_level
+            FROM drives d JOIN positions p ON p.id = d.start_position_id
+            WHERE d.car_id = %s AND d.battery_level IS NOT NULL
+            UNION ALL
+            SELECT start_date AS ts, start_battery_level AS battery_level
+            FROM charging_processes
+            WHERE car_id = %s AND start_battery_level IS NOT NULL
+        ),
+        ordered AS (
+            SELECT ts, battery_level,
+                   LEAD(ts) OVER (ORDER BY ts) AS next_ts,
+                   LEAD(battery_level) OVER (ORDER BY ts) AS next_battery_level
+            FROM events
+        ),
+        vampire_m AS (
+            SELECT date_trunc('month', ts) AS month,
+                   SUM(GREATEST(battery_level - next_battery_level, 0)) AS vampire_pct_sum
+            FROM ordered
+            WHERE next_ts IS NOT NULL
+              AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 8
+              AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168
+              AND (battery_level - next_battery_level) > 0
+            GROUP BY date_trunc('month', ts)
+        )
+        SELECT d.month, d.trips, d.total_km, d.total_min,
+               d.drive_kwh,
+               COALESCE(c.charge_kwh, 0) AS charge_kwh,
+               COALESCE(v.vampire_pct_sum, 0) * %s AS vampire_kwh,
+               COALESCE(c.total_cost, 0) AS total_cost
+        FROM drives_m d
+        LEFT JOIN charging_m c ON d.month = c.month
+        LEFT JOIN vampire_m v ON d.month = v.month
         ORDER BY d.month DESC
         LIMIT %s
-    """,
-        (effective_car_id, effective_car_id, months,),
+        """,
+        (kwh_per_km, effective_car_id,
+         effective_car_id,
+         effective_car_id, effective_car_id, effective_car_id,
+         pct_to_kwh,
+         months),
     )
 
     if not rows:
         return "No driving data yet."
 
     if USE_METRIC_UNITS:
-        lines = ["**Monthly Summary**\n"]
+        lines = [
+            "**Monthly Summary**",
+            "*kWh split into three independent categories: "
+            "Drive (range-drop estimate) | Charge (kWh added) | Vampire (parked drain). "
+            "Wh/km uses driving kWh only -- never mixed.*\n",
+        ]
         lines.append(
-            f"{'Month':<12} {'Trips':>6} {'km':>10} {'kWh':>8} {'Wh/km':>7} {'Cost':>8}"
+            f"{'Month':<10} {'Trips':>5} {'km':>9} "
+            f"{'Drive kWh':>10} {'Charge kWh':>11} {'Vampire kWh':>12} "
+            f"{'Wh/km':>7} {'Cost':>10}"
         )
-        lines.append("-" * 57)
+        lines.append("-" * 84)
 
         for r in rows:
             month = str(r.get("month", ""))[:7]
             trips = r.get("trips", 0)
             km = r.get("total_km") or 0
-            kwh = r.get("total_kwh") or 0
+            drive_kwh = r.get("drive_kwh") or 0
+            charge_kwh = r.get("charge_kwh") or 0
+            vampire_kwh = r.get("vampire_kwh") or 0
             total_cost = r.get("total_cost") or 0
-            eff_str = _format_efficiency(kwh, km) if km > 0 else "N/A"
+            # Wh/km uses ONLY driving kWh -- keeps the metric free of charging
+            # losses and vampire drain contamination.
+            eff_str = _format_efficiency(drive_kwh, km) if km > 0 else "N/A"
             cost_str = f"RMB{total_cost:.2f}" if total_cost else "N/A"
             lines.append(
-                f"{month:<12} {trips:>6} {km:>9,.0f} {kwh:>7.1f} {eff_str:>7} {cost_str:>8}"
+                f"{month:<10} {trips:>5} {km:>9,.0f} "
+                f"{drive_kwh:>10.1f} {charge_kwh:>11.1f} {vampire_kwh:>12.1f} "
+                f"{eff_str:>7} {cost_str:>10}"
             )
     else:
-        lines = ["**Monthly Summary**\n"]
+        lines = [
+            "**Monthly Summary**",
+            "*kWh split into three independent categories: "
+            "Drive (range-drop estimate) | Charge (kWh added) | Vampire (parked drain). "
+            "Wh/mi uses driving kWh only -- never mixed.*\n",
+        ]
         lines.append(
-            f"{'Month':<12} {'Trips':>6} {'Miles':>10} {'kWh':>8} {'Wh/mi':>7} {'Cost':>8}"
+            f"{'Month':<10} {'Trips':>5} {'Miles':>9} "
+            f"{'Drive kWh':>10} {'Charge kWh':>11} {'Vampire kWh':>12} "
+            f"{'Wh/mi':>7} {'Cost':>10}"
         )
-        lines.append("-" * 57)
+        lines.append("-" * 84)
 
         for r in rows:
             month = str(r.get("month", ""))[:7]
             trips = r.get("trips", 0)
             km = r.get("total_km") or 0
             mi = round(km * 0.621371)
-            kwh = r.get("total_kwh") or 0
+            drive_kwh = r.get("drive_kwh") or 0
+            charge_kwh = r.get("charge_kwh") or 0
+            vampire_kwh = r.get("vampire_kwh") or 0
             total_cost = r.get("total_cost") or 0
-            wh_mi = round(kwh * 1000 / (km * 0.621371)) if km > 0 else 0
+            wh_mi = round(drive_kwh * 1000 / mi) if mi > 0 else 0
             cost_str = f"${total_cost:.2f}" if total_cost else "N/A"
             lines.append(
-                f"{month:<12} {trips:>6} {mi:>9,} {kwh:>7.1f} {wh_mi:>7} {cost_str:>8}"
+                f"{month:<10} {trips:>5} {mi:>9,} "
+                f"{drive_kwh:>10.1f} {charge_kwh:>11.1f} {vampire_kwh:>12.1f} "
+                f"{wh_mi:>7} {cost_str:>10}"
             )
 
     return "\n".join(lines)
@@ -4067,7 +4234,12 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
     """Vampire drain analysis -- battery loss while parked overnight.
 
     Checks for periods where the car was parked (no drives) for 8+ hours
-    and measures battery drop.
+    and measures battery drop. Periods with > TESLA_CAMPING_KWH_PER_DAY
+    (default 10) kWh/day of battery loss are tagged as "露营模式" — almost
+    certainly active use (A/C while sleeping in the car, heavy sentry,
+    third-party polling) rather than idle drain. If QWeather is configured,
+    the current weather at the parking location is shown for the worst few
+    events AND every camping-mode event (display-only).
 
     Args:
         days: Number of days to analyze (default: 14)
@@ -4095,25 +4267,28 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
     rows = _query(
         f"""
         WITH events AS (
-            -- driving 结束：用 end_position_id 查 positions.battery_level
-            SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
+            -- driving 结束：用 end_position_id 查 positions.battery_level + 停车点坐标
+            SELECT d.end_date AS ts, p.battery_level,
+                   p.latitude AS lat, p.longitude AS lon, 'drive_end' AS kind
             FROM drives d
             JOIN positions p ON p.id = d.end_position_id
             WHERE d.car_id = %s AND d.end_date IS NOT NULL AND p.battery_level IS NOT NULL
             UNION ALL
             -- driving 开始：用 start_position_id 查 positions.battery_level
-            SELECT d.start_date AS ts, p.battery_level, 'drive_start' AS kind
+            SELECT d.start_date AS ts, p.battery_level,
+                   p.latitude AS lat, p.longitude AS lon, 'drive_start' AS kind
             FROM drives d
             JOIN positions p ON p.id = d.start_position_id
             WHERE d.car_id = %s AND p.battery_level IS NOT NULL
             UNION ALL
-            -- charging 开始：直接用 start_battery_level
-            SELECT start_date AS ts, start_battery_level AS battery_level, 'charge_start' AS kind
+            -- charging 开始：直接用 start_battery_level（无坐标）
+            SELECT start_date AS ts, start_battery_level AS battery_level,
+                   NULL::double precision AS lat, NULL::double precision AS lon, 'charge_start' AS kind
             FROM charging_processes
             WHERE car_id = %s AND start_battery_level IS NOT NULL
         ),
         ordered AS (
-            SELECT ts, battery_level, kind,
+            SELECT ts, battery_level, lat, lon, kind,
                    LEAD(ts) OVER (ORDER BY ts) AS next_ts,
                    LEAD(battery_level) OVER (ORDER BY ts) AS next_battery_level,
                    LEAD(kind) OVER (ORDER BY ts) AS next_kind
@@ -4123,6 +4298,8 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
                next_ts AS date,
                battery_level AS prev_level,
                next_battery_level AS battery_level,
+               lat AS park_lat,
+               lon AS park_lon,
                (battery_level - next_battery_level) AS drain,
                EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 AS hours_parked
         FROM ordered
@@ -4144,6 +4321,50 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
     if not rows:
         return f"No significant vampire drain detected ({date_range})."
 
+    # v1.2.3: flag "camping mode" — parked periods with > CAMPING_KWH_PER_DAY kWh/day
+    # of battery loss are almost certainly active use (A/C while sleeping, sentry
+    # recording, third-party polling) rather than idle drain, so we tag them and
+    # always fetch parking-location weather for them (even if not in the top N).
+    # Convert drain% → kWh via the car's usable battery capacity.
+    camping_ids: set[int] = set()
+    if CAMPING_KWH_PER_DAY > 0:
+        _battery_kwh = _get_car_config(effective_car_id)["kwh"]
+        for r in rows:
+            drain_pct = r.get("drain", 0)
+            hours = r.get("hours_parked", 0)
+            if hours > 0 and drain_pct > 0:
+                kwh_per_day = (drain_pct * _battery_kwh / 100.0) / (hours / 24.0)
+                if kwh_per_day > CAMPING_KWH_PER_DAY:
+                    camping_ids.add(id(r))
+
+    # v1.2.3: attach current weather at the parking location for the top drain
+    # events AND every camping-mode event (display-only). Grid-dedup so the same
+    # spot isn't looked up twice. Silently skipped when QWeather is disabled or
+    # the row has no coordinates.
+    park_weather: dict[int, str] = {}
+    if QWEATHER_ENABLED:
+        seen: dict[str, str] = {}
+        # Combine criteria, preserving order: top-N first (visual priority),
+        # then any camping-mode event not already covered. Manual id-based
+        # dedupe — `dict.fromkeys` would hash the dict VALUES (unhashable),
+        # so we must key off `id(r)` to dedupe by row identity.
+        targets: list = []
+        seen_ids: set[int] = set()
+        for r in list(rows[:VAMPIRE_WEATHER_MAX]) + [r for r in rows if id(r) in camping_ids]:
+            if id(r) not in seen_ids:
+                seen_ids.add(id(r))
+                targets.append(r)
+        for r in targets:
+            plat, plon = r.get("park_lat"), r.get("park_lon")
+            if plat is None or plon is None:
+                continue
+            gkey = f"{round(float(plat), 2)},{round(float(plon), 2)}"
+            if gkey not in seen:
+                w = await _qweather_now(float(plat), float(plon))
+                seen[gkey] = _format_current_weather(w) if w is not None else ""
+            if seen[gkey]:
+                park_weather[id(r)] = seen[gkey]
+
     lines = [f"**Vampire Drain** ({date_range})\n"]
     total_drain = 0
     total_hours = 0
@@ -4154,7 +4375,13 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
         total_hours += hours
         rate = round(drain / hours, 2) if hours > 0 else 0
         date = _format_dt(r.get("prev_date"))[:10]
-        lines.append(f"- {date}: -{drain}% over {hours:.0f}h ({rate}%/hr)")
+        line = f"- {date}: -{drain}% over {hours:.0f}h ({rate}%/hr)"
+        if id(r) in camping_ids:
+            line += "  🏕️ 露营模式"
+        wx = park_weather.get(id(r))
+        if wx:
+            line += f"  🌦️ {wx}"
+        lines.append(line)
 
     avg_rate = round(total_drain / total_hours, 2) if total_hours > 0 else 0
     lines.append(f"\nAverage drain rate: {avg_rate}%/hr")
