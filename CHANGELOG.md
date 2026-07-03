@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-07-03
+
+Patch release — **0 database changes**. Eliminates redundant (billed) QWeather GeoAPI calls under concurrency. Purely an in-app reliability/cost fix; no API surface, tool count, or behaviour changes for callers.
+
+### Fixed
+
+- **QWeather LocationID single-flight (P0-2)** — `_qweather_locationid()`
+  previously released its lock between the cache-miss check and the cache
+  write, so multiple coroutines resolving the **same** grid cell concurrently
+  could each fire a separate (billed) GeoAPI `city/lookup` request. Added a
+  per-grid-key `asyncio.Lock` so only the first caller performs the lookup; the
+  rest await it and reuse the cached result (double-checked after acquiring the
+  flight lock). Directly reduces GeoAPI spend under concurrent access. The
+  in-flight lock map is itself guarded by the existing threading lock and
+  bounded (free locks pruned past `_QW_INFLIGHT_MAX = 256`).
+
+### Testing
+
+- Added a **Layer 5** regression test to `test_all.py`: 20 concurrent lookups
+  of the same grid cell now make exactly **1** GeoAPI call (was up to 20);
+  cache hits make 0; a different cell makes exactly 1 more. **92 passed / 0
+  failed** overall (88 → 92).
+
+---
+
 ## [1.2.1] - 2026-06-30
 
 Weather integration release — **0 database changes**. Adds optional weather enrichment via QWeather (和风天气): a real-time weather tool, a weather-bucketed efficiency analysis backed by QWeather's *historical* API, and a destination-weather correction for trip-cost estimates. Fully backward compatible: when `QWEATHER_API_KEY` / `QWEATHER_API_HOST` are unset, all weather features are silently disabled and nothing else changes.

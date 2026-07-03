@@ -314,7 +314,7 @@ def test_unit():
     saved_qw = tesla.QWEATHER_ENABLED
     tesla.QWEATHER_ENABLED = False
     check("v1.2.1 _qweather_now disabled → None", asyncio.run(tesla._qweather_now(39.9, 116.4)) is None)
-    check("v1.2.1 _qweather_locationid disabled → None", asyncio.run(tesla._qweather_locationid(39.9, 116.4)) is None)
+    check("_qweather_locationid disabled → None", asyncio.run(tesla._qweather_locationid(39.9, 116.4)) is None)
     check("v1.2.1 _qweather_historical disabled → None", asyncio.run(tesla._qweather_historical("101010100", "20260101")) is None)
     tesla.QWEATHER_ENABLED = saved_qw
 
@@ -493,11 +493,82 @@ def test_review_fixes():
         tesla._put_conn = orig_put
 
 
+# =====================================================================
+# Layer 5 — regression test for the v1.2.2 fix
+#   P0-2: QWeather LocationID single-flight — concurrent lookups of the SAME
+#         grid cell fire only ONE (billed) GeoAPI call, the rest reuse it.
+# =====================================================================
+
+async def _test_single_flight_async():
+    print("\n[Layer 5] QWeather LocationID single-flight (P0-2)")
+
+    # A fake httpx.AsyncClient that counts real GeoAPI calls and adds a small
+    # await so concurrent coroutines genuinely overlap inside the helper.
+    call_count = {"geo": 0}
+
+    class _FakeResp:
+        def raise_for_status(self): return None
+        def json(self):
+            return {"code": "200", "location": [{"id": "101010100"}]}
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, params=None):
+            call_count["geo"] += 1
+            await asyncio.sleep(0.02)  # widen the race window
+            return _FakeResp()
+
+    orig_enabled = tesla.QWEATHER_ENABLED
+    orig_client = tesla.httpx.AsyncClient
+    orig_cache = dict(tesla._qw_locid_cache)
+    orig_inflight = dict(tesla._qw_locid_inflight)
+    try:
+        tesla.QWEATHER_ENABLED = True
+        tesla.httpx.AsyncClient = _FakeClient  # type: ignore[assignment]
+        tesla._qw_locid_cache.clear()
+        tesla._qw_locid_inflight.clear()
+
+        # 20 concurrent lookups of the SAME coordinate (same grid cell).
+        results = await asyncio.gather(
+            *[tesla._qweather_locationid(39.9042, 116.4074) for _ in range(20)]
+        )
+
+        check("P0-2 only ONE billed GeoAPI call for 20 concurrent same-cell lookups",
+              call_count["geo"] == 1, f"got {call_count['geo']} calls")
+        check("P0-2 all concurrent callers got the same LocationID",
+              all(r == "101010100" for r in results),
+              f"results={set(results)}")
+        # A subsequent call must be a pure cache hit (still just 1 total).
+        again = await tesla._qweather_locationid(39.9042, 116.4074)
+        check("P0-2 later call is a cache hit (no new GeoAPI call)",
+              call_count["geo"] == 1 and again == "101010100",
+              f"calls={call_count['geo']}, id={again}")
+
+        # A DIFFERENT cell must trigger exactly one more call.
+        _ = await tesla._qweather_locationid(31.2304, 121.4737)  # Shanghai
+        check("P0-2 different cell triggers exactly one more call",
+              call_count["geo"] == 2, f"got {call_count['geo']} calls")
+    finally:
+        tesla.QWEATHER_ENABLED = orig_enabled
+        tesla.httpx.AsyncClient = orig_client  # type: ignore[assignment]
+        tesla._qw_locid_cache.clear()
+        tesla._qw_locid_cache.update(orig_cache)
+        tesla._qw_locid_inflight.clear()
+        tesla._qw_locid_inflight.update(orig_inflight)
+
+
+def test_single_flight():
+    asyncio.run(_test_single_flight_async())
+
+
 def main():
     test_unit()
     asyncio.run(test_tools())
     asyncio.run(test_error_paths())
     test_review_fixes()
+    test_single_flight()
     print("\n" + "=" * 60)
     print(f"RESULT: {PASS} passed, {FAIL} failed")
     if FAILURES:

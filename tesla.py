@@ -109,6 +109,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import time
+import asyncio
 import threading
 import atexit
 
@@ -116,7 +117,7 @@ import atexit
 # Source of truth for this release. Bump this constant when tagging a new
 # release. Overridable at runtime via env (Docker build-arg) or git describe
 # for development checkouts.
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 
 def _detect_version() -> str:
@@ -857,6 +858,32 @@ _qw_locid_lock = threading.Lock()
 _QW_LOCID_GRID = 0.05  # ~5km snapping for LocationID reuse
 _QW_LOCID_MAX = 2000
 
+# Single-flight: one asyncio.Lock per grid key so that concurrent callers
+# resolving the SAME cell don't each fire a (billed) GeoAPI lookup — only the
+# first proceeds, the rest await it and reuse the cached result. The map itself
+# is guarded by the threading lock above (creation is a fast, non-blocking op).
+_qw_locid_inflight: dict[str, asyncio.Lock] = {}
+_QW_INFLIGHT_MAX = 256
+
+
+def _qw_locid_flight_lock(gkey: str) -> asyncio.Lock:
+    """Return the per-grid-key single-flight lock, creating it if needed."""
+    with _qw_locid_lock:
+        lock = _qw_locid_inflight.get(gkey)
+        if lock is None:
+            # Opportunistically bound the map so a long-running process with
+            # many distinct cells can't grow it without limit. Only prune keys
+            # whose lock is currently free (not held / not awaited).
+            if len(_qw_locid_inflight) >= _QW_INFLIGHT_MAX:
+                for k in list(_qw_locid_inflight.keys()):
+                    if not _qw_locid_inflight[k].locked():
+                        del _qw_locid_inflight[k]
+                    if len(_qw_locid_inflight) < _QW_INFLIGHT_MAX:
+                        break
+            lock = asyncio.Lock()
+            _qw_locid_inflight[gkey] = lock
+        return lock
+
 
 def _qw_url(path: str) -> str:
     """Build a full QWeather URL on the account's dedicated host."""
@@ -919,29 +946,41 @@ async def _qweather_locationid(lat: float, lon: float) -> str | None:
         hit = _qw_locid_cache.get(gkey)
     if hit is not None:
         return hit or None  # "" sentinel means "looked up, not found"
-    loc = f"{lon:.2f},{lat:.2f}"
-    location_id = ""
-    try:
-        async with httpx.AsyncClient(timeout=QWEATHER_TIMEOUT) as client:
-            resp = await client.get(
-                _qw_url("/geo/v2/city/lookup"),
-                params={"location": loc, "key": QWEATHER_API_KEY, "number": "1"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        if str(data.get("code")) == "200":
-            locs = data.get("location") or []
-            if locs:
-                location_id = str(locs[0].get("id") or "")
-    except (httpx.HTTPError, ValueError) as e:
-        _log.warning(f"[WEATHER] QWeather GeoAPI failed for {loc}: {e}")
-        return None  # transient: don't cache a failure
-    with _qw_locid_lock:
-        if len(_qw_locid_cache) >= _QW_LOCID_MAX:
-            # drop oldest insertion
-            _qw_locid_cache.pop(next(iter(_qw_locid_cache)), None)
-        _qw_locid_cache[gkey] = location_id  # cache "" to avoid re-looking-up misses
-    return location_id or None
+
+    # Single-flight: serialize concurrent lookups of the same cell so only one
+    # billed GeoAPI call is made; the rest wait and reuse the cached result.
+    flight = _qw_locid_flight_lock(gkey)
+    async with flight:
+        # Double-check: another coroutine may have filled the cache while we
+        # were waiting for the flight lock.
+        with _qw_locid_lock:
+            hit = _qw_locid_cache.get(gkey)
+        if hit is not None:
+            return hit or None
+
+        loc = f"{lon:.2f},{lat:.2f}"
+        location_id = ""
+        try:
+            async with httpx.AsyncClient(timeout=QWEATHER_TIMEOUT) as client:
+                resp = await client.get(
+                    _qw_url("/geo/v2/city/lookup"),
+                    params={"location": loc, "key": QWEATHER_API_KEY, "number": "1"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            if str(data.get("code")) == "200":
+                locs = data.get("location") or []
+                if locs:
+                    location_id = str(locs[0].get("id") or "")
+        except (httpx.HTTPError, ValueError) as e:
+            _log.warning(f"[WEATHER] QWeather GeoAPI failed for {loc}: {e}")
+            return None  # transient: don't cache a failure
+        with _qw_locid_lock:
+            if len(_qw_locid_cache) >= _QW_LOCID_MAX:
+                # drop oldest insertion
+                _qw_locid_cache.pop(next(iter(_qw_locid_cache)), None)
+            _qw_locid_cache[gkey] = location_id  # cache "" to avoid re-looking-up misses
+        return location_id or None
 
 
 async def _qweather_historical(location_id: str, date_yyyymmdd: str) -> dict | None:
