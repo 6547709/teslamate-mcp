@@ -27,6 +27,11 @@ os.environ.setdefault("TESLAMATE_DB_HOST", "localhost")
 os.environ.setdefault("TESLAMATE_DB_PASS", "test")
 os.environ.setdefault("USE_METRIC_UNITS", "true")
 os.environ.setdefault("TIMEZONE", "Asia/Shanghai")
+# Set sensible car defaults so module-level car config doesn't fall back to
+# the loud "no config" warning path. Tests that want to exercise the missing-
+# config path should pop these before importing tesla.
+os.environ.setdefault("TESLA_BATTERY_KWH", "75")
+os.environ.setdefault("TESLA_BATTERY_RANGE_KM", "525")
 
 import tesla  # noqa: E402
 
@@ -351,41 +356,92 @@ def test_unit():
     check("v1.2.1 _qweather_historical disabled → None", asyncio.run(tesla._qweather_historical("101010100", "20260101")) is None)
     tesla.QWEATHER_ENABLED = saved_qw
 
+    # ---- v1.2.3: car config must come from env, no hardcoded constants -----
+    # The top-level BATTERY_KWH / BATTERY_RANGE_KM / KWH_PER_KM module
+    # constants were removed — car info must come exclusively from env vars
+    # (TESLA_CAR_PARAMS or TESLA_BATTERY_KWH + TESLA_BATTERY_RANGE_KM).
+    check("v1.2.3 BATTERY_KWH module constant removed",
+          not hasattr(tesla, "BATTERY_KWH"))
+    check("v1.2.3 BATTERY_RANGE_KM module constant removed",
+          not hasattr(tesla, "BATTERY_RANGE_KM"))
+    check("v1.2.3 KWH_PER_KM module constant removed",
+          not hasattr(tesla, "KWH_PER_KM"))
+    # Camping reference is intentionally a fixed algorithm constant (NOT a car
+    # config) — the user explicitly wants the camping-rate threshold to be
+    # battery-size-independent, hence the hardcoded 75 kWh reference.
+    check("v1.2.3 CAMPING_REFERENCE_BATTERY_KWH is fixed at 75.0 (algorithm constant)",
+          tesla.CAMPING_REFERENCE_BATTERY_KWH == 75.0)
+
     # ---- v1.2.3: camping-mode flag in tesla_vampire_drain --------------------
-    # Threshold default + env override both honoured.
-    check("v1.2.3 CAMPING_KWH_PER_DAY default == 10",
-          tesla.CAMPING_KWH_PER_DAY == 10, f"got {tesla.CAMPING_KWH_PER_DAY}")
-    # End-to-end: a row whose drain%/hours imply > 10 kWh/day must be tagged
-    # 露营模式. Default car is 75 kWh → kWh per 1% battery = 0.75. Row of
-    # drain=15%, hours=20 → 15 * 0.75 / (20/24) = 13.5 kWh/day → camping.
-    _high_drain_row = {
+    # Rate-based threshold: kWh/h averaged over the parked period, computed
+    # against a FIXED 75 kWh reference battery (battery-size-independent).
+    check("v1.2.3 CAMPING_KWH_PER_HOUR default == 0.8",
+          tesla.CAMPING_KWH_PER_HOUR == 0.8, f"got {tesla.CAMPING_KWH_PER_HOUR}")
+    check("v1.2.3 CAMPING_REFERENCE_BATTERY_KWH == 75.0",
+          tesla.CAMPING_REFERENCE_BATTERY_KWH == 75.0)
+    # End-to-end: rate >= 0.8 kWh/h triggers 露营模式. SQL already enforces
+    # hours >= 8 and drain > 0. Formula: kWh/h = drain% × 75 / 100 / hours.
+    # drain=15%, hours=10 → 15 × 75/100 / 10 = 1.125 kWh/h ≥ 0.8 → camping.
+    _high_rate_row = {
         "prev_date": _NOW - timedelta(days=1),
-        "date": _NOW - timedelta(days=1) + timedelta(hours=20),
-        "prev_level": 90, "battery_level": 75, "drain": 15, "hours_parked": 20.0,
-        "hours_gap": 20.0, "park_lat": 31.23, "park_lon": 121.47,
+        "date": _NOW - timedelta(days=1) + timedelta(hours=10),
+        "prev_level": 90, "battery_level": 75, "drain": 15, "hours_parked": 10.0,
+        "hours_gap": 10.0, "park_lat": 31.23, "park_lon": 121.47,
     }
     saved_q = tesla._query
     saved_q1 = tesla._query_one
-    tesla._query = lambda sql, params=(): [_high_drain_row]
+    tesla._query = lambda sql, params=(): [_high_rate_row]
     tesla._query_one = lambda sql, params=(): None
     try:
         out = asyncio.run(tesla.tesla_vampire_drain(days=14))
-        check("v1.2.3 vampire_drain tags high-drain event as 露营模式",
+        check("v1.2.3 vampire_drain tags high-rate event as 露营模式",
               "露营模式" in out, out[:200])
-        # Negative case: drain=2%, hours=20 → 2*0.75/(20/24) = 1.8 kWh/day → not camping
-        _low_drain_row = dict(_high_drain_row, drain=2, hours_parked=20.0)
-        tesla._query = lambda sql, params=(): [_low_drain_row]
+        # Negative: drain=2%, hours=10 → 2 × 75/100 / 10 = 0.15 kWh/h → not camping
+        _low_rate_row = dict(_high_rate_row, drain=2, hours_parked=10.0)
+        tesla._query = lambda sql, params=(): [_low_rate_row]
         out2 = asyncio.run(tesla.tesla_vampire_drain(days=14))
-        check("v1.2.3 vampire_drain does NOT tag low-drain event as 露营模式",
+        check("v1.2.3 vampire_drain does NOT tag low-rate event as 露营模式",
               "露营模式" not in out2, out2[:200])
+        # Battery-size-independence: same drain%/hours should yield the same
+        # verdict regardless of what TESLA_BATTERY_KWH says. (We verify by
+        # running the same row with different car configs and checking the
+        # kWh/h math gives identical results since the reference is fixed.)
+        saved_cfg = tesla._get_car_config
+        tesla._get_car_config = lambda cid: {"kwh": 100.0, "range_km": 600, "kwh_per_km": 0.1667}
+        # 16 × 75 / 100 / 15 = 0.8 kWh/h exactly (no float drift) → camping (≥)
+        _boundary_row = {"prev_date": _NOW - timedelta(days=1),
+                         "date": _NOW - timedelta(days=1) + timedelta(hours=15),
+                         "prev_level": 90, "battery_level": 74, "drain": 16,
+                         "hours_parked": 15.0, "hours_gap": 15.0,
+                         "park_lat": 31.23, "park_lon": 121.47}
+        tesla._query = lambda sql, params=(): [_boundary_row]
+        out_b = asyncio.run(tesla.tesla_vampire_drain(days=14))
+        check("v1.2.3 boundary rate (0.8 kWh/h) → camping (≥)",
+              "露营模式" in out_b, out_b[:200])
+        # Just below threshold: 12 × 75 / 100 / 12 = 0.75 kWh/h → NOT camping
+        _just_below = dict(_boundary_row, drain=12, hours_parked=12.0,
+                           hours_gap=12.0)
+        tesla._query = lambda sql, params=(): [_just_below]
+        out_jb = asyncio.run(tesla.tesla_vampire_drain(days=14))
+        check("v1.2.3 rate just below threshold (0.75 kWh/h) → NOT camping",
+              "露营模式" not in out_jb, out_jb[:200])
+        tesla._get_car_config = saved_cfg
+        # Edge case: long parking (168h) with high drain — rate determines
+        # verdict, not duration. drain=20%, hours=168 → 0.089 kWh/h → NOT camping.
+        _long_low_rate = dict(_high_rate_row, drain=20, hours_parked=168.0,
+                              hours_gap=168.0)
+        tesla._query = lambda sql, params=(): [_long_low_rate]
+        out_long = asyncio.run(tesla.tesla_vampire_drain(days=14))
+        check("v1.2.3 long parking (168h, 20%) with low rate → NOT camping",
+              "露营模式" not in out_long, out_long[:200])
         # Disabled: setting threshold to 0 must skip the flag entirely.
-        _saved_threshold = tesla.CAMPING_KWH_PER_DAY
-        tesla.CAMPING_KWH_PER_DAY = 0
-        tesla._query = lambda sql, params=(): [_high_drain_row]
+        _saved_threshold = tesla.CAMPING_KWH_PER_HOUR
+        tesla.CAMPING_KWH_PER_HOUR = 0
+        tesla._query = lambda sql, params=(): [_high_rate_row]
         out3 = asyncio.run(tesla.tesla_vampire_drain(days=14))
         check("v1.2.3 camping disabled (threshold=0) → no tag",
               "露营模式" not in out3, out3[:200])
-        tesla.CAMPING_KWH_PER_DAY = _saved_threshold
+        tesla.CAMPING_KWH_PER_HOUR = _saved_threshold
     finally:
         tesla._query = saved_q
         tesla._query_one = saved_q1
@@ -393,8 +449,9 @@ def test_unit():
     # Regression: when QWeather is enabled AND there are multiple rows
     # (incl. camping events), the dedupe path must not crash with
     # `unhashable type: 'dict'`. Exercises the full targets-combine loop.
-    _rows = [_high_drain_row, {**_high_drain_row, "park_lat": 31.30, "park_lon": 121.55,
-                                "drain": 18, "prev_level": 92, "battery_level": 74}]
+    _rows = [_high_rate_row, {**_high_rate_row, "park_lat": 31.30, "park_lon": 121.55,
+                                "drain": 18, "prev_level": 92, "battery_level": 74,
+                                "hours_parked": 10.0, "hours_gap": 10.0}]
     saved_q = tesla._query
     saved_q1 = tesla._query_one
     saved_qw = tesla.QWEATHER_ENABLED

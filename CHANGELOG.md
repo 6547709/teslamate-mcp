@@ -17,7 +17,7 @@ All notable changes are documented in this file. The format follows [Keep a Chan
 
 #### 新增
 
-- **`tesla_vampire_drain` 露营模式标记** —— 停车期间平均每日耗电超过 `TESLA_CAMPING_KWH_PER_DAY`（默认 **10**）kWh/day 的事件自动标记为 `🏕️ 露营模式`（多半是睡眠开空调、哨兵模式狂写、第三方 app 频繁唤醒 —— 不是单纯闲置漏电）。所有露营事件**保证附带停车点天气**，根因一眼可见。
+- **`tesla_vampire_drain` 露营模式标记（rate-based）** —— 停车时间 **> 8 小时** 且该段停车的**平均每小时耗电速率** ≥ `TESLA_CAMPING_KWH_PER_HOUR`（默认 **0.8 kWh/h**）的事件自动标记为 `🏕️ 露营模式`。kWh 换算使用**固定 75 kWh 参考电池** —— 实际电池是 75 / 82 / 100 kWh 都不影响判定。哨兵 / 第三方 app 操作**不单独区分**，只看速率。所有露营事件**保证附带停车点天气**，根因一眼可见。
 - **`tesla_monthly_summary` 三列分立** —— 新增 `Drive kWh`（行驶，续航差值估算）/ `Charge kWh`（充电，会话汇总）/ `Vampire kWh`（停车，事件表聚合）三列独立展示。`Wh/km` **只用行驶 kWh**，不再被充电损耗和停车耗电污染。
 - **`tesla_monthly_report` 三种能量分开** —— 行驶 / 充电 / 停车耗电各自一行，与上月对比也按类别分别给出 delta。
 
@@ -33,15 +33,21 @@ All notable changes are documented in this file. The format follows [Keep a Chan
 
 #### 测试
 
-- `test_all.py` **110 通过 / 0 失败**（was 92）。新增 8 个露营模式用例 + 7 个三类分立用例 + 2 个 `dict.fromkeys` 回归用例。
+- `test_all.py` **114 通过 / 0 失败**（was 92）。新增 12 个露营模式用例（含边界：阈值恰好相等 0.8 kWh/h、刚低于阈值 0.75、长时间低速率、电池大小无关验证）+ 7 个三类分立用例 + 2 个 `dict.fromkeys` 回归用例。
 
 #### 配置
 
-- 新增 `TESLA_CAMPING_KWH_PER_DAY`（默认 `10`；设 ≤ 0 关闭）。现有 `TESLA_VAMPIRE_WEATHER_MAX` 现在也覆盖露营事件。
+- 新增 `TESLA_CAMPING_KWH_PER_HOUR`（默认 `0.8 kWh/h`；设 ≤ 0 关闭）。kWh 换算用**固定 75 kWh 参考电池**，与实际电池大小无关。现有 `TESLA_VAMPIRE_WEATHER_MAX` 现在也覆盖露营事件。
 
 #### 备注
 
 - 数据库访问**仍然只读**。三种 kWh 全部由现有 `drives` / `charging_processes` / `positions` 表通过 `LEAD()` 事件 CTE 聚合 —— 无 schema 变更、无写入。
+
+#### 配置（v1.2.3 后续微调，仍属同一发布）
+
+- **车配置强制环境变量化** —— 删除模块级 `BATTERY_KWH=75` / `BATTERY_RANGE_KM=525` / `KWH_PER_KM` 硬编码常量。Car info 现在**完全从环境变量读取**（`TESLA_CAR_PARAMS` 优先，回退 `TESLA_BATTERY_KWH + TESLA_BATTERY_RANGE_KM`）。如果都没设，启动时打 **WARNING** 并用占位值（kwh=0, range_km=1）让电量估算出 0，**显眼地错**而不是悄悄错（避免 Model 3P / Model YL 真实容量被默认值污染）。
+- **`TESLA_CAMPING_KWH_PER_HOUR` 默认值 0.8 kWh/h** —— 露营模式用 rate-based 判定：drain% × 固定 75 kWh 参考 / hours_parked ≥ 0.8。电池大小无关。
+- **Docker workflow `latest` 标签** —— `docker.yml` 新增 `type=raw,value=latest`，每次 `v*` tag 触发构建都会同步打 `latest`，镜像 `ghcr.io/6547709/teslamate-mcp:latest` 当前指向 v1.2.3。
 
 ---
 
@@ -51,7 +57,7 @@ Energy-categorisation release — **0 database changes**. Splits the previously 
 
 #### Added
 
-- **Camping mode flag in `tesla_vampire_drain`** — parked periods averaging more than `TESLA_CAMPING_KWH_PER_DAY` (default **10**) kWh/day of battery loss are tagged `🏕️ 露营模式` (active use: A/C while sleeping, heavy sentry, third-party polling — not idle drain). Camping events always receive parking-location weather regardless of drain rank, so the cause is visible at a glance.
+- **Camping mode flag in `tesla_vampire_drain`** (rate-based) — parked periods with parking time **> 8 hours** AND **average drain rate** ≥ `TESLA_CAMPING_KWH_PER_HOUR` (default **0.8 kWh/h**) are tagged `🏕️ 露营模式`. The kWh conversion uses a **fixed 75 kWh reference battery** — the threshold is the same whether the actual car is 75 / 82 / 100 kWh. Sentry / third-party-app activity is **not distinguished** from camping use — only the drain rate matters. Camping events always receive parking-location weather regardless of drain rank, so the cause is visible at a glance.
 - **Three independent kWh columns in `tesla_monthly_summary`** — `Drive kWh` (range-drop estimate), `Charge kWh` (sessions), `Vampire kWh` (parked drain), each aggregated from its primary table. `Wh/km` now uses **driving kWh only** and is never contaminated by charging losses or vampire drain.
 - **Three energy lines in `tesla_monthly_report`** — Driving / Charging / Vampire energy each on its own line, with per-category prev-month delta in the comparison line.
 
@@ -67,15 +73,21 @@ Energy-categorisation release — **0 database changes**. Splits the previously 
 
 #### Testing
 
-- `test_all.py` **110 passed / 0 failed** (was 92). New coverage: 8 camping-mode tests, 7 three-category separation tests, 2 `dict.fromkeys` regression tests.
+- `test_all.py` **114 passed / 0 failed** (was 92). New coverage: 12 camping-mode tests (incl. edge cases: exactly-at-threshold 0.8 kWh/h, just-below 0.75, long-park low-rate, battery-size-independence), 7 three-category separation tests, 2 `dict.fromkeys` regression tests.
 
 #### Configuration
 
-- New env var: `TESLA_CAMPING_KWH_PER_DAY` (default `10`; set ≤ 0 to disable). Existing `TESLA_VAMPIRE_WEATHER_MAX` now also covers camping events.
+- New env var: `TESLA_CAMPING_KWH_PER_HOUR` (default `0.8 kWh/h`; set ≤ 0 to disable). The kWh conversion uses a **fixed 75 kWh reference battery** — battery-size-independent. Existing `TESLA_VAMPIRE_WEATHER_MAX` now also covers camping events.
 
 #### Notes
 
 - Database access remains strictly read-only. All three categories are computed from existing `drives` / `charging_processes` / `positions` tables via a `LEAD()`-based events CTE — no schema changes, no writes.
+
+#### Configuration refinements (still v1.2.3, same release)
+
+- **Car config is now strictly env-driven** — removed module-level `BATTERY_KWH=75` / `BATTERY_RANGE_KM=525` / `KWH_PER_KM` hardcoded constants. Car info MUST come from the environment (`TESLA_CAR_PARAMS` preferred, falling back to `TESLA_BATTERY_KWH + TESLA_BATTERY_RANGE_KM`). If neither is set, a WARNING is logged at startup and placeholder values (`kwh=0`, `range_km=1`) are used so energy estimates come out to zero — loudly wrong instead of silently wrong (no more 75 kWh pollution on Model 3P / Model YL).
+- **`TESLA_CAMPING_KWH_PER_HOUR` default 0.8 kWh/h** — camping-mode judgment uses a rate-based threshold: `drain% × fixed 75 kWh reference / hours_parked ≥ 0.8`. Battery-size-independent by design.
+- **Docker workflow now tags `latest`** — added `type=raw,value=latest` to `docker.yml`. Every `v*` tag build now also publishes `:latest`, so `ghcr.io/6547709/teslamate-mcp:latest` currently points to v1.2.3.
 ---
 
 ## [1.2.2] - 2026-07-03

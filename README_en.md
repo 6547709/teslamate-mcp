@@ -12,7 +12,7 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 > Energy-categorisation release — **0 database changes**. Splits the previously entangled power-consumption metric into **three independent categories** (driving / charging / parking), each computed from its primary source, displayed side-by-side, and never mixed in calculations. Also adds a "camping mode" detector. **38 tools** total, no-database test suite **110/110 passing**.
 
-- 🏕️ **Camping mode flag in `tesla_vampire_drain`** — parked periods averaging more than `TESLA_CAMPING_KWH_PER_DAY` (default **10** kWh/day) are tagged `🏕️ 露营模式` (active use: A/C while sleeping, heavy sentry, third-party polling — not idle drain). Camping events always receive parking-location weather regardless of drain rank, so the cause is visible at a glance.
+- 🏕️ **Camping mode flag in `tesla_vampire_drain`** (rate-based) — parked periods with parking time **>8 hours** AND **average drain rate** ≥ `TESLA_CAMPING_KWH_PER_HOUR` (default **0.8 kWh/h**) are tagged `🏕️ 露营模式`. The kWh conversion uses a **fixed 75 kWh reference battery** — the threshold is the same whether the actual car is 75 / 82 / 100 kWh. Sentry / third-party-app activity is **not distinguished** from camping use — only the drain rate matters. Camping events always receive parking-location weather regardless of drain rank, so the cause is visible at a glance.
 - 📊 **Three independent kWh columns in `tesla_monthly_summary`** — `Drive kWh` (range-drop estimate) / `Charge kWh` (sessions) / `Vampire kWh` (parked drain). Three kWh values are computed independently and shown side-by-side. `Wh/km` now uses **driving kWh only** — no longer contaminated by charging losses or vampire drain.
 - 📈 **Three energy lines in `tesla_monthly_report`** — driving / charging / vampire energy each on its own line, with per-category prev-month delta in the comparison line.
 - 🔁 **`tesla_vampire_drain` weather-dedup bug fix** — multi-event path crashed with `TypeError: unhashable type: \'dict\'` from `dict.fromkeys(...)`. Replaced with `id(r)`-keyed dedup, preserving first-seen order.
@@ -165,14 +165,17 @@ services:
       # - TESLA_GAS_PRICE=3.50          # Gas price (USD/gallon, for eco savings calc)
       # - TESLA_GAS_MPG=28              # ICEV fuel economy (MPG, for eco savings calc)
 
-      # ── Vehicle ────────────────────────────────────────────
+      # ── Vehicle (multi-car config) ────────────────────────
+      # JSON format: key = TeslaMate car_id, value = {kwh, range_km}
+      # All tools accept an optional car_id parameter. When TESLA_CAR_PARAMS
+      # is set, it overrides the single-car defaults below.
+      - TESLA_CAR_PARAMS={"1":{"kwh":78.4,"range_km":675},"2":{"kwh":82,"range_km":751}}
+      #   ├─ car_id=1: Model 3 Performance (CN, refresh-2 / 2021.12): 78.4 kWh, 675 km CLTC
+      #   └─ car_id=2: Model YL Long Range 6-seater (2025.08): 82.0 kWh, 751 km CLTC
+      # For single-car deployments, the simpler vars below still work as fallback:
+      # - TESLA_BATTERY_KWH=78.4          # Usable battery capacity (kWh, fallback)
+      # - TESLA_BATTERY_RANGE_KM=675      # EPA range at 100% (km, fallback)
       - TESLA_CAR_ID=1                  # Default car ID (check TeslaMate dashboard)
-      - TESLA_BATTERY_KWH=75            # Usable battery capacity (kWh)
-      - TESLA_BATTERY_RANGE_KM=525      # EPA range at 100% (km)
-      # Multi-car: JSON map of car_id -> {kwh, range_km}
-      # All tools accept an optional car_id parameter to query a specific vehicle.
-      # If TESLA_CAR_PARAMS is set, it overrides the single-car env vars above.
-      # - TESLA_CAR_PARAMS={"1":{"kwh":75,"range_km":525},"2":{"kwh":60,"range_km":438}}
 
       # ── TPMS Thresholds (Optional) ────────────────────────
       # - TESLA_TPMS_MIN_THRESHOLD=2.5  # Low pressure warning (bar)
@@ -323,7 +326,22 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The image will be available at `ghcr.io/<your-username>/teslamate-mcp:<tag>`.
+```bash
+# Tag a release
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+Image tags:
+
+| Tag | Purpose |
+|---|---|
+| `ghcr.io/6547709/teslamate-mcp:latest` | Always points to the most recent release (currently v1.2.3) |
+| `ghcr.io/6547709/teslamate-mcp:v1.2.3` | Lock to the current version |
+| `ghcr.io/6547709/teslamate-mcp:1.2` | Track the 1.2.x minor line |
+| `ghcr.io/6547709/teslamate-mcp:sha-<commit>` | Immutable commit reference |
+
+Multi-arch: `linux/amd64` + `linux/arm64` (Docker buildx).
 
 ---
 

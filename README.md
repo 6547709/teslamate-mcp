@@ -12,7 +12,7 @@
 
 > 能耗分类大版本 —— **0 项数据库改动**。把原本纠缠在一起的功耗指标拆分成**三种独立类别**（行驶 / 充电 / 停车），各自从原始数据源独立计算、并列展示、永不混入运算。同时新增 **露营模式** 检测。当前共 **38 个工具**，无数据库测试 **110/110 全部通过**。
 
-- 🏕️ **`tesla_vampire_drain` 露营模式** —— 停车期间平均每日耗电超过 `TESLA_CAMPING_KWH_PER_DAY`（默认 **10** kWh/day）的事件，自动标记为 `🏕️ 露营模式`（多半是睡眠开空调、哨兵模式狂写、第三方 app 频繁唤醒 —— 不是单纯闲置漏电）。所有露营事件**保证附带停车点天气**，根因一眼可见。
+- 🏕️ **`tesla_vampire_drain` 露营模式（rate-based）** —— 停车时间 **>8 小时** 且该段停车的**平均每小时耗电速率** ≥ `TESLA_CAMPING_KWH_PER_HOUR`（默认 **0.8 kWh/h**）的事件，自动标记为 `🏕️ 露营模式`。kWh 换算使用**固定 75 kWh 参考电池**——无论实际是 75 / 82 / 100 kWh 电池，阈值判定都一样。哨兵 / 第三方 app **不单独区分**，只看耗电速率。所有露营事件**保证附带停车点天气**，根因一眼可见。
 - 📊 **`tesla_monthly_summary` 三列分立** —— `Drive kWh`（行驶，续航差值估算）/ `Charge kWh`（充电，会话汇总）/ `Vampire kWh`（停车，事件表聚合），三种 kWh **完全独立计算、并列展示**。`Wh/km` 现在**只用行驶 kWh**，不再被充电损耗和停车耗电污染。
 - 📈 **`tesla_monthly_report` 三种能量分开** —— 行驶 / 充电 / 停车耗电各自一行，与上月对比也按类别分别给出 delta。
 - 🔁 **`tesla_vampire_drain` 天气去重 bug 修复** —— 多事件路径下 `dict.fromkeys(...)` 抛 `TypeError: unhashable type: \'dict\'`，已改为基于 `id(r)` 的去重，保留首次出现顺序。
@@ -165,14 +165,16 @@ services:
       # - TESLA_GAS_PRICE=3.50          # 油价（美元/加仑，用于节省计算）
       # - TESLA_GAS_MPG=28              # 燃油车油耗（MPG，用于节省计算）
 
-      # ── 车辆参数 ───────────────────────────────────────
+      # ── 车辆参数（多车配置）────────────────────────────
+      # JSON 格式：key = TeslaMate car_id，value = {kwh, range_km}
+      # 所有工具均支持 car_id 参数来查询指定车辆；设置后将覆盖单车默认值
+      - TESLA_CAR_PARAMS={"1":{"kwh":78.4,"range_km":675},"2":{"kwh":82,"range_km":751}}
+      #   ├─ car_id=1：Model 3P 国产高性能版（改款二 / 2021.12）：78.4 kWh, 675 km CLTC
+      #   └─ car_id=2：Model YL 长续航六座版（2025.08）：82.0 kWh, 751 km CLTC
+      # 如只跑单车，下面的 TESLA_BATTERY_KWH + TESLA_BATTERY_RANGE_KM 仍生效
+      # - TESLA_BATTERY_KWH=78.4          # 可用电池容量（kWh，单车回退）
+      # - TESLA_BATTERY_RANGE_KM=675      # 满电续航（km，单车回退）
       - TESLA_CAR_ID=1                  # 默认车辆 ID（查看 TeslaMate 仪表盘）
-      - TESLA_BATTERY_KWH=75            # 可用电池容量（kWh）
-      - TESLA_BATTERY_RANGE_KM=525      # 满电续航（km）
-      # 多车配置：JSON 格式，key 为车辆 ID，value 为电池参数
-      # 所有工具均支持 car_id 参数来查询指定车辆
-      # 设置后将覆盖上面的单车环境变量
-      # - TESLA_CAR_PARAMS={"1":{"kwh":75,"range_km":525},"2":{"kwh":60,"range_km":438}}
 
       # ── 胎压阈值（可选）────────────────────────────────
       # - TESLA_TPMS_MIN_THRESHOLD=2.5  # 低压警告阈值（bar）
@@ -325,11 +327,20 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 
 ```bash
 # 打标签发布
-git tag v0.1.0
-git push origin v0.1.0
+git tag v1.2.3
+git push origin v1.2.3
 ```
 
-镜像地址：`ghcr.io/<your-username>/teslamate-mcp:<tag>`
+镜像地址：
+
+| Tag | 用途 |
+|---|---|
+| `ghcr.io/6547709/teslamate-mcp:latest` | 始终指向最新发布（当前 v1.2.3） |
+| `ghcr.io/6547709/teslamate-mcp:v1.2.3` | 锁定当前版本 |
+| `ghcr.io/6547709/teslamate-mcp:1.2` | 跟随 1.2.x 小版本 |
+| `ghcr.io/6547709/teslamate-mcp:sha-<commit>` | 不可变 commit 引用 |
+
+双架构：`linux/amd64` + `linux/arm64`（Docker buildx）。
 
 ---
 

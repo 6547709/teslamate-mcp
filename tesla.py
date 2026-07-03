@@ -63,10 +63,11 @@ Environment variables:
   TESLAMATE_DB_PASS     -- Postgres password
   TESLAMATE_DB_NAME     -- Postgres database (default: teslamate)
 
-  # Vehicle config
-  TESLA_CAR_ID          -- TeslaMate car ID (default: 1)
-  TESLA_BATTERY_KWH     -- Usable battery capacity in kWh (default: 75)
-  TESLA_BATTERY_RANGE_KM -- EPA range at 100% in km (default: 525)
+  # Vehicle config (REQUIRED — no hardcoded defaults; missing = WARNING + zeros)
+  TESLA_CAR_ID          -- TeslaMate car ID (defaults to 1 only for the id itself)
+  TESLA_BATTERY_KWH     -- Usable battery capacity in kWh (REQUIRED if TESLA_CAR_PARAMS unset)
+  TESLA_BATTERY_RANGE_KM -- EPA range at 100% in km (REQUIRED if TESLA_CAR_PARAMS unset)
+  TESLA_CAR_PARAMS      -- JSON map of car_id -> {kwh, range_km}; preferred for multi-car
 
   # Cost defaults (overridable per-tool-call)
   TESLA_ELECTRICITY_RATE_USD -- USD/kWh (default: 0.12)
@@ -197,23 +198,46 @@ USER_TZ = ZoneInfo(TIMEZONE)
 
 # Owner API is no longer used -- all data comes from TeslaMate PostgreSQL
 
-# Vehicle-specific
-CAR_ID = int(os.environ.get("TESLA_CAR_ID", "1"))
-BATTERY_KWH = float(os.environ.get("TESLA_BATTERY_KWH", "75"))
-BATTERY_RANGE_KM = float(os.environ.get("TESLA_BATTERY_RANGE_KM", "525"))
-KWH_PER_KM = BATTERY_KWH / BATTERY_RANGE_KM
+# -- Vehicle configuration (REQUIRED from env, no hardcoded constants) -------
+#
+# Car info MUST come from the environment. There are NO hardcoded numeric
+# defaults for battery capacity, range, or car_id beyond what's documented
+# below. Silently using fake values like "75 kWh" when the operator's actual
+# car is 78.4 kWh (Model 3P) or 82 kWh (Model YL) would produce silently
+# wrong energy estimates — so we warn loudly when config is missing and use
+# safe placeholder values (kwh=0, range_km=1) to avoid division-by-zero.
+#
+# Two configuration modes (in priority order):
+#   1. TESLA_CAR_PARAMS (JSON map of car_id -> {kwh, range_km})
+#        — preferred for multi-car deployments.
+#        Example: TESLA_CAR_PARAMS='{"1":{"kwh":78.4,"range_km":675},
+#                                     "2":{"kwh":82,"range_km":751}}'
+#   2. TESLA_BATTERY_KWH + TESLA_BATTERY_RANGE_KM
+#        — for single-car deployments.
+#        TESLA_CAR_ID selects which car_id this single-car config applies to.
+#
+# If NEITHER mode provides the requested car_id, a WARNING is logged at
+# startup and placeholder values are used so the server still boots; energy
+# and range estimates will be 0/incorrect until you fix the config.
 
-# Multi-car support: JSON map of car_id -> {kwh, range_km}
-# Example: {"1":{"kwh":75,"range_km":525},"2":{"kwh":60,"range_km":438}}
-_CAR_PARAMS_RAW = os.environ.get("TESLA_CAR_PARAMS", "")
+# Default car_id: defaults to 1 if unset (TeslaMate single-car convention).
+# This is the only car-related default; battery/range still must be configured.
+CAR_ID = int(os.environ.get("TESLA_CAR_ID", "1"))
+
+# Read raw env strings — empty string when unset, NOT a hardcoded fallback.
+_RAW_CAR_PARAMS = os.environ.get("TESLA_CAR_PARAMS", "").strip()
+_RAW_BATTERY_KWH = os.environ.get("TESLA_BATTERY_KWH", "").strip()
+_RAW_BATTERY_RANGE_KM = os.environ.get("TESLA_BATTERY_RANGE_KM", "").strip()
+
+# Parse TESLA_CAR_PARAMS (preferred mode).
 _CAR_PARAMS: dict[int, dict] = {}
-if _CAR_PARAMS_RAW:
+if _RAW_CAR_PARAMS:
     try:
-        _raw_params = json.loads(_CAR_PARAMS_RAW)
+        _raw_params = json.loads(_RAW_CAR_PARAMS)
     except json.JSONDecodeError as e:
         _log.warning(
             f"Failed to parse TESLA_CAR_PARAMS as JSON: {e}. "
-            f"Falling back to single-car config from TESLA_CAR_ID/TESLA_BATTERY_KWH."
+            f"Falling back to single-car mode (TESLA_BATTERY_KWH + TESLA_BATTERY_RANGE_KM)."
         )
         _raw_params = {}
     for k, v in _raw_params.items():
@@ -238,13 +262,36 @@ if _CAR_PARAMS_RAW:
                 f"TESLA_CAR_PARAMS car_id={k!r}: invalid value ({e}). Skipped."
             )
 
-# Always register the default car from env vars
+# Register the default car from single-car env vars if TESLA_CAR_PARAMS
+# didn't already define CAR_ID. NO hardcoded fallback to fake values.
 if CAR_ID not in _CAR_PARAMS:
-    _CAR_PARAMS[CAR_ID] = {
-        "kwh": BATTERY_KWH,
-        "range_km": BATTERY_RANGE_KM,
-        "kwh_per_km": KWH_PER_KM,
-    }
+    if _RAW_BATTERY_KWH and _RAW_BATTERY_RANGE_KM:
+        try:
+            _kwh = float(_RAW_BATTERY_KWH)
+            _range = float(_RAW_BATTERY_RANGE_KM)
+            if _range <= 0:
+                raise ValueError(f"range_km must be positive, got {_range}")
+            _CAR_PARAMS[CAR_ID] = {
+                "kwh": _kwh,
+                "range_km": _range,
+                "kwh_per_km": _kwh / _range,
+            }
+        except (TypeError, ValueError) as e:
+            _log.error(
+                f"Invalid TESLA_BATTERY_KWH/TESLA_BATTERY_RANGE_KM values: {e}. "
+                f"Falling back to placeholders — energy estimates will be inaccurate."
+            )
+            _CAR_PARAMS[CAR_ID] = {"kwh": 0.0, "range_km": 1.0, "kwh_per_km": 0.0}
+    else:
+        # Loud warning so operators notice the missing config.
+        _log.warning(
+            f"No car configuration in environment for car_id={CAR_ID}. "
+            f"Set TESLA_CAR_PARAMS (preferred) or TESLA_BATTERY_KWH + TESLA_BATTERY_RANGE_KM. "
+            f"Energy, range, and efficiency estimates will be inaccurate until configured."
+        )
+        # Placeholder values to avoid division-by-zero; kwh=0 makes all
+        # kWh-derived estimates come out to 0, which is at least obviously wrong.
+        _CAR_PARAMS[CAR_ID] = {"kwh": 0.0, "range_km": 1.0, "kwh_per_km": 0.0}
 
 def _get_car_config(car_id: int | None = None) -> dict:
     """Get car-specific config (kwh, range_km, kwh_per_km) for a given car_id.
@@ -283,11 +330,22 @@ VAMPIRE_MAX_HOURS = float(os.environ.get("TESLA_VAMPIRE_MAX_HOURS", "168"))  # c
 # Bounded so a long list doesn't fan out into many QWeather calls; grid-dedup
 # means repeated spots cost nothing extra.
 VAMPIRE_WEATHER_MAX = int(os.environ.get("TESLA_VAMPIRE_WEATHER_MAX", "5"))
-# v1.2.3: "camping mode" flag. When a parked period's energy loss (converted from
-# the battery-% drop via the car's usable kWh) averages above this many kWh PER
-# DAY, it's almost certainly active use (A/C while sleeping in the car, etc.)
-# rather than idle vampire drain, so we tag it. Configurable; 0/negative disables.
-CAMPING_KWH_PER_DAY = float(os.environ.get("TESLA_CAMPING_KWH_PER_DAY", "10"))
+# v1.2.3: "camping mode" flag. A parked period is tagged camping when:
+#   1) hours_parked > VAMPIRE_MIN_HOURS (= 8, enforced by SQL)
+#   2) AVERAGE kWh consumed per hour over the parked period >= threshold
+#
+# The kWh conversion uses a FIXED 75 kWh reference battery so the threshold
+# is independent of the actual car's battery size (75 kWh vs 82 kWh vs 100 kWh
+# all use the same reference for comparison). The actual battery capacity
+# (TESLA_BATTERY_KWH / _CAR_PARAMS) is NOT consulted here — we judge the
+# drain RATE on a reference scale, not the absolute energy lost. Sentry and
+# third-party-app activity are intentionally NOT distinguished from camping
+# use: any aggregate drain rate above the threshold is flagged.
+#
+# Default 0.8 kWh/h on the 75 kWh reference = 1.067%/h battery drop rate.
+# Configurable; 0/negative disables.
+CAMPING_REFERENCE_BATTERY_KWH = 75.0  # fixed; does NOT read from env or car cfg
+CAMPING_KWH_PER_HOUR = float(os.environ.get("TESLA_CAMPING_KWH_PER_HOUR", "0.8"))
 
 # -- Trip classification thresholds & geocode tuning --------------------------
 # ISSUE-3: queries shorter than this are too ambiguous for fuzzy address match.
@@ -4234,12 +4292,15 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
     """Vampire drain analysis -- battery loss while parked overnight.
 
     Checks for periods where the car was parked (no drives) for 8+ hours
-    and measures battery drop. Periods with > TESLA_CAMPING_KWH_PER_DAY
-    (default 10) kWh/day of battery loss are tagged as "露营模式" — almost
-    certainly active use (A/C while sleeping in the car, heavy sentry,
-    third-party polling) rather than idle drain. If QWeather is configured,
-    the current weather at the parking location is shown for the worst few
-    events AND every camping-mode event (display-only).
+    and measures battery drop. A parked period is tagged "露营模式" when the
+    AVERAGE drain rate over the parked period is ≥
+    `TESLA_CAMPING_KWH_PER_HOUR` (default **0.8 kWh/h**). The kWh conversion
+    uses a **fixed 75 kWh reference battery** — so the threshold does NOT
+    change whether the car is 75 / 82 / 100 kWh. Sentry and third-party-app
+    activity are NOT distinguished from camping use: any aggregate drain rate
+    at or above the threshold is flagged. If QWeather is configured, the
+    current weather at the parking location is shown for the worst few events
+    AND every camping-mode event (display-only).
 
     Args:
         days: Number of days to analyze (default: 14)
@@ -4321,21 +4382,23 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
     if not rows:
         return f"No significant vampire drain detected ({date_range})."
 
-    # v1.2.3: flag "camping mode" — parked periods with > CAMPING_KWH_PER_DAY kWh/day
-    # of battery loss are almost certainly active use (A/C while sleeping, sentry
-    # recording, third-party polling) rather than idle drain, so we tag them and
-    # always fetch parking-location weather for them (even if not in the top N).
-    # Convert drain% → kWh via the car's usable battery capacity.
+    # v1.2.3: flag "camping mode" — parked periods whose AVERAGE drain rate
+    # >= CAMPING_KWH_PER_HOUR (default 0.8 kWh/h) are tagged. The parking-time
+    # lower bound (> 8h) is already enforced by the SQL filter
+    # (VAMPIRE_MIN_HOURS). The kWh conversion uses a FIXED 75 kWh reference
+    # battery so the threshold is battery-size-independent — whether the car
+    # is 75 / 82 / 100 kWh doesn't change the comparison. Strict ≥ at the
+    # threshold (equal counts as camping).
     camping_ids: set[int] = set()
-    if CAMPING_KWH_PER_DAY > 0:
-        _battery_kwh = _get_car_config(effective_car_id)["kwh"]
+    if CAMPING_KWH_PER_HOUR > 0:
         for r in rows:
-            drain_pct = r.get("drain", 0)
-            hours = r.get("hours_parked", 0)
-            if hours > 0 and drain_pct > 0:
-                kwh_per_day = (drain_pct * _battery_kwh / 100.0) / (hours / 24.0)
-                if kwh_per_day > CAMPING_KWH_PER_DAY:
-                    camping_ids.add(id(r))
+            drain_pct = r.get("drain", 0) or 0
+            hours = r.get("hours_parked", 0) or 0
+            # SQL guarantees drain_pct > 0 and hours >= 8, so we skip the
+            # zero-division guard for clarity.
+            kwh_per_hour = (drain_pct * CAMPING_REFERENCE_BATTERY_KWH / 100.0) / hours
+            if kwh_per_hour >= CAMPING_KWH_PER_HOUR:
+                camping_ids.add(id(r))
 
     # v1.2.3: attach current weather at the parking location for the top drain
     # events AND every camping-mode event (display-only). Grid-dedup so the same
