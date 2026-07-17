@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
+      contents: write  # needed by the auto-release step below
 
     steps:
       - name: Checkout
@@ -45,3 +46,55 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
           platforms: linux/amd64,linux/arm64
+
+      # Auto-create the GitHub Release on tag push so the "Releases" sidebar
+      # picks up the new version as Latest. Release notes are extracted from
+      # CHANGELOG.md (the bilingual ## [X.Y.Z] - DATE section) so the body
+      # stays in sync with the source-of-truth changelog.
+      #
+      # Tag → extracted section format example (from CHANGELOG.md):
+      #   ## [1.2.4] - 2026-07-17
+      #   ### 中文
+      #   ...
+      #   ### English
+      #   ...
+      #   ---
+      #
+      # The next `## [` heading (or EOF) terminates the section.
+      - name: Extract release notes from CHANGELOG.md
+        id: extract
+        run: |
+          set -euo pipefail
+          # GITHUB_REF_NAME looks like "v1.2.4" → strip leading "v"
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          echo "Extracting section for version ${VER}"
+          awk -v v="${VER}" '
+            /^## \[/ {
+              # Encountered the NEXT version heading → stop after capturing this one
+              if (found) { exit }
+              # Match e.g. "## [1.2.4] - 2026-07-17"
+              if (index($0, "[" v "]") > 0) { found = 1 }
+            }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          # Sanity check: file must not be empty, otherwise softprops will silently
+          # create an empty release.
+          if [ ! -s release_notes.md ]; then
+            echo "::error::No CHANGELOG section found for version ${VER}"
+            echo "::error::Expected heading like: ## [${VER}] - YYYY-MM-DD"
+            exit 1
+          fi
+          echo "----- release notes (first 20 lines) -----"
+          head -n 20 release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          generate_release_notes: false  # we supply our own from CHANGELOG.md
+          fail_on_unmatched_files: true  # fail loud if release_notes.md is missing
