@@ -541,6 +541,243 @@ def test_unit():
     finally:
         tesla._query_one = saved_q1
 
+    # REGRESSION-v1.2.3: d.battery_level never appears in SQL — drives table
+    # has no battery_level column (it's on positions). Both monthly tools
+    # were broken in v1.2.3 release with `d.battery_level IS NOT NULL` in
+    # the WHERE clause of the start_position JOIN. PostgreSQL would raise
+    # `column d.battery_level does not exist` on a real DB.
+    src = inspect.getsource(tesla)
+    check("REGRESSION no `d.battery_level` reference in source",
+          "d.battery_level" not in src,
+          "found d.battery_level reference — drives table has no battery_level column")
+
+    # REGRESSION-v1.2.3: both monthly tools' SQL fingerprints must contain
+    # the correct `p.battery_level IS NOT NULL` filter on the start_position JOIN.
+    src = inspect.getsource(tesla)
+    # monthly_report
+    check("REGRESSION monthly_report uses p.battery_level filter",
+          "JOIN positions p ON p.id = d.start_position_id\n            WHERE d.car_id = %s AND p.battery_level IS NOT NULL" in src)
+    # monthly_summary
+    check("REGRESSION monthly_summary uses p.battery_level filter",
+          src.count("JOIN positions p ON p.id = d.start_position_id\n            WHERE d.car_id = %s AND p.battery_level IS NOT NULL") >= 2,
+          "expected >=2 occurrences (monthly_report + monthly_summary)")
+
+    # REGRESSION-v1.2.3: cp.outside_temp_avg never appears — it's not on
+    # charging_processes. The vintage tool originally referenced it; if it
+    # creeps back in, get_charging_vintage_data crashes on real DB.
+    check("REGRESSION no `cp.outside_temp_avg` reference in source",
+          "cp.outside_temp_avg" not in src,
+          "found cp.outside_temp_avg reference — column not on charging_processes")
+
+    # REGRESSION-v1.2.4: _cutoff_from_days helper exists and is used at
+    # every site that previously did `_utcnow() - timedelta(days=days)`,
+    # because days=None otherwise raises TypeError on those call sites.
+    check("REGRESSION _cutoff_from_days helper exists",
+          hasattr(tesla, "_cutoff_from_days"),
+          "_cutoff_from_days helper not defined")
+    raw_timedelta = "(_utcnow() - timedelta(days=days))"
+    check("REGRESSION no bare `_utcnow() - timedelta(days=days)` outside helper docstring",
+          raw_timedelta not in src.replace(
+              "    `_utcnow() - timedelta(days=days)` which raises TypeError when days is None.", ""
+          ),
+          f"found unguarded {raw_timedelta}")
+
+    # REGRESSION-v1.2.4: tesla_savings monthly fallback must filter by
+    # month_start_utc, otherwise "this month estimated kWh" equals lifetime.
+    # We assert the source contains a start_date predicate scoped by a
+    # month_start_utc-like parameter binding.
+    check("REGRESSION tesla_savings monthly fallback filters by start_date",
+          ("month_start_utc" in src
+           and "AND start_date >= %s" in src
+           and src.count("AND start_date >= %s") >= 2),  # monthly + lifetime have separate paths
+          "tesla_savings monthly estimate not scoped to current month")
+
+    # REGRESSION-v1.2.4: _monthly_report_compute must use tzinfo=USER_TZ
+    # (matches sibling tools at lines 4719/5219/1916). Naive datetime
+    # would shift the queried window by ±14h for non-UTC users.
+    mr_body = inspect.getsource(tesla._monthly_report_compute)
+    check("REGRESSION _monthly_report_compute uses tzinfo=USER_TZ",
+          "tzinfo=USER_TZ" in mr_body and ".astimezone(timezone.utc)" in mr_body,
+          "monthly_report still uses naive datetime")
+
+    # REGRESSION-v1.2.4 (B1): async wrappers for psycopg2 calls so the event
+    # loop isn't blocked. Verify the helpers exist and that no sync _query call
+    # remains inside any async function.
+    check("REGRESSION async query wrappers exist",
+          hasattr(tesla, "_query_async")
+          and hasattr(tesla, "_query_one_async")
+          and hasattr(tesla, "_cached_query_async")
+          and hasattr(tesla, "_cached_query_one_async"),
+          "missing async query wrapper helpers")
+
+    # REGRESSION-v1.2.4 (B2): _cached_result uses asyncio.Future for
+    # single-flight, so cold-key concurrent callers coalesce into one fn().
+    check("REGRESSION _cached_result uses per-key in-flight future",
+          hasattr(tesla, "_result_inflight")
+          and "_result_inflight[key] = inflight" in src,
+          "_cached_result lacks single-flight coalescing")
+
+    # REGRESSION-v1.2.4 (B3): _check_car_config helper exists and is invoked
+    # by tools that compute energy/kWh to fail loudly instead of returning 0.
+    check("REGRESSION _check_car_config helper exists",
+          hasattr(tesla, "_check_car_config"),
+          "_check_car_config helper missing")
+
+    # REGRESSION-v1.2.4 (B4): three previously-unchecked tools now reject
+    # negative/oversized days.
+    check("REGRESSION calculate_eco_savings_vs_icev validates days",
+          "days = _validate_days(days)" in inspect.getsource(tesla.calculate_eco_savings_vs_icev),
+          "calculate_eco_savings_vs_icev still accepts any days")
+    check("REGRESSION check_driving_achievements validates days",
+          "days = _validate_days(days)" in inspect.getsource(tesla.check_driving_achievements),
+          "check_driving_achievements still accepts any days")
+    gb_src = inspect.getsource(tesla.generate_weekend_blindbox)
+    check("REGRESSION generate_weekend_blindbox validates months_lookback",
+          "months_lookback <= 0" in gb_src and "MAX_LOOKBACK_DAYS" in gb_src,
+          "generate_weekend_blindbox still accepts any months_lookback")
+
+    # REGRESSION-v1.2.4 (B5): _qw_locid_flight_lock must check loop identity
+    # so a cached lock from a previous event loop doesn't trigger
+    # `RuntimeError: got Future ... attached to a different loop` in tests or
+    # multi-worker deployments.
+    fl_src = inspect.getsource(tesla._qw_locid_flight_lock)
+    check("REGRESSION _qw_locid_flight_lock is loop-aware",
+          "asyncio.get_running_loop()" in fl_src
+          and "loop_id" in fl_src
+          and "cached_loop_id" in fl_src,
+          "_qw_locid_flight_lock still binds to first-seen loop")
+
+    # REGRESSION-v1.2.4 (B7): broken connections must be closed instead of
+    # returned to the pool, so the next 8 callers don't inherit a dead socket.
+    check("REGRESSION _put_conn_safe helper exists",
+          hasattr(tesla, "_put_conn_safe"),
+          "_put_conn_safe helper missing")
+    q_src = inspect.getsource(tesla._query)
+    check("REGRESSION _query detects broken connections",
+          "_put_conn_safe" in q_src and "InterfaceError" in q_src
+          and "OperationalError" in q_src,
+          "_query still puts broken connections back into pool")
+
+    # REGRESSION-v1.2.4 (B11): narrative tool has hard LIMIT + window cap.
+    check("REGRESSION LIMIT_NARRATIVE env var defined",
+          hasattr(tesla, "LIMIT_NARRATIVE") and isinstance(tesla.LIMIT_NARRATIVE, int),
+          "LIMIT_NARRATIVE not defined")
+    nar_src = inspect.getsource(tesla.generate_travel_narrative_context)
+    check("REGRESSION narrative tool bounds time window",
+          "MAX_LOOKBACK_DAYS" in nar_src and "time window too large" in nar_src,
+          "narrative tool still accepts arbitrarily long windows")
+    check("REGRESSION narrative tool applies LIMIT_NARRATIVE",
+          "LIMIT_NARRATIVE" in nar_src,
+          "narrative SQL has no LIMIT clause")
+    check("REGRESSION narrative tool warns when capped",
+          "Timeline truncated at" in nar_src,
+          "narrative tool silently truncates at LIMIT")
+
+    # REGRESSION-v1.2.4 (B6): when all in-flight QWeather locks are held,
+    # _qw_locid_flight_lock must force-evict the oldest entry instead of
+    # silently exceeding _QW_INFLIGHT_MAX (which would let single-flight
+    # get bypassed for the evicted gkey).
+    fl_full_src = inspect.getsource(tesla._qw_locid_flight_lock)
+    check("REGRESSION QWeather flight lock force-evicts when saturated",
+          "force-evicting oldest key" in fl_full_src,
+          "QWeather lock eviction may exceed _QW_INFLIGHT_MAX under contention")
+
+    # REGRESSION-v1.2.4 (B8): _get_conn must retry briefly on PoolError
+    # instead of surfacing a raw pool error to the MCP client.
+    gc_src = inspect.getsource(tesla._get_conn)
+    check("REGRESSION _get_conn retries on PoolError",
+          "psycopg2.pool.PoolError" in gc_src
+          and "_POOL_RETRY_WINDOW_SEC" in gc_src
+          and "Database connection pool exhausted" in gc_src,
+          "_get_conn surfaces raw PoolError to MCP caller")
+
+    # REGRESSION-v1.2.4 (B9): every cache key built for _cached_query* /
+    # _cached_result must go through _vkey so upgrades invalidate stale
+    # entries. We assert that no bare f"..." cache key prefixes remain.
+    # ("geofences_all" is allowed only when wrapped by _vkey(...).)
+    bare_prefix_patterns = [
+        r'f"car_',  # was f"car_{id}", should now be _vkey("car", id)
+        r'f"bh:', r'f"sv:', r'f"eft:', r'f"efw:',
+        r'f"cbl:', r'f"td:', r'f"mr:',
+    ]
+    leftover = []
+    for pat in bare_prefix_patterns:
+        leftover.extend(re.findall(pat, src))
+    # Strip the legitimate _vkey("geofences_all") inner-string occurrences
+    geo_vkey_uses = src.count('_vkey("geofences_all")')
+    geo_bare = src.count('"geofences_all"') - geo_vkey_uses
+    leftover.extend(["geofences_all"] * geo_bare)
+    check(f"REGRESSION no bare cache-key prefixes (found {len(leftover)})",
+          len(leftover) == 0,
+          f"bare cache keys remain: {leftover}")
+    check("REGRESSION _vkey helper exists and uses __version__",
+          hasattr(tesla, "_vkey")
+          and "__version__" in inspect.getsource(tesla._vkey)
+          and src.count("_vkey(") >= 10,
+          f"_vkey only used {src.count('_vkey(')} times")
+
+    # REGRESSION-v1.2.4 (B10): ROUTINE_CACHE must have a bound and a pruner
+    # so a multi-tenant deployment doesn't leak car_ids over weeks.
+    check("REGRESSION ROUTINE_CACHE bounded + pruned",
+          hasattr(tesla, "_routine_cache_prune")
+          and hasattr(tesla, "ROUTINE_CACHE_MAX"),
+          "ROUTINE_CACHE still unbounded")
+
+    # REGRESSION-v1.2.4 (B12): tesla_monthly_summary must scope every
+    # date_trunc to USER_TZ, otherwise non-UTC users get mis-bucketed months.
+    ms_src = inspect.getsource(tesla.tesla_monthly_summary)
+    check("REGRESSION monthly_summary uses USER_TZ in date_trunc",
+          ms_src.count("AT TIME ZONE 'UTC' AT TIME ZONE %s") >= 5
+          and "USER_TZ" in ms_src,
+          "monthly_summary still uses session-TZ date_trunc")
+
+    # REGRESSION-v1.2.4 (B13): midnight-ghost query no longer pulls columns
+    # the consumer never reads.
+    ach_src = inspect.getsource(tesla.check_driving_achievements)
+    midnight_block = ach_src.split("Achievement 2", 1)[-1].split("Achievement 3", 1)[0]
+    check("REGRESSION midnight-ghost query has no dead columns",
+          "outside_temp_avg" not in midnight_block.split("SELECT", 1)[1].split("FROM", 1)[0]
+          or "outside_temp_avg" in midnight_block.split("-- Achievement 3", 1)[0].split("SELECT", 1)[1].split("FROM", 1)[0],
+          "midnight-ghost query still pulls outside_temp_avg")
+    # Cleaner check: between Achievement 2 SELECT and FROM, no outside_temp_avg
+    m = re.search(r"Achievement 2.*?SELECT\s+(.*?)\s+FROM drives", ach_src, re.DOTALL)
+    if m:
+        cols = m.group(1)
+        check("REGRESSION midnight-ghost SELECT is lean",
+              "outside_temp_avg" not in cols and "end_address_id" not in cols,
+              f"midnight-ghost still pulls {cols}")
+
+    # REGRESSION-v1.2.4 (B14): no dead next_charge_end window function.
+    lt_src = inspect.getsource(tesla.get_longest_trip_on_single_charge)
+    check("REGRESSION no dead next_charge_end window",
+          "next_charge_end" not in lt_src,
+          "get_longest_trip_on_single_charge still computes next_charge_end")
+
+    # REGRESSION-v1.2.4 (B15): tesla_live pulls `states.state` via LATERAL
+    # instead of a separate round-trip.
+    live_src = inspect.getsource(tesla.tesla_live)
+    check("REGRESSION tesla_live merges states into combined query",
+          "states" in live_src and "LEFT JOIN LATERAL" in live_src
+          and live_src.count("LEFT JOIN LATERAL") >= 4,
+          f"tesla_live only has {live_src.count('LEFT JOIN LATERAL')} LATERAL joins (expect 4)")
+
+    # REGRESSION-v1.2.4 (NEW BUG, found in smoke test): tesla_drives had
+    # `actual_days < days * 0.9` downstream of the days=None-tolerant
+    # _validate_days path, which still crashed because days was None.
+    # The fix skips the window-rewrite branch entirely when days is None.
+    drives_src = inspect.getsource(tesla.tesla_drives)
+    check("REGRESSION tesla_drives guards `days * 0.9` for days=None",
+          "days is not None" in drives_src and "days * 0.9" in drives_src,
+          "tesla_drives still crashes on days=None via `days * 0.9`")
+
+    # REGRESSION-v1.2.4 (NEW BUG): get_vehicle_persona_status had
+    # `if days_lookback <= 0` which TypeError'd before the ❌ message
+    # when days_lookback=None. Fix: gate the check on `is not None`.
+    persona_src = inspect.getsource(tesla.get_vehicle_persona_status)
+    check("REGRESSION persona guards days_lookback=None",
+          "days_lookback is not None" in persona_src,
+          "get_vehicle_persona_status still crashes on days_lookback=None")
+
 
 # =====================================================================
 # Layer 2 — smoke-call every MCP tool

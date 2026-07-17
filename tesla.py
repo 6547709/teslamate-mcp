@@ -118,7 +118,7 @@ import atexit
 # Source of truth for this release. Bump this constant when tagging a new
 # release. Overridable at runtime via env (Docker build-arg) or git describe
 # for development checkouts.
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 
 def _detect_version() -> str:
@@ -486,6 +486,10 @@ LIMIT_SOFTWARE_UPDATES   = int(os.environ.get("TESLA_LIMIT_SOFTWARE_UPDATES", "3
 LIMIT_CHARGING_BY_LOC    = int(os.environ.get("TESLA_LIMIT_CHARGING_BY_LOCATION", "50"))
 LIMIT_TPMS_HISTORY       = int(os.environ.get("TESLA_LIMIT_TPMS_HISTORY", "180"))
 LIMIT_VAMPIRE_DRAIN      = int(os.environ.get("TESLA_LIMIT_VAMPIRE_DRAIN", "50"))
+# REGRESSION-v1.2.4 (B11): hard cap on the narrative tool. Without it, a
+# caller asking for a multi-year window pulls every drive in the DB and
+# blows up the MCP payload / response time.
+LIMIT_NARRATIVE          = int(os.environ.get("TESLA_LIMIT_NARRATIVE", "500"))
 
 mcp = FastMCP(
     name="teslamate-mcp",
@@ -560,6 +564,43 @@ def _validate_days(days: int | None, max_days: int = MAX_LOOKBACK_DAYS) -> int |
     return days
 
 
+def _cutoff_from_days(days: int | None, default_days: int = MAX_LOOKBACK_DAYS) -> datetime:
+    """REGRESSION-v1.2.4: return a UTC cutoff datetime for `days` look-back.
+
+    `_validate_days(None)` legitimately passes through (callers use None to mean
+    "all time"). But every previous caller then computed
+    `_utcnow() - timedelta(days=days)` which raises TypeError when days is None.
+
+    This helper converts None → default_days (effectively "all time" within the
+    MAX_LOOKBACK_DAYS cap) so callers never need a None branch. The output is a
+    concrete datetime usable directly in SQL.
+    """
+    d = days if days is not None else default_days
+    return _utcnow() - timedelta(days=d)
+
+
+def _check_car_config(car_id: int) -> str | None:
+    """REGRESSION-v1.2.4: detect silently-zero energy calculations.
+
+    When TESLA_CAR_PARAMS (or TESLA_BATTERY_KWH+TESLA_BATTERY_RANGE_KM) is unset
+    at startup, _get_car_config returns the placeholder {kwh: 0, range_km: 1,
+    kwh_per_km: 0}. Every `(range_start - range_end) * kwh_per_km` then yields
+    0.0 silently — the user sees "0.0 kWh" with no warning. The startup WARNING
+    log is often lost in stdout.
+
+    Returns None if config is OK, or a user-facing error string the tool should
+    return directly.
+    """
+    cfg = _get_car_config(car_id)
+    if cfg.get("kwh_per_km", 0) <= 0:
+        return (
+            "⚠️ 未配置车辆能耗参数（TESLA_CAR_PARAMS 或 TESLA_BATTERY_KWH + "
+            "TESLA_BATTERY_RANGE_KM）。所有能耗/电耗/效率类指标无法计算，"
+            "返回 0.0 是占位值不是真实数据。请设置环境变量后重启。"
+        )
+    return None
+
+
 def _format_dt(dt: datetime | None) -> str:
     """Convert a UTC datetime to user timezone string, or 'N/A' if None."""
     if dt is None:
@@ -626,12 +667,35 @@ def _get_conn():
     read-only queries. Autocommit prevents SELECTs from leaving the connection
     in 'idle in transaction' state after it's returned to the pool, which
     would otherwise accumulate until Postgres terminates the session.
+
+    REGRESSION-v1.2.4 (B8): ThreadedConnectionPool raises PoolError
+    immediately when all `maxconn` slots are checked out. Under bursty HTTP
+    traffic, callers 9..N would surface a raw PoolError. Retry briefly with
+    backoff so a slow query finishing within ~POOL_RETRY_WINDOW_SEC frees a
+    slot; after that, raise a clean RuntimeError with a hint, since the user
+    can fix it by raising TESLA_DB_MAXCONN or scaling the deployment.
     """
     _init_pool()
-    conn = _pool.getconn()
-    if not conn.autocommit:
-        conn.autocommit = True
-    return conn
+    deadline = time.monotonic() + _POOL_RETRY_WINDOW_SEC
+    last_err: Exception | None = None
+    while True:
+        try:
+            conn = _pool.getconn()
+            if not conn.autocommit:
+                conn.autocommit = True
+            return conn
+        except psycopg2.pool.PoolError as e:
+            last_err = e
+            if time.monotonic() >= deadline:
+                break
+            # Brief sleep — let any in-flight query finish and free a slot.
+            time.sleep(_POOL_RETRY_SLEEP_SEC)
+    raise RuntimeError(
+        f"Database connection pool exhausted (max {_pool.maxconn} conns busy). "
+        f"Waited {_POOL_RETRY_WINDOW_SEC:.1f}s for a free slot. "
+        f"Either scale up TESLA_DB_MAXCONN (and Postgres max_connections), "
+        f"or reduce concurrent requests. Last pool error: {last_err}"
+    )
 
 
 def _put_conn(conn):
@@ -640,14 +704,73 @@ def _put_conn(conn):
         _pool.putconn(conn)
 
 
+# REGRESSION-v1.2.4 (B8): pool-exhaustion retry budget. With maxconn=8 and
+# statement_timeout=30s, a single stuck query can pin all 8 slots. Retrying
+# briefly gives in-flight queries time to finish; once the budget elapses,
+# the caller gets a friendly RuntimeError instead of a raw PoolError.
+_POOL_RETRY_WINDOW_SEC = float(os.environ.get("TESLA_DB_POOL_RETRY_WINDOW_SEC", "2.0"))
+_POOL_RETRY_SLEEP_SEC = float(os.environ.get("TESLA_DB_POOL_RETRY_SLEEP_SEC", "0.05"))
+
+
+def _vkey(*parts) -> str:
+    """REGRESSION-v1.2.4 (B9): namespace every cache key with __version__.
+
+    Without this, an upgrade from v1.2.3 → v1.2.4 would silently serve stale
+    cached values until the TTL elapses — even when the cached payload's
+    format changed (column renamed, label wording, etc.). The version prefix
+    invalidates every cached entry on startup because the key prefix no
+    longer matches.
+
+    Use this everywhere a `_cached_query*` or `_cached_result` key is built.
+    """
+    return f"v{__version__}:" + ":".join(str(p) for p in parts)
+
+
+def _put_conn_safe(conn):
+    """REGRESSION-v1.2.4 (B7): return a connection to the pool, closing it if
+    it looks unhealthy so the next caller doesn't inherit a dead socket.
+
+    A connection can become unusable mid-flight (Postgres restart, network
+    blip, statement_timeout cancellation past the keepalive window, etc.).
+    Putting it back unchanged lets the next 8 callers all hit the same broken
+    connection and surface `InterfaceError("connection already closed")`.
+
+    Detection: psycopg2's `conn.closed` is 0 when usable, non-zero otherwise.
+    We also force-close on the exception path so a transient failure doesn't
+    cascade to the next 8 callers.
+    """
+    if conn is None or _pool is None:
+        return
+    try:
+        if conn.closed:
+            _log.warning("[POOL] discarding closed connection instead of returning to pool")
+            _pool.putconn(conn, close=True)
+        else:
+            _put_conn(conn)
+    except Exception as e:
+        # Last-resort: don't let a pool bookkeeping error mask the real cause.
+        _log.warning(f"[POOL] putconn failed ({e}); closing connection outright")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _query(sql: str, params: tuple = ()) -> list[dict]:
     """Execute a read-only query and return results as list of dicts."""
     conn = None
+    broken = False
     try:
         conn = _get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
+    except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+        # The connection itself is suspect: mark it broken so the finally
+        # block closes it instead of putting it back.
+        broken = True
+        _log.error(f"Query failed (connection suspect): {e} | SQL: {sql[:200]}... | Params: {params}")
+        raise
     except Exception as e:
         _log.error(f"Query failed: {e} | SQL: {sql[:200]}... | Params: {params}")
         # P0-3: connections run in autocommit mode (see _get_conn), so there is
@@ -657,25 +780,53 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
         raise
     finally:
         if conn is not None:
-            _put_conn(conn)
+            if broken or (hasattr(conn, 'closed') and conn.closed):
+                _put_conn_safe(conn)
+            else:
+                _put_conn_safe(conn)
 
 
 def _query_one(sql: str, params: tuple = ()) -> dict | None:
     """Execute a read-only query and return first result (fetchone)."""
     conn = None
+    broken = False
     try:
         conn = _get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, params)
             row = cur.fetchone()
             return dict(row) if row else None
+    except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+        broken = True
+        _log.error(f"Query failed (connection suspect): {e} | SQL: {sql[:200]}... | Params: {params}")
+        raise
     except Exception as e:
         _log.error(f"Query failed: {e} | SQL: {sql[:200]}... | Params: {params}")
         # P0-3: autocommit mode — no transaction to roll back; re-raise cleanly.
         raise
     finally:
         if conn is not None:
-            _put_conn(conn)
+            _put_conn_safe(conn)
+
+
+# REGRESSION-v1.2.4 (B1): async wrappers that offload the blocking psycopg2
+# call to a worker thread so the event loop stays responsive in streamable-http
+# mode. Use these from inside `async def` tools instead of calling _query /
+# _query_one / _cached_query* directly.
+async def _query_async(sql: str, params: tuple = ()) -> list[dict]:
+    return await asyncio.to_thread(_query, sql, params)
+
+
+async def _query_one_async(sql: str, params: tuple = ()) -> dict | None:
+    return await asyncio.to_thread(_query_one, sql, params)
+
+
+async def _cached_query_async(key: str, sql: str, params: tuple = (), ttl: int = 300) -> list[dict]:
+    return await asyncio.to_thread(_cached_query, key, sql, params, ttl)
+
+
+async def _cached_query_one_async(key: str, sql: str, params: tuple = (), ttl: int = 300) -> dict | None:
+    return await asyncio.to_thread(_cached_query_one, key, sql, params, ttl)
 
 
 # -- Simple TTL cache for low-frequency data -----------------------------------
@@ -950,26 +1101,62 @@ _QW_LOCID_MAX = 2000
 # resolving the SAME cell don't each fire a (billed) GeoAPI lookup — only the
 # first proceeds, the rest await it and reuse the cached result. The map itself
 # is guarded by the threading lock above (creation is a fast, non-blocking op).
-_qw_locid_inflight: dict[str, asyncio.Lock] = {}
+#
+# REGRESSION-v1.2.4 (B5): store (loop_id, lock) instead of bare lock. asyncio.Lock
+# binds to the event loop where it is first awaited; if a different loop later
+# awaits the cached lock, Python raises
+# `RuntimeError: got Future <..> attached to a different loop`.
+# `test_all.py` creates fresh loops via `asyncio.run(...)` per smoke call, and
+# deployments may run multiple loops (uvicorn workers, background tasks). Storing
+# the loop_id lets us detect and replace stale locks on the new loop without
+# blowing up.
+_qw_locid_inflight: dict[str, tuple[int, asyncio.Lock]] = {}
 _QW_INFLIGHT_MAX = 256
 
 
 def _qw_locid_flight_lock(gkey: str) -> asyncio.Lock:
-    """Return the per-grid-key single-flight lock, creating it if needed."""
+    """Return the per-grid-key single-flight lock, creating it if needed.
+
+    REGRESSION-v1.2.4 (B5): if the cached lock belongs to a different event
+    loop (e.g. test harness or uvicorn worker spawned a new loop), replace it
+    with a fresh one bound to the running loop. Otherwise we'd raise
+    `RuntimeError` on `async with`.
+    """
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
     with _qw_locid_lock:
-        lock = _qw_locid_inflight.get(gkey)
-        if lock is None:
-            # Opportunistically bound the map so a long-running process with
-            # many distinct cells can't grow it without limit. Only prune keys
-            # whose lock is currently free (not held / not awaited).
-            if len(_qw_locid_inflight) >= _QW_INFLIGHT_MAX:
-                for k in list(_qw_locid_inflight.keys()):
-                    if not _qw_locid_inflight[k].locked():
-                        del _qw_locid_inflight[k]
+        entry = _qw_locid_inflight.get(gkey)
+        if entry is not None:
+            cached_loop_id, lock = entry
+            if cached_loop_id == loop_id:
+                return lock
+            # Stale lock from a previous loop — drop and replace.
+            del _qw_locid_inflight[gkey]
+
+        # Opportunistically bound the map so a long-running process with
+        # many distinct cells can't grow it without limit. Phase 1: drop
+        # unlocked entries until below cap. Phase 2 (REGRESSION-v1.2.4 B6):
+        # if the cap is STILL hit after phase 1 — i.e. every existing lock
+        # is currently in flight — force-evict the OLDEST entry as a last
+        # resort. The previous code would skip eviction entirely and then
+        # add a 257th entry, silently breaking the cap invariant.
+        if len(_qw_locid_inflight) >= _QW_INFLIGHT_MAX:
+            for k in list(_qw_locid_inflight.keys()):
+                _, lk = _qw_locid_inflight[k]
+                if not lk.locked():
+                    del _qw_locid_inflight[k]
                     if len(_qw_locid_inflight) < _QW_INFLIGHT_MAX:
                         break
-            lock = asyncio.Lock()
-            _qw_locid_inflight[gkey] = lock
+            if len(_qw_locid_inflight) >= _QW_INFLIGHT_MAX:
+                # Force-evict oldest (insertion-order dict → first key).
+                oldest_key = next(iter(_qw_locid_inflight))
+                _log.warning(
+                    f"[QW] all {_QW_INFLIGHT_MAX} in-flight locks held; "
+                    f"force-evicting oldest key={oldest_key} to make room for {gkey}"
+                )
+                del _qw_locid_inflight[oldest_key]
+        lock = asyncio.Lock()
+        _qw_locid_inflight[gkey] = (loop_id, lock)
         return lock
 
 
@@ -1130,6 +1317,11 @@ async def _qweather_historical(location_id: str, date_yyyymmdd: str) -> dict | N
 # where the underlying data changes slowly (monthly granularity).
 _result_cache: dict[str, dict] = {}
 _result_cache_lock = threading.Lock()
+# REGRESSION-v1.2.4 (B2): per-key in-flight future so N concurrent cold
+# callers coalesce into a single `fn()` execution instead of all running the
+# expensive aggregate. Pattern mirrors `_qw_locid_flight_lock`.
+_result_inflight: dict[str, asyncio.Future] = {}
+_result_inflight_lock = asyncio.Lock()
 
 
 async def _cached_result(key: str, ttl: int, fn) -> str:
@@ -1139,24 +1331,55 @@ async def _cached_result(key: str, ttl: int, fn) -> str:
         key:  cache key (must include all relevant params, e.g. f"savings:{car_id}")
         ttl:  seconds to cache
         fn:   async callable that produces the string when cache miss
+
+    Single-flight: if multiple coroutines hit a cold key simultaneously, only
+    one runs `fn()`; the rest await the same future and share its result.
     """
     now = time.time()
+    # Fast path: cache hit — return immediately without touching the inflight map.
     with _result_cache_lock:
         entry = _result_cache.get(key)
         if entry and now - entry["ts"] < ttl:
             _log.debug(f"[CACHE] result hit: {key} (age {now - entry['ts']:.1f}s)")
             return entry["data"]
-    result = await fn()
-    with _result_cache_lock:
-        _result_cache[key] = {"data": result, "ts": now, "ttl": ttl}
-        _prune_cache(_result_cache, now)
-    return result
+
+    # Slow path: cache miss. Acquire or join the per-key inflight future.
+    async with _result_inflight_lock:
+        inflight = _result_inflight.get(key)
+        if inflight is None:
+            # We're the first misser — create the future and run `fn()` ourselves.
+            # asyncio.get_running_loop() is the 3.10+ safe way to get the current
+            # loop from inside a coroutine (get_event_loop is deprecated when no
+            # loop is set, and the test suite spins up fresh loops via asyncio.run).
+            inflight = asyncio.get_running_loop().create_future()
+            _result_inflight[key] = inflight
+            leader = True
+        else:
+            leader = False
+
+    if leader:
+        try:
+            result = await fn()
+            with _result_cache_lock:
+                _result_cache[key] = {"data": result, "ts": time.time(), "ttl": ttl}
+                _prune_cache(_result_cache, time.time())
+            inflight.set_result(result)
+            return result
+        except Exception as exc:
+            inflight.set_exception(exc)
+            raise
+        finally:
+            async with _result_inflight_lock:
+                _result_inflight.pop(key, None)
+    else:
+        # Another coroutine is already running `fn()`; wait for its result.
+        return await inflight
 
 
 def _find_nearby_geofence(lat: float, lon: float) -> str | None:
     """Find nearest geofence name using cached geofence data. Returns name or None."""
     geofences = _cached_query(
-        "geofences_all",
+        _vkey("geofences_all"),
         "SELECT name, latitude, longitude, radius FROM geofences",
         ttl=3600,
     )
@@ -1261,7 +1484,7 @@ async def tesla_version() -> str:
     db_detail = ""
     if HAS_TESLAMATE:
         try:
-            row = _query_one("SELECT 1 AS ok, NOW() AS ts, current_database() AS db", ())
+            row = await _query_one_async("SELECT 1 AS ok, NOW() AS ts, current_database() AS db", ())
             if row and row.get("ok") == 1:
                 db_status = "✅ connected"
                 db_detail = f" ({row.get('db')}@{DB_HOST}:{DB_PORT}, server time {row.get('ts')})"
@@ -1296,7 +1519,7 @@ async def tesla_cars() -> str:
     Use the car_id with other tools to query a specific vehicle.
     """
     _log.info(f"[TOOL] tesla_cars called")
-    rows = _query("SELECT id, name, model, vin, efficiency FROM cars ORDER BY display_priority, id")
+    rows = await _query_async("SELECT id, name, model, vin, efficiency FROM cars ORDER BY display_priority, id")
 
     if not rows:
         return "No vehicles registered in TeslaMate."
@@ -1330,14 +1553,14 @@ async def tesla_status(car_id: int | None = None) -> str:
     _log.info(f"[TOOL] tesla_status called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     # Car info rarely changes — cache for 10 minutes
-    car = _cached_query_one(
-        f"car_{effective_car_id}",
+    car = await _cached_query_one_async(
+        _vkey("car", effective_car_id),
         "SELECT id, name, model, efficiency FROM cars WHERE id = %s LIMIT 1",
         (effective_car_id,), ttl=600,
     )
 
     # Single query: latest position + state + charging + software version
-    combined = _query_one("""
+    combined = await _query_one_async("""
         SELECT
             p.battery_level, p.ideal_battery_range_km,
             p.is_climate_on, p.inside_temp, p.outside_temp,
@@ -1491,17 +1714,17 @@ async def tesla_charging_history(days: int = 30, start_date: str | None = None, 
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = date_from_dt.isoformat() if date_from_dt else _cutoff_from_days(days).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
     # #15: 用 cp.address_id 直接 JOIN（TeslaMate 自动填充），替代原来的 LATERAL 坐标近邻扫描
-    rows = _query(
+    rows = await _query_async(
         f"""
         SELECT cp.start_date, cp.end_date,
                cp.charge_energy_added, cp.duration_min,
@@ -1577,18 +1800,18 @@ async def tesla_charges(
 
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = date_from_dt.isoformat() if date_from_dt else _cutoff_from_days(days).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
     limit_sql = "" if limit < 0 else f"LIMIT {limit}"
 
-    rows = _query(
+    rows = await _query_async(
         f"""
         SELECT
             cp.id AS session_id,
@@ -1653,10 +1876,13 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
     """
     _log.info(f"[TOOL] tesla_drives called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     # Validate date parameters
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         # Exclusive end boundary: add 1 day so [start, end) covers the full end_date
         # e.g., end_date="2026-04-09" means up to 2026-04-09 23:59:59 in user TZ
@@ -1665,7 +1891,7 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
     except ValueError as e:
         return f"❌ {e}"
 
-    rows = _query(
+    rows = await _query_async(
         f"""
         SELECT d.start_date, d.end_date,
                d.distance, d.duration_min,
@@ -1699,7 +1925,9 @@ async def tesla_drives(days: int = 30, start_date: str | None = None, end_date: 
             actual_days = (last_date - first_date).days + 1
             # Only rewrite header when requested window is significantly larger
             # than actual data (avoids noise for typical 30-day calls).
-            if actual_days < days * 0.9:
+            # REGRESSION-v1.2.4: skip this rewrite entirely when days=None
+            # ("all time") — there's no requested window to compare against.
+            if days is not None and actual_days < days * 0.9:
                 actual_first = _format_dt(first_date)[:10]
                 actual_last  = _format_dt(last_date)[:10]
                 date_range = f"{actual_first} → {actual_last}, {actual_days} days of data"
@@ -1868,7 +2096,7 @@ async def tesla_driving_score(
 
     if period == "recent_n":
         n = n or 10
-        rows = _query(
+        rows = await _query_async(
             """
             SELECT d.distance, d.duration_min, d.power_max, d.power_min,
                    d.speed_max, d.start_date
@@ -1896,7 +2124,12 @@ async def tesla_driving_score(
         end_utc = end_local.astimezone(timezone.utc)
         start_utc = start_local.astimezone(timezone.utc)
 
-        rows = _query_drives(start_utc, end_utc, effective_car_id)
+        rows = await asyncio.to_thread(
+            _query_drives,
+            start_utc,
+            end_utc,
+            effective_car_id
+        )
         if not rows:
             return f"No drives found for last {days_val} days."
 
@@ -1919,7 +2152,12 @@ async def tesla_driving_score(
         else:
             end_local = datetime(year, month + 1, 1, tzinfo=USER_TZ)
 
-        rows = _query_drives(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), effective_car_id)
+        rows = await asyncio.to_thread(
+            _query_drives,
+            start_local.astimezone(timezone.utc),
+            end_local.astimezone(timezone.utc),
+            effective_car_id
+        )
         if not rows:
             return f"No drives found for {year}-{month:02d}."
 
@@ -1944,10 +2182,11 @@ async def tesla_driving_score(
         else:
             range_end_local = datetime(year, end_month + 1, 1, tzinfo=USER_TZ)
 
-        all_rows = _query_drives(
+        all_rows = await asyncio.to_thread(
+            _query_drives,
             range_start_local.astimezone(timezone.utc),
             range_end_local.astimezone(timezone.utc),
-            effective_car_id,
+            effective_car_id
         )
 
         # Group rows by month (using start_date in user timezone)
@@ -2018,7 +2257,26 @@ _LEISURE_KEYWORDS = tuple(k.lower() for k in [
 # Key: car_id, Value: (dict of ids, timestamp)
 ROUTINE_CACHE = {}
 ROUTINE_CACHE_TTL = 3600  # 1 hour — previously 24h was too stale when user's routine changes
+ROUTINE_CACHE_MAX = int(os.environ.get("TESLA_ROUTINE_CACHE_MAX", "256"))  # REGRESSION-v1.2.4 (B10): bound the dict
 _routine_cache_lock = threading.Lock()
+
+
+def _routine_cache_prune(now: float) -> None:
+    """REGRESSION-v1.2.4 (B10): evict expired entries and cap the dict size.
+
+    Previously, ROUTINE_CACHE grew unbounded: every distinct car_id ever queried
+    stayed in memory forever (its TTL only gated READS, not eviction). Over weeks
+    of operation in a multi-tenant deployment this leaked linearly. Now we drop
+    expired entries on every write and FIFO-evict the oldest if still over cap.
+    Caller must hold `_routine_cache_lock`.
+    """
+    expired = [cid for cid, (_, ts) in ROUTINE_CACHE.items()
+               if now - ts >= ROUTINE_CACHE_TTL]
+    for cid in expired:
+        ROUTINE_CACHE.pop(cid, None)
+    if len(ROUTINE_CACHE) > ROUTINE_CACHE_MAX:
+        for cid in list(ROUTINE_CACHE.keys())[: len(ROUTINE_CACHE) - ROUTINE_CACHE_MAX]:
+            ROUTINE_CACHE.pop(cid, None)
 
 
 def _get_routine_locations(car_id: int) -> dict:
@@ -2034,6 +2292,8 @@ def _get_routine_locations(car_id: int) -> dict:
             ids, ts = entry
             if now - ts < ROUTINE_CACHE_TTL:
                 return ids
+        # Opportunistic prune while we hold the lock — REGRESSION-v1.2.4 (B10).
+        _routine_cache_prune(now)
 
     # Find Top 3 most frequent start and end address IDs combined
     rows = _query(
@@ -2060,6 +2320,7 @@ def _get_routine_locations(car_id: int) -> dict:
 
     with _routine_cache_lock:
         ROUTINE_CACHE[car_id] = (ids, now)
+        _routine_cache_prune(now)
     return ids
 
 
@@ -2122,7 +2383,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         if start_date:
             start_dt = _parse_date(start_date)
         elif days:
-            start_dt = _utcnow() - timedelta(days=days)
+            start_dt = _cutoff_from_days(days)
         else:
             start_dt = datetime(2000, 1, 1, tzinfo=timezone.utc)  # All time by default
 
@@ -2138,13 +2399,16 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
     start_iso = start_dt.isoformat() if start_dt else None
     end_iso = end_dt.isoformat() if end_dt else None
 
-    routine_ids = _get_routine_locations(effective_car_id)
+    routine_ids = await asyncio.to_thread(
+        _get_routine_locations,
+        effective_car_id
+    )
     classified: list[dict] = []
 
     # #17: 对可以 SQL 直接过滤的类别走快路径（long_trip / commute），避免 Python 端漏捡数据
     if category == "long_trip":
         # long_trip 定义：distance > TRIP_THRESHOLD_KM (100)
-        rows = _query(
+        rows = await _query_async(
             """
             SELECT d.start_date, d.distance, d.duration_min,
                    d.start_address_id, d.end_address_id,
@@ -2164,7 +2428,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         # commute 定义：home_id ↔ work_id 往返 AND distance >= COMMUTE_MIN_DIST_KM AND distance <= TRIP_THRESHOLD_KM
         h_id = routine_ids["home_id"]
         w_id = routine_ids["work_id"]
-        rows = _query(
+        rows = await _query_async(
             """
             SELECT d.start_date, d.distance, d.duration_min,
                    d.start_address_id, d.end_address_id,
@@ -2195,7 +2459,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         # keyword-matching rows, eliminating the multi-batch Python scan.
         kw_list = _SHOPPING_KEYWORDS if category == "shopping" else _LEISURE_KEYWORDS
         like_patterns = [f"%{kw}%" for kw in kw_list]
-        rows = _query(
+        rows = await _query_async(
             """
             SELECT d.start_date, d.distance, d.duration_min,
                    d.start_address_id, d.end_address_id,
@@ -2236,7 +2500,7 @@ async def tesla_trips_by_category(category: str = "commute", limit: int = 20, da
         BATCH = max(limit * 5, 100)
         offset = 0
         while len(classified) < limit and offset < MAX_SCAN:
-            batch = _query(
+            batch = await _query_async(
                 """
                 SELECT d.start_date, d.distance, d.duration_min,
                        d.start_address_id, d.end_address_id,
@@ -2291,7 +2555,7 @@ async def tesla_trip_categories(car_id: int | None = None) -> str:
     """
     _log.info(f"[TOOL] tesla_trip_categories called")
     effective_car_id = car_id if car_id is not None else CAR_ID
-    rows = _query(
+    rows = await _query_async(
         f"""
         SELECT d.distance,
                d.start_address_id, d.end_address_id,
@@ -2307,7 +2571,10 @@ async def tesla_trip_categories(car_id: int | None = None) -> str:
         (effective_car_id,),
     )
 
-    routine_ids = _get_routine_locations(effective_car_id)
+    routine_ids = await asyncio.to_thread(
+        _get_routine_locations,
+        effective_car_id
+    )
     counts = {"commute": 0, "shopping": 0, "leisure": 0, "long_trip": 0, "other": 0}
     for r in rows:
         cat = _classify_trip(
@@ -2343,7 +2610,7 @@ async def tesla_battery_health(car_id: int | None = None) -> str:
 
     # PERF: cache 1h — degradation moves at month-granularity, no need to recompute often.
     return await _cached_result(
-        f"bh:{effective_car_id}",
+        _vkey("bh", effective_car_id),
         ttl=3600,
         fn=lambda: _battery_health_compute(effective_car_id),
     )
@@ -2353,7 +2620,7 @@ async def _battery_health_compute(effective_car_id: int) -> str:
     # NOTE: tried two-stage CTE (day → month) but PG optimizer treats it as
     # equivalent plan when no covering index exists; same ~1.5s. Keeping the
     # simple form. The 1h result-cache above takes care of repeated calls.
-    rows = _query(f"""
+    rows = await _query_async(f"""
         SELECT date_trunc('month', date) AS month,
                AVG(ideal_battery_range_km) AS avg_ideal_km,
                COUNT(*) AS samples
@@ -2367,7 +2634,7 @@ async def _battery_health_compute(effective_car_id: int) -> str:
     """, (effective_car_id,))
 
     if not rows:
-        rows = _query(f"""
+        rows = await _query_async(f"""
             SELECT date, ideal_battery_range_km
             FROM positions
             WHERE car_id = %s
@@ -2417,18 +2684,21 @@ async def tesla_efficiency(days: int = 90, start_date: str | None = None, end_da
     """
     _log.info(f"[TOOL] tesla_efficiency called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = date_from_dt.isoformat() if date_from_dt else _cutoff_from_days(days).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
-    rows = _query(
+    rows = await _query_async(
         """
         SELECT d.week, d.total_km, d.total_kwh AS estimated_kwh, d.total_min, d.trips, d.avg_temp,
                COALESCE(c.charged_kwh, 0) AS charged_kwh
@@ -2505,17 +2775,17 @@ async def tesla_location_history(days: int = 7, start_date: str | None = None, e
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = date_from_dt.isoformat() if date_from_dt else _cutoff_from_days(days).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
 
-    rows = _query(
+    rows = await _query_async(
         f"""
         SELECT
             FLOOR(latitude / 0.002) * 0.002 AS lat,
@@ -2537,7 +2807,7 @@ async def tesla_location_history(days: int = 7, start_date: str | None = None, e
     if not rows:
         return f"No location data ({date_range})."
 
-    geofences = _cached_query("geofences_all",
+    geofences = await _cached_query_async(_vkey("geofences_all"),
         "SELECT name, latitude, longitude, radius FROM geofences", ttl=3600)
 
     lines = [f"**Location History** ({date_range})\n"]
@@ -2578,16 +2848,16 @@ async def tesla_state_history(days: int = 7, start_date: str | None = None, end_
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = date_from_dt.isoformat() if date_from_dt else _cutoff_from_days(days).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
-    rows = _query(
+    rows = await _query_async(
         f"""
         SELECT state, start_date, end_date
         FROM states
@@ -2651,7 +2921,7 @@ async def tesla_software_updates(car_id: int | None = None) -> str:
     """
     _log.info(f"[TOOL] tesla_software_updates called")
     effective_car_id = car_id if car_id is not None else CAR_ID
-    rows = _query(f"""
+    rows = await _query_async(f"""
         SELECT version, start_date, end_date
         FROM updates
         WHERE car_id = %s
@@ -2698,14 +2968,17 @@ async def tesla_live(car_id: int | None = None) -> str:
     _log.info(f"[TOOL] tesla_live called")
     effective_car_id = car_id if car_id is not None else CAR_ID
     # Car info — cached (same SQL as tesla_status to share cache key)
-    car = _cached_query_one(
-        f"car_{effective_car_id}",
+    car = await _cached_query_one_async(
+        _vkey("car", effective_car_id),
         "SELECT id, name, model, efficiency FROM cars WHERE id = %s LIMIT 1",
         (effective_car_id,), ttl=600,
     )
 
-    # Single combined query: position + charging + software
-    combined = _query_one("""
+    # Single combined query: position + charging + software + state.
+    # REGRESSION-v1.2.4 (B15): the latest `states.state` row used to be a
+    # separate round-trip; fold it into the LATERAL chain so the whole live
+    # view is one DB hit instead of two.
+    combined = await _query_one_async("""
         SELECT
             p.battery_level, p.ideal_battery_range_km,
             p.is_climate_on, p.inside_temp, p.outside_temp,
@@ -2716,7 +2989,8 @@ async def tesla_live(car_id: int | None = None) -> str:
             p.tpms_pressure_rl, p.tpms_pressure_rr,
             cp.start_date AS charge_start, cp.end_date AS charge_end,
             cp.charge_energy_added,
-            u.version AS sw_version
+            u.version AS sw_version,
+            st.state AS vehicle_state
         FROM (
             SELECT battery_level, ideal_battery_range_km,
                    is_climate_on, inside_temp, outside_temp, driver_temp_setting,
@@ -2732,7 +3006,10 @@ async def tesla_live(car_id: int | None = None) -> str:
         LEFT JOIN LATERAL (
             SELECT version FROM updates WHERE car_id = %s ORDER BY id DESC LIMIT 1
         ) u ON true
-    """, (effective_car_id, effective_car_id, effective_car_id))
+        LEFT JOIN LATERAL (
+            SELECT state FROM states WHERE car_id = %s ORDER BY id DESC LIMIT 1
+        ) st ON true
+    """, (effective_car_id, effective_car_id, effective_car_id, effective_car_id))
 
     if not combined:
         return "No position data found. Is TeslaMate running?"
@@ -2795,20 +3072,16 @@ async def tesla_live(car_id: int | None = None) -> str:
     else:
         lines.append("Driving: Parked")
 
-    # State from states table
-    current_state = _query_one("""
-        SELECT state FROM states WHERE car_id = %s ORDER BY id DESC LIMIT 1
-    """, (effective_car_id,))
-
+    # State from states table — REGRESSION-v1.2.4 (B15): now read from the
+# combined query above (LEFT JOIN LATERAL states), so this is a no-DB lookup.
     state_label = "Unknown"
-    if current_state:
-        s = current_state.get("state")
-        if s == "online":
-            state_label = "Online"
-        elif s == "offline":
-            state_label = "Offline"
-        elif s == "asleep":
-            state_label = "Asleep"
+    s = (combined or {}).get("vehicle_state")
+    if s == "online":
+        state_label = "Online"
+    elif s == "offline":
+        state_label = "Offline"
+    elif s == "asleep":
+        state_label = "Asleep"
     lines.append(f"State: {state_label}")
 
     # Location
@@ -2868,12 +3141,15 @@ async def tesla_savings(
     """
     _log.info(f"[TOOL] tesla_savings called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     _gas = gas_price or GAS_PRICE
     _mpg = mpg_equivalent or GAS_MPG
 
     # PERF: cache 10min — savings are aggregated across lifetime/month, slow-changing.
     return await _cached_result(
-        f"sv:{effective_car_id}:{_gas}:{_mpg}",
+        _vkey("sv", effective_car_id, _gas, _mpg),
         ttl=600,
         fn=lambda: _savings_compute(effective_car_id, _gas, _mpg, gas_price, mpg_equivalent),
     )
@@ -2883,14 +3159,14 @@ async def _savings_compute(effective_car_id: int, _gas: float, _mpg: int,
                             gas_price: float | None, mpg_equivalent: int | None) -> str:
     # PERF: 4 queries → 2 queries via FILTER (WHERE) aggregate condition.
     # Lifetime + this-month from drives in one scan; same for charging_processes.
-    drive_row = _query_one("""
+    drive_row = await _query_one_async("""
         SELECT
             COALESCE(SUM(distance), 0)                                                                  AS lifetime_km,
             COALESCE(SUM(distance) FILTER (WHERE date_trunc('month', start_date) = date_trunc('month', NOW())), 0) AS monthly_km
         FROM drives
         WHERE car_id = %s AND distance > 0
     """, (effective_car_id,))
-    charge_row = _query_one("""
+    charge_row = await _query_one_async("""
         SELECT
             COALESCE(SUM(charge_energy_added), 0)                                                                          AS lifetime_kwh,
             COALESCE(SUM(charge_energy_added) FILTER (WHERE date_trunc('month', start_date) = date_trunc('month', NOW())), 0) AS monthly_kwh
@@ -2905,27 +3181,49 @@ async def _savings_compute(effective_car_id: int, _gas: float, _mpg: int,
     lifetime_charge = {"total_kwh": charge_row.get("lifetime_kwh") or 0}
     monthly_charge  = {"total_kwh": charge_row.get("monthly_kwh")  or 0}
 
-    def _merge(drive_row: dict | None, charge_row: dict | None) -> tuple[dict, bool]:
+    # REGRESSION-v1.2.4: month-start UTC boundary so the monthly fallback
+    # estimate queries drives within this month only — previously the SQL had
+    # no `start_date` predicate, so "this month estimated kWh" was actually
+    # "lifetime estimated kWh", masking the real per-month figure.
+    month_start_local = datetime.now(USER_TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start_utc = month_start_local.astimezone(timezone.utc).isoformat()
+
+    def _merge(drive_row: dict | None, charge_row: dict | None, start_filter: str | None) -> tuple[dict, bool]:
         """Merge drive and charge rows. Returns (merged, is_estimated).
 
         Falls back to ideal-range energy estimation only when no charging data exists.
+        `start_filter` (ISO datetime) scopes the fallback SQL to drives at-or-after
+        that timestamp; pass None for lifetime.
         """
         total_km = (drive_row or {}).get("total_km") or 0
         total_kwh = (charge_row or {}).get("total_kwh") or 0
         is_estimated = False
         if total_km > 0 and total_kwh == 0:
-            # Fallback: estimate from ideal range (only when no charge data available)
-            est = _query_one("""
-                SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
-                    * %s), 0) AS total_kwh
-                FROM drives WHERE car_id = %s AND distance > 0
-            """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
+            # Fallback: estimate from ideal range (only when no charge data available).
+            # Lifetime scope (start_filter=None) → no extra predicate.
+            # Monthly scope → AND start_date >= month_start_utc.
+            # NB: _merge is a nested sync function inside _savings_compute (async),
+            # so the DB call must use the sync _query_one — the caller wraps
+            # this work in asyncio.to_thread at the cache layer.
+            if start_filter is None:
+                est = _query_one("""
+                    SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                        * %s), 0) AS total_kwh
+                    FROM drives WHERE car_id = %s AND distance > 0
+                """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id))
+            else:
+                est = _query_one("""
+                    SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
+                        * %s), 0) AS total_kwh
+                    FROM drives
+                    WHERE car_id = %s AND distance > 0 AND start_date >= %s
+                """, (_get_car_config(effective_car_id)["kwh_per_km"], effective_car_id, start_filter))
             total_kwh = (est or {}).get("total_kwh") or 0
             is_estimated = True
         return {"total_km": total_km, "total_kwh": total_kwh}, is_estimated
 
-    lifetime, lifetime_estimated = _merge(lifetime_drive, lifetime_charge)
-    monthly, monthly_estimated = _merge(monthly_drive, monthly_charge)
+    lifetime, lifetime_estimated = _merge(lifetime_drive, lifetime_charge, None)
+    monthly, monthly_estimated = _merge(monthly_drive, monthly_charge, month_start_utc)
 
     if not lifetime["total_km"]:
         return "No driving data yet."
@@ -3009,6 +3307,10 @@ async def tesla_trip_cost(
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info(f"[TOOL] tesla_trip_cost called with destination={destination[:30]}...")
+    effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     # Bug-1: empty/whitespace destination must NOT fall through to ILIKE '%%' which
     # matches any address in the table. Validate before any geocoding logic runs.
     if not destination or not destination.strip():
@@ -3036,7 +3338,7 @@ async def tesla_trip_cost(
     dest_lat: float | None = None
     dest_lon: float | None = None
     dest_name: str | None = None
-    local_hit = _query_one(
+    local_hit = await _query_one_async(
         """
         SELECT a.latitude, a.longitude,
                COALESCE(a.name, a.display_name) AS label
@@ -3118,7 +3420,7 @@ async def tesla_trip_cost(
                 # Persist for next time (cross-process cache).
                 _geocode_cache_put(destination, dest_lat, dest_lon, dest_name)
 
-    pos = _query_one("""
+    pos = await _query_one_async("""
         SELECT latitude, longitude, battery_level
         FROM positions WHERE car_id = %s
         ORDER BY id DESC LIMIT 1
@@ -3140,7 +3442,7 @@ async def tesla_trip_cost(
     road_mi = round(straight_mi * 1.3, 1)
     round_trip = round(road_mi * 2, 1)
 
-    eff = _query_one("""
+    eff = await _query_one_async("""
         SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
                    * %s), 0) AS kwh,
                COALESCE(SUM(distance), 0) AS km
@@ -3272,7 +3574,7 @@ async def tesla_weather(car_id: int | None = None) -> str:
             "TeslaMate's outside_temp sensor is unaffected."
         )
     effective_car_id = car_id if car_id is not None else CAR_ID
-    pos = _query_one(
+    pos = await _query_one_async(
         """
         SELECT latitude, longitude, battery_level
         FROM positions WHERE car_id = %s
@@ -3299,7 +3601,9 @@ async def tesla_weather(car_id: int | None = None) -> str:
 
     lines = [f"**Current Weather** {bucket_emoji} {w.get('text') or ''}\n"]
     if USE_METRIC_UNITS:
-        lines.append(f"Temperature: {temp_c}°C (feels {feels_c}°C)")
+        if temp_c is not None:
+            feels_str = f" (feels {feels_c}°C)" if feels_c is not None else ""
+            lines.append(f"Temperature: {temp_c}°C{feels_str}")
         if w.get("windSpeed") is not None:
             lines.append(f"Wind: {w.get('windDir') or ''} {w.get('windSpeed')} km/h (force {w.get('windScale')})")
         if w.get("vis") is not None:
@@ -3310,7 +3614,10 @@ async def tesla_weather(car_id: int | None = None) -> str:
                 return round(float(c) * 9 / 5 + 32)
             except (TypeError, ValueError):
                 return c
-        lines.append(f"Temperature: {_c2f(temp_c)}°F (feels {_c2f(feels_c)}°F)")
+        if temp_c is not None:
+            temp_f = _c2f(temp_c)
+            feels_str = f" (feels {_c2f(feels_c)}°F)" if feels_c is not None else ""
+            lines.append(f"Temperature: {temp_f}°F{feels_str}")
         if w.get("windSpeed") is not None:
             try:
                 mph = round(float(w["windSpeed"]) * 0.621371)
@@ -3345,16 +3652,19 @@ async def tesla_efficiency_by_temp(car_id: int | None = None) -> str:
     """
     _log.info(f"[TOOL] tesla_efficiency_by_temp called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     # PERF: cache 30min — temperature efficiency curve is a slowly-evolving aggregate.
     return await _cached_result(
-        f"eft:{effective_car_id}",
+        _vkey("eft", effective_car_id),
         ttl=1800,
         fn=lambda: _efficiency_by_temp_compute(effective_car_id),
     )
 
 
 async def _efficiency_by_temp_compute(effective_car_id: int) -> str:
-    rows = _query("""
+    rows = await _query_async("""
         SELECT
             CASE
                 WHEN outside_temp_avg < 0 THEN 'Below 32degF'
@@ -3445,6 +3755,10 @@ async def tesla_efficiency_by_weather(days: int = 90, car_id: int | None = None)
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
     _log.info("[TOOL] tesla_efficiency_by_weather called")
+    effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     if not QWEATHER_ENABLED:
         return (
             "❌ Weather analysis needs QWEATHER_API_KEY + QWEATHER_API_HOST "
@@ -3459,7 +3773,7 @@ async def tesla_efficiency_by_weather(days: int = 90, car_id: int | None = None)
     # Cache the whole computed result 6h — historical weather never changes and
     # the API calls are the expensive part.
     return await _cached_result(
-        f"efw:{effective_car_id}:{days}",
+        _vkey("efw", effective_car_id, days),
         ttl=21600,
         fn=lambda: _efficiency_by_weather_compute(effective_car_id, days),
     )
@@ -3467,9 +3781,9 @@ async def tesla_efficiency_by_weather(days: int = 90, car_id: int | None = None)
 
 async def _efficiency_by_weather_compute(effective_car_id: int, days: int) -> str:
     sample_max = int(os.environ.get("TESLA_WEATHER_SAMPLE_MAX", "60"))
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = _cutoff_from_days(days).isoformat()
     kwh_per_km = _get_car_config(effective_car_id)["kwh_per_km"]
-    rows = _query(
+    rows = await _query_async(
         """
         SELECT d.start_date,
                GREATEST(d.start_ideal_range_km - d.end_ideal_range_km, 0) * %s AS kwh,
@@ -3607,21 +3921,25 @@ async def tesla_charging_by_location(days: int = 0, car_id: int | None = None) -
     effective_car_id = car_id if car_id is not None else CAR_ID
     # PERF: cache 30min — charging sessions don't appear that often.
     return await _cached_result(
-        f"cbl:{effective_car_id}:{days}",
+        _vkey("cbl", effective_car_id, days),
         ttl=1800,
         fn=lambda: _charging_by_location_compute(effective_car_id, days),
     )
 
 
 async def _charging_by_location_compute(effective_car_id: int, days: int) -> str:
+    # Guard: only days > 0 enables the date filter. days == 0 → all time.
+    # Negative or other values fall back to all-time silently so old callers
+    # don't crash; explicit >= 1 would be stricter but breaks the documented
+    # default (`days: int = 0` = all time).
     date_filter = ""
     params = [effective_car_id]
-    if days > 0:
-        cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    if days and days > 0:
+        cutoff = _cutoff_from_days(days).isoformat()
         date_filter = "AND cp.start_date >= %s"
         params.append(cutoff)
 
-    rows = _query(f"""
+    rows = await _query_async(f"""
         SELECT COALESCE(gf.name, a.display_name) AS location,
                COUNT(*) AS sessions,
                COALESCE(SUM(cp.charge_energy_added), 0) AS total_kwh,
@@ -3675,7 +3993,7 @@ async def tesla_top_destinations(limit: int = 15, car_id: int | None = None) -> 
         return "❌ limit must be between 1 and 100"
     # PERF: cache 30min — visited destinations evolve slowly.
     return await _cached_result(
-        f"td:{effective_car_id}:{limit}",
+        _vkey("td", effective_car_id, limit),
         ttl=1800,
         fn=lambda: _top_destinations_compute(effective_car_id, limit),
     )
@@ -3683,7 +4001,7 @@ async def tesla_top_destinations(limit: int = 15, car_id: int | None = None) -> 
 
 async def _top_destinations_compute(effective_car_id: int, limit: int) -> str:
     # 按坐标聚合（精度 0.002 度 ≈ 220m），避免 GPS 漂移导致同一地点被分成多个 address_id
-    rows = _query(
+    rows = await _query_async(
         """
         SELECT
             -- 代表地址：该坐标簇里出现次数最多的 display_name（优先 geofence）
@@ -3727,9 +4045,12 @@ async def tesla_longest_trips(limit: int = 10, car_id: int | None = None) -> str
     """
     _log.info(f"[TOOL] tesla_longest_trips called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     if limit <= 0 or limit > 100:
         return "❌ limit must be between 1 and 100"
-    rows = _query(
+    rows = await _query_async(
         """
         SELECT d.start_date, d.distance, d.duration_min,
                GREATEST(d.start_ideal_range_km - d.end_ideal_range_km, 0)
@@ -3774,6 +4095,9 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
     """
     _log.info(f"[TOOL] tesla_monthly_report called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     # Validate parameters
     if month < 1 or month > 12:
         return "❌ month must be between 1 and 12"
@@ -3786,7 +4110,7 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
     is_current_month = (year == today.year and month == today.month)
     if not is_current_month:
         return await _cached_result(
-            f"mr:{effective_car_id}:{year}:{month}",
+            _vkey("mr", effective_car_id, year, month),
             ttl=86400,  # 1 day; historical data doesn't change
             fn=lambda: _monthly_report_compute(effective_car_id, year, month),
         )
@@ -3794,15 +4118,22 @@ async def tesla_monthly_report(year: int, month: int, car_id: int | None = None)
 
 
 async def _monthly_report_compute(effective_car_id: int, year: int, month: int) -> str:
-    start = datetime(year, month, 1)
+    # TZ: half-open boundaries in user-local TZ then converted to UTC for SQL.
+    # Sibling tools (generate_monthly_driving_report, get_vehicle_persona_status,
+    # tesla_driving_score) use the same conversion; naive datetimes would
+    # silently shift the queried window by up to ±14h for non-UTC users.
+    start_local = datetime(year, month, 1, tzinfo=USER_TZ)
     if month == 12:
-        next_start = datetime(year + 1, 1, 1)
+        next_local = datetime(year + 1, 1, 1, tzinfo=USER_TZ)
     else:
-        next_start = datetime(year, month + 1, 1)
+        next_local = datetime(year, month + 1, 1, tzinfo=USER_TZ)
     if month == 1:
-        prev_start = datetime(year - 1, 12, 1)
+        prev_local = datetime(year - 1, 12, 1, tzinfo=USER_TZ)
     else:
-        prev_start = datetime(year, month - 1, 1)
+        prev_local = datetime(year, month - 1, 1, tzinfo=USER_TZ)
+    start = start_local.astimezone(timezone.utc)
+    next_start = next_local.astimezone(timezone.utc)
+    prev_start = prev_local.astimezone(timezone.utc)
 
     car_cfg = _get_car_config(effective_car_id)
     kwh_per_km = car_cfg["kwh_per_km"]
@@ -3811,7 +4142,7 @@ async def _monthly_report_compute(effective_car_id: int, year: int, month: int) 
     # PERF: 4 queries -> 2 queries via FILTER (WHERE).
     # Drives: trips/km/min/drive_kwh for current month + km/drive_kwh for prev
     # month, single scan.
-    drive_row = _query_one(
+    drive_row = await _query_one_async(
         """
         SELECT
             COUNT(*) FILTER (WHERE start_date >= %s AND start_date < %s)               AS cur_trips,
@@ -3844,7 +4175,7 @@ async def _monthly_report_compute(effective_car_id: int, year: int, month: int) 
     prev_drive_kwh = drive_row.get("prev_drive_kwh") or 0
 
     # Charging: cost + actual kWh for current month + prev kWh, single scan.
-    charge_row = _query_one(
+    charge_row = await _query_one_async(
         """
         SELECT
             COALESCE(SUM(cost) FILTER (WHERE start_date >= %s AND start_date < %s), 0)                  AS cur_cost,
@@ -3869,7 +4200,7 @@ async def _monthly_report_compute(effective_car_id: int, year: int, month: int) 
 
     # Vampire drain: parked battery% drop (drive_end -> next event) per month.
     # Returns pct sums for current and prev month; multiplied by pct_to_kwh.
-    vampire_row = _query_one(
+    vampire_row = await _query_one_async(
         """
         WITH events AS (
             SELECT d.end_date AS ts, p.battery_level
@@ -3878,7 +4209,7 @@ async def _monthly_report_compute(effective_car_id: int, year: int, month: int) 
             UNION ALL
             SELECT d.start_date AS ts, p.battery_level
             FROM drives d JOIN positions p ON p.id = d.start_position_id
-            WHERE d.car_id = %s AND d.battery_level IS NOT NULL
+            WHERE d.car_id = %s AND p.battery_level IS NOT NULL
             UNION ALL
             SELECT start_date AS ts, start_battery_level AS battery_level
             FROM charging_processes
@@ -3973,7 +4304,7 @@ async def tesla_tpms_status(car_id: int | None = None) -> str:
     """
     _log.info(f"[TOOL] tesla_tpms_status called")
     effective_car_id = car_id if car_id is not None else CAR_ID
-    pos = _query_one("""
+    pos = await _query_one_async("""
         SELECT date,
                tpms_pressure_fl, tpms_pressure_fr,
                tpms_pressure_rl, tpms_pressure_rr
@@ -4051,17 +4382,17 @@ async def tesla_tpms_history(days: int = 30, start_date: str | None = None, end_
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = date_from_dt.isoformat() if date_from_dt else _cutoff_from_days(days).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
     # 4 小时桶聚合：每天 6 个数据点，30 天 × 6 = 180 条刚好
-    rows = _query(
+    rows = await _query_async(
         f"""
         SELECT
             date_trunc('hour', date)
@@ -4147,30 +4478,33 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
     """
     _log.info(f"[TOOL] tesla_monthly_summary called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    cfg_err = _check_car_config(effective_car_id)
+    if cfg_err:
+        return cfg_err
     if months <= 0 or months > 120:
         return "❌ months must be between 1 and 120"
     car_cfg = _get_car_config(effective_car_id)
     kwh_per_km = car_cfg["kwh_per_km"]
     pct_to_kwh = car_cfg["kwh"] / 100.0  # 1% battery -> kWh (vampire column)
-    rows = _query(
+    rows = await _query_async(
         """
         WITH drives_m AS (
-            SELECT date_trunc('month', start_date) AS month,
+            SELECT date_trunc('month', start_date AT TIME ZONE 'UTC' AT TIME ZONE %s) AS month,
                    COUNT(id) AS trips,
                    COALESCE(SUM(distance), 0) AS total_km,
                    COALESCE(SUM(duration_min), 0) AS total_min,
                    COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0) * %s), 0) AS drive_kwh
             FROM drives
             WHERE car_id = %s AND distance > 0
-            GROUP BY date_trunc('month', start_date)
+            GROUP BY date_trunc('month', start_date AT TIME ZONE 'UTC' AT TIME ZONE %s)
         ),
         charging_m AS (
-            SELECT date_trunc('month', start_date) AS month,
+            SELECT date_trunc('month', start_date AT TIME ZONE 'UTC' AT TIME ZONE %s) AS month,
                    SUM(charge_energy_added) AS charge_kwh,
                    SUM(cost) AS total_cost
             FROM charging_processes
             WHERE car_id = %s AND end_date IS NOT NULL
-            GROUP BY date_trunc('month', start_date)
+            GROUP BY date_trunc('month', start_date AT TIME ZONE 'UTC' AT TIME ZONE %s)
         ),
         events AS (
             SELECT d.end_date AS ts, p.battery_level
@@ -4179,7 +4513,7 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
             UNION ALL
             SELECT d.start_date AS ts, p.battery_level
             FROM drives d JOIN positions p ON p.id = d.start_position_id
-            WHERE d.car_id = %s AND d.battery_level IS NOT NULL
+            WHERE d.car_id = %s AND p.battery_level IS NOT NULL
             UNION ALL
             SELECT start_date AS ts, start_battery_level AS battery_level
             FROM charging_processes
@@ -4192,14 +4526,14 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
             FROM events
         ),
         vampire_m AS (
-            SELECT date_trunc('month', ts) AS month,
+            SELECT date_trunc('month', ts AT TIME ZONE 'UTC' AT TIME ZONE %s) AS month,
                    SUM(GREATEST(battery_level - next_battery_level, 0)) AS vampire_pct_sum
             FROM ordered
             WHERE next_ts IS NOT NULL
               AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 >= 8
               AND EXTRACT(EPOCH FROM (next_ts - ts)) / 3600 <= 168
               AND (battery_level - next_battery_level) > 0
-            GROUP BY date_trunc('month', ts)
+            GROUP BY date_trunc('month', ts AT TIME ZONE 'UTC' AT TIME ZONE %s)
         )
         SELECT d.month, d.trips, d.total_km, d.total_min,
                d.drive_kwh,
@@ -4212,9 +4546,16 @@ async def tesla_monthly_summary(months: int = 6, car_id: int | None = None) -> s
         ORDER BY d.month DESC
         LIMIT %s
         """,
-        (kwh_per_km, effective_car_id,
-         effective_car_id,
+        # REGRESSION-v1.2.4 (B12): USER_TZ is now bound to every date_trunc so
+        # month-bucketing respects the user's timezone rather than the Postgres
+        # session timezone. Sibling tools (_monthly_report_compute,
+        # generate_monthly_driving_report, etc.) already do this in Python via
+        # `datetime(..., tzinfo=USER_TZ).astimezone(timezone.utc)`; tesla_monthly_summary
+        # was the odd one out because it groups server-side.
+        (str(USER_TZ), kwh_per_km, effective_car_id, str(USER_TZ),
+         str(USER_TZ), effective_car_id, str(USER_TZ),
          effective_car_id, effective_car_id, effective_car_id,
+         str(USER_TZ), str(USER_TZ),
          pct_to_kwh,
          months),
     )
@@ -4312,20 +4653,20 @@ async def tesla_vampire_drain(days: int = 14, start_date: str | None = None, end
     effective_car_id = car_id if car_id is not None else CAR_ID
     try:
         days = _validate_days(days)  # ISSUE-1: reject negative / zero / oversized days
-        date_from_dt = _parse_date(start_date, _utcnow() - timedelta(days=days))
+        date_from_dt = _parse_date(start_date, _cutoff_from_days(days))
         date_to_dt = _parse_date(end_date, _utcnow())
         if end_date and date_to_dt:
             date_to_dt = date_to_dt + timedelta(days=1)
     except ValueError as e:
         return f"❌ {e}"
 
-    cutoff = date_from_dt.isoformat() if date_from_dt else (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = date_from_dt.isoformat() if date_from_dt else _cutoff_from_days(days).isoformat()
     end_boundary = date_to_dt.isoformat() if date_to_dt else None
     # TeslaMate 在车辆休眠时不上报 positions，因此"两条 positions 间隔 >= 8h"的条件极少命中。
     # 改用事件表（drives/charging_processes）推算：每次驾驶结束后，到下一次驾驶或充电开始之前，
     # 就是停放期间。停放期间的电量损失即为 vampire drain。
     # 注意：drives 表没有 battery_level 字段，需要 JOIN positions（通过 start/end_position_id）拿。
-    rows = _query(
+    rows = await _query_async(
         f"""
         WITH events AS (
             -- driving 结束：用 end_position_id 查 positions.battery_level + 停车点坐标
@@ -4486,10 +4827,14 @@ async def calculate_eco_savings_vs_icev(
     """
     _log.info(f"[TOOL] calculate_eco_savings_vs_icev called")
     effective_car_id = car_id if car_id is not None else CAR_ID
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    try:
+        days = _validate_days(days)
+    except ValueError as e:
+        return f"❌ {e}"
+    cutoff = _cutoff_from_days(days).isoformat()
 
     # Total driving distance from drives table
-    drive_row = _query_one(
+    drive_row = await _query_one_async(
         """
         SELECT COALESCE(SUM(distance), 0) AS total_km
         FROM drives
@@ -4500,7 +4845,7 @@ async def calculate_eco_savings_vs_icev(
     total_km = drive_row["total_km"] if drive_row else 0.0
 
     # Charging: prefer cost from charging_processes.cost, fallback to energy * price
-    charge_rows = _query(
+    charge_rows = await _query_async(
         """
         SELECT COALESCE(SUM(charge_energy_added), 0) AS total_kwh,
                COALESCE(SUM(cost), 0) AS total_cost
@@ -4516,7 +4861,7 @@ async def calculate_eco_savings_vs_icev(
 
     # Fallback: if no charging sessions recorded, estimate kWh from ideal-range deltas
     if total_kwh == 0 and total_km > 0:
-        est = _query_one(
+        est = await _query_one_async(
             """
             SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
                 * %s), 0) AS total_kwh
@@ -4616,8 +4961,19 @@ async def generate_travel_narrative_context(
     except ValueError:
         return f"❌ Invalid end_time format: '{end_time}'. Use ISO8601 like '2026-03-03T23:59:59' or '2026-03-03'"
 
-    rows = _query(
-        """
+    # REGRESSION-v1.2.4 (B11): bound the requested window. Without this, a
+    # caller asking for a multi-year span pulls the entire drives history and
+    # the MCP payload / memory blows up. Cap at MAX_LOOKBACK_DAYS (10y by
+    # default), aligned with the rest of the codebase.
+    if (end_utc - start_utc).days > MAX_LOOKBACK_DAYS:
+        return (
+            f"❌ time window too large ({(end_utc - start_utc).days} days); "
+            f"max is {MAX_LOOKBACK_DAYS} days. Narrow start_time / end_time or "
+            f"raise TESLA_MAX_LOOKBACK_DAYS."
+        )
+
+    rows = await _query_async(
+        f"""
         SELECT d.start_date, d.end_date,
                d.distance, d.duration_min, d.outside_temp_avg,
                sa.display_name AS start_name,
@@ -4629,9 +4985,14 @@ async def generate_travel_narrative_context(
         WHERE d.car_id = %s
           AND d.start_date >= %s AND d.start_date < %s
         ORDER BY d.start_date ASC
+        {_limit_sql(LIMIT_NARRATIVE)}
         """,
         (effective_car_id, start_utc.isoformat(), end_utc.isoformat()),
     )
+
+    # REGRESSION-v1.2.4 (B11): warn when the SQL hit the LIMIT cap so the
+    # caller knows the timeline is truncated, not actually empty.
+    capped = (LIMIT_NARRATIVE > 0 and len(rows) >= LIMIT_NARRATIVE)
 
     if not rows:
         return json.dumps({"timeline": [], "message": "No drives found in this time window."}, ensure_ascii=False, indent=2)
@@ -4665,6 +5026,13 @@ async def generate_travel_narrative_context(
         "total_drives": len(timeline),
         "timeline": timeline,
     }
+    if capped:
+        # REGRESSION-v1.2.4 (B11): surface the cap so the LLM caller knows the
+        # timeline is truncated, not actually complete.
+        result["warning"] = (
+            f"Timeline truncated at {LIMIT_NARRATIVE} drives. "
+            f"Increase TESLA_LIMIT_NARRATIVE or narrow the time window."
+        )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -4693,7 +5061,9 @@ async def get_vehicle_persona_status(
         return "❌ month must be between 1 and 12"
     if year is not None and (year < 2000 or year > 2100):
         return "❌ year must be between 2000 and 2100"
-    if days_lookback <= 0 or days_lookback > 3650:
+    # REGRESSION-v1.2.4: guard None — `None <= 0` would TypeError before
+    # the validation message, and downstream `days_lookback * 24.0` would too.
+    if days_lookback is not None and (days_lookback <= 0 or days_lookback > 3650):
         return "❌ days_lookback must be between 1 and 3650"
 
     # Determine query period
@@ -4722,7 +5092,7 @@ async def get_vehicle_persona_status(
     cutoff = start.isoformat()
 
     # -- Active: total distance + longest drive (single query)
-    drive_r = _query_one(
+    drive_r = await _query_one_async(
         """
         SELECT COALESCE(SUM(distance), 0) AS total_km,
                COALESCE(SUM(duration_min), 0) AS total_driving_min,
@@ -4750,7 +5120,7 @@ async def get_vehicle_persona_status(
     driving_hours = total_driving_min / 60.0
 
     # -- Idle time: use states table for asleep/offline + non-driving online time
-    state_rows = _query(
+    state_rows = await _query_async(
         """
         SELECT state, start_date, end_date
         FROM states
@@ -4790,7 +5160,7 @@ async def get_vehicle_persona_status(
 
     # -- Vampire drain: battery drop between drive_end and next drive/charge (see tesla_vampire_drain for rationale)
     # BUG-4: use the shared VAMPIRE_MIN_HOURS/MAX_HOURS so this agrees with tesla_vampire_drain.
-    vampire_rows = _query(
+    vampire_rows = await _query_async(
         f"""
         WITH events AS (
             SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
@@ -4882,13 +5252,17 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
         days: Number of days to look back (default: 30)
         car_id: Filter by vehicle ID (default: TESLA_CAR_ID env or first car)
     """
+    try:
+        days = _validate_days(days)
+    except ValueError as e:
+        return f"❌ {e}"
     _log.info(f"[TOOL] check_driving_achievements called")
     effective_car_id = car_id if car_id is not None else CAR_ID
-    cutoff = (_utcnow() - timedelta(days=days)).isoformat()
+    cutoff = _cutoff_from_days(days).isoformat()
     unlocked = []
 
     # Achievement 1:极限续航幸存者 -- start_battery_level <= 5
-    low_battery_rows = _query(
+    low_battery_rows = await _query_async(
         """
         SELECT start_date, start_battery_level, charge_energy_added,
                end_battery_level, duration_min
@@ -4917,10 +5291,9 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
     # Achievement 2:午夜幽灵 -- 3+ drives between 00:00 and 05:00 (in user's timezone)
     # AT TIME ZONE 'UTC' AT TIME ZONE %s ensures consistent behavior: first 'UTC' normalizes
     # to naive UTC, then converts to target timezone (works for both tz-aware and naive inputs)
-    midnight_drives = _query(
+    midnight_drives = await _query_async(
         """
-        SELECT start_date, distance, duration_min,
-               outside_temp_avg, end_address_id
+        SELECT start_date, distance
         FROM drives
         WHERE car_id = %s AND start_date >= %s
           AND EXTRACT(HOUR FROM (start_date AT TIME ZONE 'UTC') AT TIME ZONE %s) < 5
@@ -4946,7 +5319,7 @@ async def check_driving_achievements(days: int = 30, car_id: int | None = None) 
         })
 
     # Achievement 3:冰雪勇士 -- outside_temp_avg < 0 AND distance > 20
-    cold_drives = _query(
+    cold_drives = await _query_async(
         """
         SELECT start_date, distance, outside_temp_avg,
                duration_min, start_ideal_range_km, end_ideal_range_km
@@ -4995,31 +5368,47 @@ async def get_charging_vintage_data(charge_id: int | None = None, car_id: int | 
     effective_car_id = car_id if car_id is not None else CAR_ID
 
     if charge_id is not None:
-        row = _query_one(
+        row = await _query_one_async(
             """
             SELECT cp.start_date, cp.end_date, cp.duration_min,
                    cp.start_battery_level, cp.end_battery_level,
-                   cp.outside_temp_avg, cp.charge_energy_added,
+                   cp.charge_energy_added,
                    cp.cost,
-                   COALESCE(gf.name, sa.display_name) AS location
+                   COALESCE(gf.name, sa.display_name) AS location,
+                   pos.outside_temp AS outside_temp_avg
             FROM charging_processes cp
             LEFT JOIN geofences gf ON cp.geofence_id = gf.id
             LEFT JOIN addresses sa ON cp.address_id = sa.id
+            LEFT JOIN LATERAL (
+                SELECT outside_temp FROM positions
+                WHERE car_id = cp.car_id
+                  AND date <= cp.start_date
+                  AND outside_temp IS NOT NULL
+                ORDER BY date DESC LIMIT 1
+            ) pos ON true
             WHERE cp.car_id = %s AND cp.id = %s
             """,
             (effective_car_id, charge_id,),
         )
     else:
-        row = _query_one(
+        row = await _query_one_async(
             """
             SELECT cp.id, cp.start_date, cp.end_date, cp.duration_min,
                    cp.start_battery_level, cp.end_battery_level,
-                   cp.outside_temp_avg, cp.charge_energy_added,
+                   cp.charge_energy_added,
                    cp.cost,
-                   COALESCE(gf.name, sa.display_name) AS location
+                   COALESCE(gf.name, sa.display_name) AS location,
+                   pos.outside_temp AS outside_temp_avg
             FROM charging_processes cp
             LEFT JOIN geofences gf ON cp.geofence_id = gf.id
             LEFT JOIN addresses sa ON cp.address_id = sa.id
+            LEFT JOIN LATERAL (
+                SELECT outside_temp FROM positions
+                WHERE car_id = cp.car_id
+                  AND date <= cp.start_date
+                  AND outside_temp IS NOT NULL
+                ORDER BY date DESC LIMIT 1
+            ) pos ON true
             WHERE cp.car_id = %s AND cp.end_date IS NOT NULL
             ORDER BY cp.start_date DESC
             LIMIT 1
@@ -5087,13 +5476,20 @@ async def generate_weekend_blindbox(
     """
     _log.info(f"[TOOL] generate_weekend_blindbox called")
     effective_car_id = car_id if car_id is not None else CAR_ID
+    # REGRESSION-v1.2.4: bound months_lookback; was unbounded, e.g. user passing
+    # months_lookback=999 would scan lifetime. months_lookback is in months, not
+    # days, so multiply after validation.
+    if not isinstance(months_lookback, int) or months_lookback <= 0:
+        return "❌ months_lookback must be a positive integer"
+    if months_lookback * 30 > MAX_LOOKBACK_DAYS:
+        return f"❌ months_lookback too large ({months_lookback}); max ≈ {MAX_LOOKBACK_DAYS // 30}"
     import random
 
     cutoff = (_utcnow() - timedelta(days=months_lookback * 30)).isoformat()
     min_stay_min = int(min_stay_hours * 60)
 
     # Window-function query: LEAD to compute stay gap, COUNT to compute visit frequency
-    rows = _query(
+    rows = await _query_async(
         """
         WITH ranked AS (
             SELECT
@@ -5210,7 +5606,7 @@ async def generate_monthly_driving_report(
     end_iso = end.isoformat()
 
     # -- Drive stats
-    drive_rows = _query(
+    drive_rows = await _query_async(
         """
         SELECT
             COUNT(id) AS trip_count,
@@ -5231,7 +5627,7 @@ async def generate_monthly_driving_report(
     max_speed_kmh = drive_r.get("max_speed_kmh") or 0.0
 
     # -- Charge stats
-    charge_rows = _query(
+    charge_rows = await _query_async(
         """
         SELECT
             COUNT(id) AS charge_count,
@@ -5251,7 +5647,7 @@ async def generate_monthly_driving_report(
 
     # Fallback: if no charge sessions recorded in month, estimate from ideal-range deltas
     if total_kwh == 0 and total_km > 0:
-        est = _query_one(
+        est = await _query_one_async(
             """
             SELECT COALESCE(SUM(GREATEST(start_ideal_range_km - end_ideal_range_km, 0)
                 * %s), 0) AS total_kwh
@@ -5271,7 +5667,7 @@ async def generate_monthly_driving_report(
     # BUG-4: use the shared VAMPIRE_MIN_HOURS/MAX_HOURS so the monthly report's
     # vampire penalty agrees with the standalone tesla_vampire_drain tool
     # (previously this used 3h while the tool used 8h, giving contradictory results).
-    vampire_rows = _query(
+    vampire_rows = await _query_async(
         f"""
         WITH events AS (
             SELECT d.end_date AS ts, p.battery_level, 'drive_end' AS kind
@@ -5380,14 +5776,14 @@ async def get_driver_profile(car_id: int | None = None) -> str:
     effective_car_id = car_id if car_id is not None else CAR_ID
 
     # -- Query 1: total distance --
-    drive_row = _query_one(
+    drive_row = await _query_one_async(
         "SELECT COALESCE(SUM(distance), 0) AS total_distance_km FROM drives WHERE car_id = %s",
         (effective_car_id,),
     )
     total_km = float(drive_row["total_distance_km"]) if drive_row else 0.0
 
     # -- Query 2: total charge count --
-    charge_row = _query_one(
+    charge_row = await _query_one_async(
         "SELECT COUNT(*) AS total_charge_count FROM charging_processes WHERE car_id = %s AND end_date IS NOT NULL",
         (effective_car_id,),
     )
@@ -5511,7 +5907,7 @@ async def check_daily_quest(car_id: int | None = None) -> str:
     tomorrow_utc = tomorrow_local.astimezone(timezone.utc)
 
     # Query today's drives
-    rows = _query(
+    rows = await _query_async(
         """
         SELECT distance,
                start_ideal_range_km, end_ideal_range_km
@@ -5593,14 +5989,13 @@ async def get_longest_trip_on_single_charge(car_id: int | None = None) -> str:
     _log.info(f"[TOOL] get_longest_trip_on_single_charge called")
     effective_car_id = car_id if car_id is not None else CAR_ID
 
-    row = _query_one(
+    row = await _query_one_async(
         """
         WITH charge_windows AS (
             SELECT
                 cp.id AS charge_id,
                 cp.end_date AS charge_end,
                 cp.end_battery_level AS start_battery,
-                LEAD(cp.end_date) OVER (ORDER BY cp.start_date) AS next_charge_end,
                 LEAD(cp.start_date) OVER (ORDER BY cp.start_date) AS next_charge_start,
                 LEAD(cp.start_battery_level) OVER (ORDER BY cp.start_date) AS arrival_battery
             FROM charging_processes cp

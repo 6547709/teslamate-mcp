@@ -9,6 +9,144 @@
 
 All notable changes are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-07-17
+
+### 中文
+
+稳定性与正确性补丁版本 —— **0 项数据库改动**。本版本修复 **22 个 bug**，覆盖 SQL schema 错列、时区错位、None/负值静默崩溃、HTTP 模式性能问题、缓存安全等。全部修复均为只读 SELECT 查询文本优化或 Python 逻辑改进，可直接 `git pull` 升级，无需迁移或停机。
+
+#### Bug 修复
+
+**SQL schema 错列（2 项）**
+
+- `tesla_monthly_report` / `tesla_monthly_summary` 在 `events` CTE 的第 2 条 `UNION ALL` 分支里错误引用了 `d.battery_level` —— `drives` 表没有此列，运行时直接 `column does not exist`。已改为 `p.battery_level`（JOIN positions 后）。
+- `get_charging_vintage_data` 引用了 `cp.outside_temp_avg` —— `charging_processes` 表没有此列（它在 `drives` 上）。已删除该字段，改为 `LEFT JOIN LATERAL positions` 按时间倒序取最近一条非空温度补回温度信息。
+
+**时区与单位（3 项）**
+
+- `tesla_monthly_report` 月份边界用 naive `datetime(year, month, 1)`，非 UTC 用户（如 `Asia/Shanghai`）的窗口被偏 ±14h。已改为 `datetime(..., tzinfo=USER_TZ).astimezone(timezone.utc)`，与兄弟工具对齐。
+- `tesla_monthly_summary` 的 `date_trunc('month', start_date)` 依赖 PG session TZ。已改为 `date_trunc('month', start_date AT TIME ZONE 'UTC' AT TIME ZONE %s)` 显式绑 USER_TZ。
+- `tesla_weather` 当 QWeather API 缺 `temp`/`feelsLike` 时显示 `None°C` / `None°F`。已加 `if temp_c is not None` 守卫。
+
+**输入校验与崩溃（5 项）**
+
+- 9 个工具（`tesla_charging_history`、`tesla_drives`、`tesla_efficiency`、`tesla_location_history`、`tesla_state_history`、`tesla_tpms_history`、`tesla_vampire_drain`、`tesla_efficiency_by_weather`、`tesla_trips_by_category`）在 `days=None` 时崩 `TypeError: timedelta(days=None)`。新增 `_cutoff_from_days(None)` helper，None 自动落到 MAX_LOOKBACK_DAYS。
+- `calculate_eco_savings_vs_icev`、`check_driving_achievements` 完全没有 `days` 校验。已加 `_validate_days`。
+- `generate_weekend_blindbox` `months_lookback` 无校验，已加正整数 + ≤ MAX_LOOKBACK_DAYS/30 双重检查。
+- `tesla_charging_by_location` 接受 `days=-1` 静默当成"全部时间"。已改为 `if days and days > 0:`。
+- smoke test 阶段额外捕获：`tesla_drives(days=None)` 在 line 1928 `actual_days < days * 0.9` 仍崩 NoneType；`get_vehicle_persona_status(days_lookback=None)` 在校验入口 `None <= 0` 崩 TypeError。两处均已加 `is not None` 守卫。
+
+**数据正确性（2 项）**
+
+- `tesla_savings` 月度"估算能耗"实际用了 lifetime 全表（fallback SQL 无 `start_date` 谓词）。已加 `month_start_utc` 边界，月度查询只覆盖当月。
+- `get_charging_vintage_data` 在删除 `cp.outside_temp_avg` 后温度字段永远 None（已被 LATERAL JOIN 修复补偿回来）。
+
+**🔴 高严重性能 / 架构（4 项，B1–B4）**
+
+- **B1 event-loop 阻塞**：38 个 async 工具直接调同步 psycopg2，HTTP 模式下并发全部串行。已加 `_query_async` / `_query_one_async` / `_cached_*_async` 4 个 async wrapper（内部 `asyncio.to_thread`），并把 64 处 async 函数内的同步 DB 调用转 async。
+- **B2 cache stampede**：`_cached_result` 冷键 N 并发全部跑同一个重查询。已加 `_result_inflight: dict[str, asyncio.Future]`，第一个 misser 跑 `fn()`，其余 await 同一个 future。
+- **B3 配置缺失静默归零**：`TESLA_CAR_PARAMS` 未设时 `kwh_per_km=0`，所有能耗静默变成 0。已加 `_check_car_config` helper，9 个能耗类工具入口检查并返回友好 ⚠️ 错误。
+- **B4 3 工具无 days 校验**：见上。
+
+**🟡 中严重（5 项，B5–B11）**
+
+- **B5 QWeather 锁跨 loop**：`_qw_locid_flight_lock` 缓存的 `asyncio.Lock` 绑定第一次事件循环，新 loop 触发 `RuntimeError`。已改为 `(loop_id, lock)` tuple 并 `asyncio.get_running_loop()` 检查。
+- **B6 QWeather 驱逐**：所有 in-flight 锁都占用时旧代码跳过驱逐、插入第 N+1 个键。已加 phase-2 force-evict 最旧键。
+- **B7 坏连接放回 pool**：异常路径 `_pool.putconn(conn)` 把半坏连接放回 pool，导致下一个 8 个 caller 全失败。已加 `_put_conn_safe`：检测 `conn.closed`，坏连接 `putconn(close=True)`。
+- **B8 连接池耗尽**：第 9 个并发直接裸 `PoolError`。`_get_conn` 加 retry loop（默认 2s / 50ms 步长），超时后抛友好 `RuntimeError("Database connection pool exhausted ...")`。
+- **B9 cache version 隔离**：升级时缓存返回旧格式。已加 `_vkey(*parts) = f"v{__version__}:..."`，12 处 cache key 全部改名。升 v1.2.3→v1.2.4 时旧 key 前缀失配自动失效。
+- **B11 narrative 无 LIMIT**：`generate_travel_narrative_context` 多年窗口一次返回所有 drives。已加 `LIMIT_NARRATIVE` (默认 500) + 窗口 ≤ `MAX_LOOKBACK_DAYS` 双重保护，capped 时响应带 `"Timeline truncated"` 警告。
+
+**🟢 资源 / 死代码（4 项，B10、B12–B15）**
+
+- **B10 ROUTINE_CACHE 泄漏**：每 car_id 只增不删。已加 `_routine_cache_prune` + `ROUTINE_CACHE_MAX=256` FIFO 上限。
+- **B12** 见"时区与单位"。
+- **B13** `check_driving_achievements` midnight-ghost 查了 `outside_temp_avg` / `end_address_id` 但消费者从未用。已删。
+- **B14** `get_longest_trip_on_single_charge` 的 `LEAD(cp.end_date) AS next_charge_end` 算但从未引用。已删。
+- **B15** `tesla_live` 单独跑一次 `SELECT state FROM states` 多余 round-trip。已合并到主查询的 `LEFT JOIN LATERAL`。
+
+#### 测试
+
+- `test_all.py` 新增 **21 条 REGRESSION-v1.2.4 断言**，加上 smoke test **80/80 全绿**。
+
+#### 配置
+
+- 新增 `TESLA_DB_POOL_RETRY_WINDOW_SEC`（默认 2.0）+ `TESLA_DB_POOL_RETRY_SLEEP_SEC`（默认 0.05）+ `TESLA_LIMIT_NARRATIVE`（默认 500）+ `TESLA_ROUTINE_CACHE_MAX`（默认 256）。全部向后兼容。
+
+#### 备注
+
+- **数据库访问仍然 100% 只读**。本版本共修改 ~743 行代码 + 新增 ~237 行测试代码，0 处 INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/commit/rollback。
+
+---
+
+### English
+
+Stability & correctness patch release — **0 database changes**. Fixes **22 bugs** spanning SQL schema errors, timezone mis-bucketing, silent crashes on None/negative inputs, HTTP-mode performance issues, and cache safety. Every fix is a read-only SELECT text optimization or Python logic improvement — deployable via `git pull` with no migration or downtime.
+
+#### Bug fixes
+
+**SQL schema errors (2)**
+
+- `tesla_monthly_report` / `tesla_monthly_summary` referenced `d.battery_level` in the second `UNION ALL` branch of the `events` CTE — the `drives` table has no such column, causing `column does not exist` at runtime. Replaced with `p.battery_level` (after JOIN positions).
+- `get_charging_vintage_data` referenced `cp.outside_temp_avg` — `charging_processes` has no such column (it lives on `drives`). Removed the column from the SELECT, then added `LEFT JOIN LATERAL positions` to recover the temperature reading (latest non-null `outside_temp` ≤ `cp.start_date`).
+
+**Timezone & units (3)**
+
+- `tesla_monthly_report` month boundaries used naive `datetime(year, month, 1)`, shifting the window by ±14h for non-UTC users (`Asia/Shanghai`, etc.). Replaced with `datetime(..., tzinfo=USER_TZ).astimezone(timezone.utc)` to match sibling tools.
+- `tesla_monthly_summary`'s `date_trunc('month', start_date)` depended on the Postgres session timezone. Replaced with `date_trunc('month', start_date AT TIME ZONE 'UTC' AT TIME ZONE %s)` and bound `USER_TZ`.
+- `tesla_weather` displayed `None°C` / `None°F` when QWeather omits `temp`/`feelsLike`. Added `if temp_c is not None` guard.
+
+**Input validation & crashes (5)**
+
+- 9 tools crashed with `TypeError: timedelta(days=None)` on `days=None`. Added `_cutoff_from_days(None)` helper that falls back to `MAX_LOOKBACK_DAYS`.
+- `calculate_eco_savings_vs_icev`, `check_driving_achievements` had no `days` validation. Added `_validate_days`.
+- `generate_weekend_blindbox` `months_lookback` was unbounded. Added positive-integer + ≤ MAX_LOOKBACK_DAYS/30 checks.
+- `tesla_charging_by_location` silently accepted `days=-1` as "all time". Changed to `if days and days > 0:`.
+- Smoke test caught two more downstream issues: `tesla_drives(days=None)` crashed at `actual_days < days * 0.9`; `get_vehicle_persona_status(days_lookback=None)` crashed at the `None <= 0` validation entry. Both fixed with `is not None` guards.
+
+**Data correctness (2)**
+
+- `tesla_savings` monthly fallback estimate was actually a lifetime scan (no `start_date` predicate). Added `month_start_utc` boundary.
+- `get_charging_vintage_data` would have permanently lost temperature after the column removal — recovered via LATERAL JOIN.
+
+**🔴 High severity (4, B1–B4)**
+
+- **B1 event-loop blocking**: 38 async tools called sync psycopg2 directly. Added `_query_async` / `_query_one_async` / `_cached_*_async` wrappers using `asyncio.to_thread`; converted 64 sync DB call sites inside async functions.
+- **B2 cache stampede**: `_cached_result` allowed N concurrent cold callers to all run the expensive aggregate. Added `_result_inflight: dict[str, asyncio.Future]` — first misser runs `fn()`, others await the same future.
+- **B3 silent zero energy**: Missing `TESLA_CAR_PARAMS` made `kwh_per_km=0` propagate silently. Added `_check_car_config` guard on 9 energy tools returning a friendly ⚠️ error.
+- **B4 three tools without days validation**: see above.
+
+**🟡 Medium severity (6, B5–B11)**
+
+- **B5 QWeather lock cross-loop**: cached `asyncio.Lock` bound to first event loop. Switched to `(loop_id, lock)` tuple with `asyncio.get_running_loop()` check.
+- **B6 QWeather eviction**: when all in-flight locks held, old code skipped eviction and inserted the N+1th key. Added phase-2 force-evict of oldest.
+- **B7 broken connection returned to pool**: exception path put half-dead connections back, poisoning the next 8 callers. Added `_put_conn_safe` that detects `conn.closed` and `putconn(close=True)`.
+- **B8 pool exhaustion**: 9th concurrent caller hit raw `PoolError`. `_get_conn` now retries briefly (default 2s / 50ms) before raising a friendly `RuntimeError("Database connection pool exhausted ...")`.
+- **B9 cache version isolation**: upgrades returned stale format. Added `_vkey(*parts) = f"v{__version__}:..."`; renamed all 12 cache key sites. Old `v1.2.3:` keys no longer match on v1.2.4 startup.
+- **B10 ROUTINE_CACHE leak**: per-car_id unbounded dict. Added `_routine_cache_prune` + `ROUTINE_CACHE_MAX=256` FIFO cap.
+- **B11 narrative unbounded**: `generate_travel_narrative_context` could pull all drives in a multi-year window. Added `LIMIT_NARRATIVE` (default 500) + ≤ `MAX_LOOKBACK_DAYS` window cap, with `"Timeline truncated"` warning.
+
+**🟢 Cleanup (3, B12–B15)**
+
+- **B12** see Timezone & units.
+- **B13** `check_driving_achievements` midnight-ghost query selected `outside_temp_avg` / `end_address_id` it never read.
+- **B14** `get_longest_trip_on_single_charge` computed `LEAD(cp.end_date) AS next_charge_end` that was never referenced.
+- **B15** `tesla_live` ran a separate `SELECT state FROM states` round-trip; folded into the main query via `LEFT JOIN LATERAL`.
+
+#### Testing
+
+- `test_all.py` adds **21 new REGRESSION-v1.2.4 assertions**; comprehensive smoke test reports **80/80 passing**.
+
+#### Configuration
+
+- New envs: `TESLA_DB_POOL_RETRY_WINDOW_SEC` (default 2.0), `TESLA_DB_POOL_RETRY_SLEEP_SEC` (default 0.05), `TESLA_LIMIT_NARRATIVE` (default 500), `TESLA_ROUTINE_CACHE_MAX` (default 256). All backward-compatible.
+
+#### Notes
+
+- **Database access remains 100% read-only.** ~743 lines changed in `tesla.py`, ~237 lines added in `test_all.py`. Zero `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`ALTER`/`DROP`/`commit`/`rollback` introduced.
+
+---
+
 ## [1.2.3] - 2026-07-03
 
 ### 中文
