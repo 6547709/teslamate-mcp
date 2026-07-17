@@ -8,22 +8,54 @@
 
 ---
 
-## ✨ v1.2.3 新特性
+## ✨ v1.2.4 新特性 — 稳定性与正确性补丁
 
-> 能耗分类大版本 —— **0 项数据库改动**。把原本纠缠在一起的功耗指标拆分成**三种独立类别**（行驶 / 充电 / 停车），各自从原始数据源独立计算、并列展示、永不混入运算。同时新增 **露营模式** 检测。当前共 **38 个工具**，无数据库测试 **110/110 全部通过**。
+> **0 项数据库改动**。修复 **22 个 bug**，覆盖 SQL schema 错列、时区错位、None/负值崩溃、HTTP 模式性能、缓存安全等。全部修复是只读 SELECT 文本优化或 Python 逻辑改进，**`git pull` 即可升级，无需迁移或停机**。无数据库 smoke 测试 **80/80 全部通过** + 21 条新 REGRESSION-v1.2.4 断言。
 
-- 🏕️ **`tesla_vampire_drain` 露营模式（rate-based）** —— 停车时间 **>8 小时** 且该段停车的**平均每小时耗电速率** ≥ `TESLA_CAMPING_KWH_PER_HOUR`（默认 **0.8 kWh/h**）的事件，自动标记为 `🏕️ 露营模式`。kWh 换算使用**固定 75 kWh 参考电池**——无论实际是 75 / 82 / 100 kWh 电池，阈值判定都一样。哨兵 / 第三方 app **不单独区分**，只看耗电速率。所有露营事件**保证附带停车点天气**，根因一眼可见。
-- 📊 **`tesla_monthly_summary` 三列分立** —— `Drive kWh`（行驶，续航差值估算）/ `Charge kWh`（充电，会话汇总）/ `Vampire kWh`（停车，事件表聚合），三种 kWh **完全独立计算、并列展示**。`Wh/km` 现在**只用行驶 kWh**，不再被充电损耗和停车耗电污染。
-- 📈 **`tesla_monthly_report` 三种能量分开** —— 行驶 / 充电 / 停车耗电各自一行，与上月对比也按类别分别给出 delta。
-- 🔁 **`tesla_vampire_drain` 天气去重 bug 修复** —— 多事件路径下 `dict.fromkeys(...)` 抛 `TypeError: unhashable type: \'dict\'`，已改为基于 `id(r)` 的去重，保留首次出现顺序。
-- 🏷️ **`tesla_efficiency` 标签改清楚** —— 周报的 `估算 X kWh` 改成 `行驶 X kWh`，`实际充电 Y kWh` 改成 `充电 Y kWh`，顶部加注 "Two independent metrics — never mixed"。
-- 🛡️ **零天气修正已就位** — `tesla_trip_cost` 在 v1.2.3 继续保留 v1.2.3 起的行为：天气只在输出末尾以 `🌦️ Current weather` 段呈现，**绝不参与 cost 公式**（cost = kWh × 电价）。
-- 📊 **测试实证** —— `test_all.py` **110/110 全部通过**（was 92）。新增 8 个露营模式用例 + 7 个三类分立用例 + 2 个 `dict.fromkeys` 回归用例。
+### 🔴 关键修复
+
+- 🐛 **2 处 SQL schema 错列** —— `tesla_monthly_*` 工具的 `events` CTE 错把 `drives.battery_level` 当列引用（应通过 JOIN positions 取 `p.battery_level`）；`get_charging_vintage_data` 引用了不存在的 `cp.outside_temp_avg`（已用 `LEFT JOIN LATERAL positions` 按时间倒序补回温度）。两处在真实 DB 上跑会立刻抛 `column does not exist`。
+- 🕐 **时区错位** —— `tesla_monthly_report` 月份边界用 naive datetime，非 UTC 用户窗口偏 ±14h；`tesla_monthly_summary` 的 `date_trunc('month', ...)` 依赖 PG session TZ。两处都已绑定 `USER_TZ`。
+- ⚡ **B1 event-loop 阻塞** —— 38 个 async 工具直接调同步 psycopg2，HTTP 模式并发全部串行。已加 4 个 async wrapper（`asyncio.to_thread`），64 处 DB 调用已迁移。
+- 🚦 **B2 cache stampede** —— `_cached_result` 冷键 N 并发全部跑同一个重查询。已加 per-key `asyncio.Future` single-flight。
+
+### 📋 22 项修复分类
+
+| 类别 | 项数 | 包含 |
+|---|---|---|
+| **SQL schema 错列** | 2 | `d.battery_level`, `cp.outside_temp_avg` |
+| **时区 / None / 负值** | 5 | monthly_report TZ, monthly_summary TZ, weather None, charging_by_location 负 days, narrative 多年窗口 |
+| **崩溃修复** | 4 | 9 工具 days=None, 2 工具下游 None*float (smoke 发现) |
+| **数据正确性** | 2 | savings 月度估算, vintage 温度 |
+| **🔴 高严重 (B1–B4)** | 4 | event-loop, cache stampede, 静默归零, 3 工具无校验 |
+| **🟡 中严重 (B5–B11)** | 5 | QWeather 锁跨 loop/驱逐, 坏连接, pool 耗尽, cache version, ROUTINE 泄漏, narrative LIMIT |
+| **🟢 资源/死代码 (B10, B12–B15)** | 4 | 内存泄漏, TZ, 死列, 多余 round-trip |
+
+### 🔄 部署方式
+
+```bash
+docker pull ghcr.io/6547709/teslamate-mcp:1.2.4   # 或 :latest（已指向 v1.2.4）
+```
+
+镜像：linux/amd64 + linux/arm64 双架构。完整清单见 [CHANGELOG.md](CHANGELOG.md)。
+
+<details>
+<summary>📜 v1.2.3 能耗分类大版本（点击展开）</summary>
+
+> **0 项数据库改动**。把原本纠缠在一起的功耗指标拆分成**三种独立类别**（行驶 / 充电 / 停车），各自从原始数据源独立计算、并列展示、永不混入运算。同时新增 **露营模式** 检测。38 个工具，无数据库测试 **110/110 全部通过**。
+
+- 🏕️ **`tesla_vampire_drain` 露营模式（rate-based）** —— 停车时间 >8 小时且平均每小时耗电速率 ≥ `TESLA_CAMPING_KWH_PER_HOUR`（默认 0.8 kWh/h）的事件自动标记为 🏕️ 露营模式。kWh 换算使用固定 75 kWh 参考电池。哨兵 / 第三方 app 不单独区分。所有露营事件保证附带停车点天气。
+- 📊 **`tesla_monthly_summary` 三列分立** —— Drive kWh / Charge kWh / Vampire kWh 三种独立计算并列展示。Wh/km 只用行驶 kWh。
+- 📈 **`tesla_monthly_report` 三种能量分开** —— 与上月对比按类别分别 delta。
+- 🔁 **`tesla_vampire_drain` 天气去重 bug 修复** —— 改 `id(r)`-keyed dedup。
+- 🏷️ **`tesla_efficiency` 标签改清楚** —— "Two independent metrics — never mixed"。
+
+</details>
 
 <details>
 <summary>📜 v1.2.1 天气与高德（点击展开）</summary>
 
-- 🌦️ **新增工具 `tesla_weather`** —— 基于车辆最新 GPS 位置，通过**和风天气（QWeather）**返回实时天气：温度、体感、湿度、风力、降水、能见度、天气状况。
+- 🌦️ **新增工具 `tesla_weather`** —— 基于车辆最新 GPS 位置，通过和风天气（QWeather）返回实时天气。
 - 📉 **新增工具 `tesla_efficiency_by_weather`** —— 按真实天气分桶的能效分析。
 - 🗺️ **高德地图（AMAP）地理编码** —— 中文地址精度远胜 Nominatim，内置 GCJ-02 → WGS-84 转换。
 - 🛡️ **优雅降级** —— Key 未配置时对应功能自动关闭。
@@ -327,16 +359,16 @@ Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 
 ```bash
 # 打标签发布
-git tag v1.2.3
-git push origin v1.2.3
+git tag v1.2.4
+git push origin v1.2.4
 ```
 
 镜像地址：
 
 | Tag | 用途 |
 |---|---|
-| `ghcr.io/6547709/teslamate-mcp:latest` | 始终指向最新发布（当前 v1.2.3） |
-| `ghcr.io/6547709/teslamate-mcp:v1.2.3` | 锁定当前版本 |
+| `ghcr.io/6547709/teslamate-mcp:latest` | 始终指向最新发布（当前 v1.2.4） |
+| `ghcr.io/6547709/teslamate-mcp:v1.2.4` | 锁定当前版本 |
 | `ghcr.io/6547709/teslamate-mcp:1.2` | 跟随 1.2.x 小版本 |
 | `ghcr.io/6547709/teslamate-mcp:sha-<commit>` | 不可变 commit 引用 |
 

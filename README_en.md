@@ -8,17 +8,49 @@ A Model Context Protocol (MCP) server providing Tesla vehicle analytics through 
 
 ---
 
-## ✨ What\'s New in v1.2.3
+## ✨ What\'s New in v1.2.4 — Stability & Correctness Patch
 
-> Energy-categorisation release — **0 database changes**. Splits the previously entangled power-consumption metric into **three independent categories** (driving / charging / parking), each computed from its primary source, displayed side-by-side, and never mixed in calculations. Also adds a "camping mode" detector. **38 tools** total, no-database test suite **110/110 passing**.
+> **0 database changes**. Fixes **22 bugs** spanning SQL schema typos, timezone mis-bucketing, None/negative crashes, HTTP-mode performance, and cache safety. Every fix is a read-only SELECT text optimization or Python logic improvement — **`git pull` to upgrade, no migration or downtime**. No-database smoke test **80/80 passing** + 21 new REGRESSION-v1.2.4 assertions.
 
-- 🏕️ **Camping mode flag in `tesla_vampire_drain`** (rate-based) — parked periods with parking time **>8 hours** AND **average drain rate** ≥ `TESLA_CAMPING_KWH_PER_HOUR` (default **0.8 kWh/h**) are tagged `🏕️ 露营模式`. The kWh conversion uses a **fixed 75 kWh reference battery** — the threshold is the same whether the actual car is 75 / 82 / 100 kWh. Sentry / third-party-app activity is **not distinguished** from camping use — only the drain rate matters. Camping events always receive parking-location weather regardless of drain rank, so the cause is visible at a glance.
-- 📊 **Three independent kWh columns in `tesla_monthly_summary`** — `Drive kWh` (range-drop estimate) / `Charge kWh` (sessions) / `Vampire kWh` (parked drain). Three kWh values are computed independently and shown side-by-side. `Wh/km` now uses **driving kWh only** — no longer contaminated by charging losses or vampire drain.
-- 📈 **Three energy lines in `tesla_monthly_report`** — driving / charging / vampire energy each on its own line, with per-category prev-month delta in the comparison line.
-- 🔁 **`tesla_vampire_drain` weather-dedup bug fix** — multi-event path crashed with `TypeError: unhashable type: \'dict\'` from `dict.fromkeys(...)`. Replaced with `id(r)`-keyed dedup, preserving first-seen order.
-- 🏷️ **`tesla_efficiency` labels clarified** — weekly output relabels `估算 X kWh` → `行驶 X kWh` and `实际充电 Y kWh` → `充电 Y kWh`, with top-of-output note "Two independent metrics — never mixed".
-- 🛡️ **Zero weather correction retained** — `tesla_trip_cost` continues the v1.2.3 behaviour: weather only shown at the end as a `🌦️ Current weather` block; **never participates in the cost formula** (cost = kWh × rate).
-- 📊 **Test evidence** — `test_all.py` **110/110 passing** (was 92). New: 8 camping-mode tests + 7 three-category separation tests + 2 `dict.fromkeys` regression tests.
+### 🔴 Key fixes
+
+- 🐛 **2 SQL schema typos** — `tesla_monthly_*` tools' `events` CTE wrongly referenced `drives.battery_level` (should be `p.battery_level` after JOIN positions); `get_charging_vintage_data` referenced the non-existent `cp.outside_temp_avg` (recovered via `LEFT JOIN LATERAL positions` ordered by time). Both crash with `column does not exist` on a real DB.
+- 🕐 **Timezone mis-bucketing** — `tesla_monthly_report`'s month boundaries used naive datetime (±14h shift for non-UTC users); `tesla_monthly_summary`'s `date_trunc('month', ...)` depended on PG session TZ. Both now bind `USER_TZ`.
+- ⚡ **B1 event-loop blocking** — 38 async tools called sync psycopg2 directly, serializing all HTTP-mode concurrency. Added 4 async wrappers (`asyncio.to_thread`); migrated 64 DB call sites.
+- 🚦 **B2 cache stampede** — `_cached_result` let N concurrent cold callers all run the same expensive aggregate. Added per-key `asyncio.Future` single-flight.
+
+### 📋 22 fixes by category
+
+| Category | Count | Highlights |
+|---|---|---|
+| **SQL schema typos** | 2 | `d.battery_level`, `cp.outside_temp_avg` |
+| **Timezone / None / negative** | 5 | monthly_report TZ, monthly_summary TZ, weather None, charging_by_location neg days, narrative multi-year window |
+| **Crash fixes** | 4 | 9 tools `days=None` + 2 downstream `None*float` (found via smoke) |
+| **Data correctness** | 2 | savings monthly estimate, vintage temperature |
+| **🔴 High severity (B1–B4)** | 4 | event-loop, cache stampede, silent-zero energy, 3 tools without validation |
+| **🟡 Medium (B5–B11)** | 5 | QWeather lock cross-loop/eviction, broken conn, pool exhausted, cache version, ROUTINE leak, narrative LIMIT |
+| **🟢 Cleanup (B10, B12–B15)** | 4 | memory leak, TZ, dead cols, extra round-trip |
+
+### 🔄 Deploy
+
+```bash
+docker pull ghcr.io/6547709/teslamate-mcp:1.2.4   # or :latest (now points to v1.2.4)
+```
+
+Multi-arch image: linux/amd64 + linux/arm64. Full list in [CHANGELOG.md](CHANGELOG.md).
+
+<details>
+<summary>📜 v1.2.3 energy-categorisation (click to expand)</summary>
+
+> **0 database changes**. Splits the previously entangled power-consumption metric into **three independent categories** (driving / charging / parking), each computed from its primary source, displayed side-by-side, and never mixed in calculations. Also adds a "camping mode" detector. 38 tools, no-database test suite 110/110 passing.
+
+- 🏕️ **Camping mode flag in `tesla_vampire_drain`** (rate-based) — parked periods with parking time >8 hours AND average drain rate ≥ `TESLA_CAMPING_KWH_PER_HOUR` (default 0.8 kWh/h) are tagged 🏕️ 露营模式. Fixed 75 kWh reference battery. Sentry / 3rd-party apps not distinguished.
+- 📊 **Three independent kWh columns in `tesla_monthly_summary`** — Drive kWh / Charge kWh / Vampire kWh, shown side-by-side. Wh/km uses driving kWh only.
+- 📈 **Three energy lines in `tesla_monthly_report`** — per-category prev-month delta.
+- 🔁 **`tesla_vampire_drain` weather-dedup bug fix** — `id(r)`-keyed dedup.
+- 🏷️ **`tesla_efficiency` labels clarified** — "Two independent metrics — never mixed".
+
+</details>
 
 <details>
 <summary>📜 v1.2.1 weather & AMAP (click to expand)</summary>
@@ -328,16 +360,16 @@ git push origin v0.1.0
 
 ```bash
 # Tag a release
-git tag v1.2.3
-git push origin v1.2.3
+git tag v1.2.4
+git push origin v1.2.4
 ```
 
 Image tags:
 
 | Tag | Purpose |
 |---|---|
-| `ghcr.io/6547709/teslamate-mcp:latest` | Always points to the most recent release (currently v1.2.3) |
-| `ghcr.io/6547709/teslamate-mcp:v1.2.3` | Lock to the current version |
+| `ghcr.io/6547709/teslamate-mcp:latest` | Always points to the most recent release (currently v1.2.4) |
+| `ghcr.io/6547709/teslamate-mcp:v1.2.4` | Lock to the current version |
 | `ghcr.io/6547709/teslamate-mcp:1.2` | Track the 1.2.x minor line |
 | `ghcr.io/6547709/teslamate-mcp:sha-<commit>` | Immutable commit reference |
 
